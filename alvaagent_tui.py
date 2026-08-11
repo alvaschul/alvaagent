@@ -2991,8 +2991,17 @@ def main():
     ON_PERMISSION = ask_permission  # interactive y/N for risky actions
     state = load_state()
     set_active_skin(state)
-    banner(state)
-    repl()
+    # Alternate-screen buffer: take over the whole terminal like Hermes' TUI
+    # (prior scrollback hidden on launch, restored on exit). Emit the enter
+    # code, run, and always emit the leave code (even on Ctrl-C / error).
+    sys.stdout.write("\x1b[?1049h")
+    sys.stdout.flush()
+    try:
+        banner(state)
+        repl()
+    finally:
+        sys.stdout.write("\x1b[?1049l")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
