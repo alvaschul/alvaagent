@@ -320,6 +320,33 @@ try:
     assert_ok(all(v is True for v in results.values()),
               "harness self_test passes all checks: " + json.dumps(results))
 
+    # ---------- reliability: atomic store writes ----------
+    # A store save must leave VALID json even under a racing second write.
+    pa._store["alvaagent.todos"] = [{"text": "atomic test", "done": False}]
+    pa._save_store()
+    sp = os.path.join(DATA, "store.json")
+    assert_ok(os.path.exists(sp), "store.json exists after save")
+    try:
+        _reloaded = json.load(open(sp))
+        assert_ok(isinstance(_reloaded, dict), "store.json is valid JSON after save")
+    except Exception as e:
+        assert_ok(False, "store.json corrupted: %s" % e)
+    # back-to-back saves must not corrupt (temp+rename is atomic on POSIX)
+    pa._store["alvaagent.mem.x"] = "v1"
+    pa._save_store()
+    pa._store["alvaagent.mem.x"] = "v2"
+    pa._save_store()
+    _reloaded2 = json.load(open(sp))
+    assert_ok(_reloaded2.get("alvaagent.mem.x") == "v2", "second store save wins (no corruption)")
+    # no leftover temp files
+    _leftover = [f for f in os.listdir(DATA) if f.startswith(".store.") or f.startswith(".tmp.") or f.endswith(".tmp")]
+    assert_ok(not _leftover, "no leftover temp files after atomic writes (%s)" % _leftover)
+    # _atomic_write helper works
+    _ap = os.path.join(DATA, "_atomic_probe.txt")
+    pa._atomic_write(_ap, "hello")
+    assert_ok(open(_ap).read() == "hello", "_atomic_write writes content")
+    os.remove(_ap)
+
     print("\nALL TESTS PASSED ✓" if failures == 0 else "\n%d TEST(S) FAILED ✗" % failures)
     sys.exit(0 if failures == 0 else 1)
 finally:

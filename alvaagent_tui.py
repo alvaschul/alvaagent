@@ -190,9 +190,25 @@ def load_state():
 
 
 def save_state(state):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(state, f, indent=2)
+    """Atomically persist config: temp file + fsync + rename (see _save_store)."""
+    try:
+        import tempfile
+        os.makedirs(DATA_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".config.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CONFIG_PATH)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    except Exception:
+        pass
 
 
 def active_cfg(state):
@@ -240,10 +256,24 @@ def _load_store():
 
 
 def _save_store():
+    """Atomically persist the store: write to a temp file, then rename into
+    place. A kill/crash mid-write can never leave a truncated store.json."""
     try:
+        import tempfile
         os.makedirs(DATA_DIR, exist_ok=True)
-        with open(STORE_PATH, "w") as f:
-            json.dump(_store, f)
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".store.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(_store, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, STORE_PATH)  # atomic on POSIX
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
     except Exception:
         pass
 
@@ -428,10 +458,8 @@ def tool_file_write(path, content):
     if classify_file_action(path, "write") == "ask" and not _permission("write file: %s" % path):
         return {"ok": False, "error": "permission denied by user"}
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         text = str(content)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        _atomic_write(path, text)
         return {"ok": True, "path": path, "chars": len(text)}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
@@ -494,6 +522,27 @@ def tool_skill_read(name):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
+def _atomic_write(path, text, mode="w"):
+    """Write text to `path` atomically: temp file + fsync + rename into place.
+    Creates parent dirs. Raises on failure so callers can report the error."""
+    import tempfile
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)) or ".",
+                               prefix=".tmp.", suffix=".write")
+    try:
+        with os.fdopen(fd, mode, encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def tool_skill_save(name, content):
     name = str(name).strip()
     if not name or "/" in name or "\\" in name or name.startswith("."):
@@ -501,10 +550,8 @@ def tool_skill_save(name, content):
     try:
         os.makedirs(SKILLS_DIR, exist_ok=True)
         path = os.path.join(SKILLS_DIR, name + ".md")
-        text = str(content)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-        return {"ok": True, "name": name, "path": path, "chars": len(text)}
+        _atomic_write(path, str(content))
+        return {"ok": True, "name": name, "path": path, "chars": len(str(content))}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
