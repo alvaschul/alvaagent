@@ -1662,11 +1662,13 @@ def _wrap_text(text, w):
     return out
 
 
-# ---------------- Hermes-style display (rule-only panels) ----------------
+# ---------------- Hermes-style display (full panels) ----------------
 # Mirrors the Hermes agent TUI: Rich `Panel(box=HORIZONTALS)` for static
-# blocks (banner, buffered agent reply) and matching raw-ANSI rule borders
-# for live streaming. Hermes' palette is fixed (gold user bullet, bronze
-# agent border) so the UI reads as Hermes regardless of the /skin palette.
+# blocks (banner, buffered agent reply) and matching raw-ANSI HORIZONTALS
+# borders for live streaming. Hermes' palette is fixed (gold user bullet,
+# bronze agent border) so the UI reads as Hermes regardless of the /skin
+# palette. The live reply block is a full bordered panel (╭─ ╮ / │ / ╰─ ╯)
+# identical in shape to the startup banner.
 HERMES_ACCENT = "#FFD700"   # gold   - user bullet / banner title
 HERMES_BORDER = "#CD7F32"   # bronze - agent reply border (Hermes response_border)
 HERMES_TEXT   = "#FFF8DC"   # cream  - agent text
@@ -1687,6 +1689,28 @@ def _fgh(h):
 
 def _rsth():
     return C.RESET if COLOR else ""
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _vislen(s):
+    """Visible character width of s (ANSI escapes are invisible)."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def _panel_top(title, hexcol, width=None):
+    """Top of a full Hermes HORIZONTALS panel: '╭─ title ──────╮'."""
+    w = width or _term_width()
+    inner = (" " + title + " ") if title else ""
+    dashes = "─" * max(w - len(inner) - 3, 1)
+    sys.stdout.write(_fgh(hexcol) + "╭─" + inner + dashes + "╮" + _rsth() + "\n")
+
+
+def _panel_bottom(hexcol, width=None):
+    """Bottom of a full Hermes HORIZONTALS panel: '╰────────────╯'."""
+    w = width or _term_width()
+    sys.stdout.write(_fgh(hexcol) + "╰" + "─" * max(w - 2, 1) + "╯" + _rsth() + "\n")
 
 
 def _rule_h(top_title, hexcol, width=None):
@@ -1779,16 +1803,22 @@ class AgentWriter:
         self.started = False
         self.closed = False
         self.at_line_start = True
+        self._width = _term_width()
+        self._linebuf = ""
 
     # ---- low-level output ----
     def _write(self, s):
         if self.at_line_start:
             self.at_line_start = False
-            sys.stdout.write("  ")   # Hermes HORIZONTALS gutter: 2-space indent
+            sys.stdout.write("│ ")   # Hermes HORIZONTALS left gutter
+            self._linebuf = ""
         sys.stdout.write(s)
+        self._linebuf += s
 
     def _nl(self):
-        sys.stdout.write("\n")
+        pad = max(self._width - 3 - _vislen(self._linebuf), 0)
+        sys.stdout.write(" " * pad + "│\n")   # Hermes HORIZONTALS right gutter
+        self._linebuf = ""
         self.at_line_start = True
 
     def _emit_plain(self, styled):
@@ -1801,7 +1831,7 @@ class AgentWriter:
     def feed(self, chunk):
         if not self.started:
             self.started = True
-            _rule_h("⚕ alvaagent", HERMES_BORDER)   # top rule of the reply block
+            _panel_top("⚕ alvaagent", HERMES_BORDER, self._width)  # reply panel top
         parts = chunk.split("```")
         for i, part in enumerate(parts):
             if i > 0:
@@ -1829,7 +1859,7 @@ class AgentWriter:
             self._emit_plain("```")
         if not self.at_line_start:
             self._nl()
-        _rule_bottom(HERMES_BORDER)   # bottom rule of the reply block
+        _panel_bottom(HERMES_BORDER, self._width)   # reply panel bottom
 
     def _flush_code_label(self):
         """Code buffered while waiting for a language newline is real code -
@@ -1853,24 +1883,48 @@ class AgentWriter:
             self._code_label = None
             self._emit_plain("```" + label.strip())
             part = rest
-        lines = part.split("\n")
-        for idx, piece in enumerate(lines):
+        raw = part.split("\n")
+        if raw and raw[0] == "" and len(raw) > 1:
+            # leading newline: break from previous line if mid-line
+            if not self.at_line_start:
+                self._nl()
+            raw = raw[1:]
+        end_nl = part.endswith("\n")
+        if end_nl:
+            raw = raw[:-1]   # drop trailing empty (real line break handled below)
+        wrote = False
+        for idx, piece in enumerate(raw):
+            if idx > 0:
+                self._nl()
             if piece:
                 self._write(col(self.skin["code"], piece))
-            if idx < len(lines) - 1:
-                self._nl()
+                wrote = True
+        if end_nl and wrote:
+            self._nl()
 
     def _write_inline(self, part):
-        lines = style_inline(part, self.skin).split("\n")
-        for idx, piece in enumerate(lines):
+        raw = part.split("\n")
+        if raw and raw[0] == "" and len(raw) > 1:
+            # leading newline: break from previous line if mid-line
+            if not self.at_line_start:
+                self._nl()
+            raw = raw[1:]
+        end_nl = part.endswith("\n")
+        if end_nl:
+            raw = raw[:-1]   # drop trailing empty (real line break handled below)
+        wrote = False
+        for idx, piece in enumerate(raw):
+            if idx > 0:
+                self._nl()
             if piece:
                 if self.at_line_start:
                     hm = re.match(r"^#{1,6}\s+(.*)$", piece)
                     if hm:  # '## Heading' -> bold accent heading
                         piece = col(C.BOLD + self.skin["agent"], hm.group(1))
-                self._write(piece)
-            if idx < len(lines) - 1:
-                self._nl()
+                self._write(style_inline(piece, self.skin))
+                wrote = True
+        if end_nl and wrote:
+            self._nl()
 
 
 def render_markdown(text):
