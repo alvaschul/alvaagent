@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================
-#  alvaagent_tui.py — alvaagent terminal chat client
+#  alvaagent_tui.py - alvaagent terminal chat client
 #
 #  Same agent harness ported to plain Python so it runs entirely inside
-#  Termux — no browser, no web server, nothing to disconnect when you
+#  Termux - no browser, no web server, nothing to disconnect when you
 #  switch apps.
 #
 #  Uses only the Python standard library (no pip installs needed).
@@ -24,21 +24,21 @@
 #    /help /config /provider /models /test /tools /todos /todo /memory
 #    /skin /sessions /session /new /clear /context /compress /multi /export
 #    /stop /exit /quit
-#    Ctrl+C cancels a running request · Tab completes slash commands
+#    Ctrl+C cancels a running request | Tab completes slash commands
 #    (at the api key prompt, type 'none' to clear the key)
 #
 #  Sessions: conversations are saved to store.json and resumed on restart.
-#    /sessions lists them · /session <name> switches/creates · /new starts fresh.
+#    /sessions lists them | /session <name> switches/creates | /new starts fresh.
 #  Context: the footer shows a live ctx meter (est. tokens / model window) and
 #    auto-compresses older messages into a summary near the limit so long chats
-#    don't drift out of context. /context shows the numbers · /compress forces it.
+#    don't drift out of context. /context shows the numbers | /compress forces it.
 #  Skins: /skin lists & switches the color theme (midnight | ember | ocean |
 #  daylight). Skins persist to config.json. The layout echoes the Hermes agent
 #  TUI (banner + bordered message blocks + tool blocks + status chips) but with
 #  its own palettes, a footer status line instead of a persistent bottom bar,
 #  tab-completion instead of a dropdown, and the alvaagent ⚡ brand.
 #
-#  Note: single-line input — a multi-line paste submits only its first
+#  Note: single-line input - a multi-line paste submits only its first
 #  line (the soft keyboard's Enter sends each line).
 # ============================================================
 import ast
@@ -113,7 +113,7 @@ ALVA_VERSION = "1.2.0"
 # fallback context window when the model can't be identified
 DEFAULT_CONTEXT_WINDOW = 128000
 
-# known context windows (tokens) — used for the ctx meter + auto-compress
+# known context windows (tokens) - used for the ctx meter + auto-compress
 MODEL_CONTEXT = {
     "gpt-4o-mini": 128000, "gpt-4o": 128000, "gpt-4-turbo": 128000,
     "gpt-3.5-turbo": 16385, "o1-mini": 128000, "o1": 200000,
@@ -366,7 +366,7 @@ def classify_command(cmd):
     # Shell metacharacters that enable command substitution / sub-shells are
     # never needed by the allowlisted read-only commands -> always ask.
     # (e.g. ``echo $(touch /tmp/x)`` and ``echo `touch /tmp/x` `` must NOT
-    # pass as read-only — they execute arbitrary commands.)
+    # pass as read-only - they execute arbitrary commands.)
     if any(ch in c for ch in "$`(){}"):
         return "ask"
     tokens = _tokenize_shell(c)
@@ -379,7 +379,7 @@ def classify_command(cmd):
     if any(w in _RISKY_TOKENS for w in words):
         return "ask"
     # find is allowlisted for searches but its destructive flags (-delete,
-    # -exec/-execdir/-ok) turn it into a wipe — treat them as risky.
+    # -exec/-execdir/-ok) turn it into a wipe - treat them as risky.
     if words and words[0] == "find":
         for w in words:
             if w.startswith("-delete") or w.startswith("-exec") \
@@ -829,7 +829,7 @@ TOOLS = [
             "required": []}}},
     {"type": "function", "function": {
         "name": "skill_list",
-        "description": "List available on-device skill files. ALWAYS call this before starting a substantial task and read any skill whose name matches the task — skills encode the user's preferred way of doing that kind of work.",
+        "description": "List available on-device skill files. ALWAYS call this before starting a substantial task and read any skill whose name matches the task - skills encode the user's preferred way of doing that kind of work.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "skill_read",
@@ -880,7 +880,7 @@ def dispatch_tool(name, args):
 # ---------------- LLM client (OpenAI-compatible) ----------------
 SYSTEM_PROMPT = """You are alvaagent, a helpful AI agent running on the user's Android device (Termux / proot).
 You can call tools to do real work. Guidelines:
-1. Use the calculator tool for ANY arithmetic — never guess math.
+1. Use the calculator tool for ANY arithmetic - never guess math.
 2. Use web_fetch to read a webpage when the user asks about online content.
 3. Use memory_save / memory_recall to remember facts the user asks you to remember.
 4. Use todo_add / todo_list / todo_toggle / todo_remove to manage the user's to-do list.
@@ -888,12 +888,12 @@ You can call tools to do real work. Guidelines:
 6. You have real device access: run_command runs shell commands (Termux), and
    file_read / file_write / file_edit / file_list work on the device's files.
    Read-only commands and in-project file edits run freely; mutating/unknown
-   commands or out-of-project writes ask the user first — if denied, do not
+   commands or out-of-project writes ask the user first - if denied, do not
    retry, and explain what was blocked and why.
 7. Skills: skill_list / skill_read / skill_save manage reusable procedures
    stored on the device. BEFORE starting any substantial task, call skill_list
    and read any skill whose name matches the task. Apply the skill's guidance
-   faithfully — a skill is the user's preferred way of doing that kind of work.
+   faithfully - a skill is the user's preferred way of doing that kind of work.
    When you discover a reusable, non-obvious procedure during a task, save it
    as a skill with a descriptive name and a concise body (trigger + steps).
    Keep skills small and self-contained so they stay easy to apply and test.
@@ -901,7 +901,7 @@ You can call tools to do real work. Guidelines:
    start.sh, test_tui.py) and improve it with file_edit/
    file_write, then validate with run_command("python3 -m py_compile
    alvaagent_tui.py") and run_command("python3 test_tui.py"). Changes take
-   effect the next time the user restarts the TUI — always say so, and keep
+   effect the next time the user restarts the TUI - always say so, and keep
    edits small, targeted, and tested.
 Only call a tool when it genuinely helps. If no tool is needed, answer directly.
 Respond in the same language the user writes in. Be concise, friendly, and precise."""
@@ -911,8 +911,8 @@ def _readable_error(status, text):
     """Best-effort readable message from an API error body (JSON or HTML).
 
     Gateways/WAFs often return HTML error pages whose <title> says exactly
-    what's blocked (Cloudflare, nginx, …); proxies sometimes wrap upstream
-    failures as JSON like {"error": {"message": "[403]: <html>…"}}.
+    what's blocked (Cloudflare, nginx, ...); proxies sometimes wrap upstream
+    failures as JSON like {"error": {"message": "[403]: <html>..."}}.
     """
     msg = ""
     try:
@@ -1390,7 +1390,7 @@ def summarize_with_llm(messages, cfg, max_words=350):
         "- FACTS: durable facts, names, values, config learned\n"
         "- ACTIONS: concrete work done (commands run, files changed, code edits)\n"
         "- OPEN: unresolved questions or next steps\n"
-        "Be dense and factual — no preamble, under %d words total. "
+        "Be dense and factual - no preamble, under %d words total. "
         "Output only the summary sections." % max_words)
     sys_note = "You are a compression assistant. Output only the requested summary, no preamble."
     msgs = ([{"role": "system", "content": sys_note}]
@@ -1462,7 +1462,7 @@ def compress_now(history, cfg, threshold=0.75, force=False):
         return False
     if not force and tokens <= int(window * threshold):
         return False
-    p_info("context %d%% of %s — compressing older messages…"
+    p_info("context %d%% of %s - compressing older messages..."
            % (tokens * 100 // window, _fmt_k(window)))
     sp = Spinner("compressing")
     _UI["spinner"] = sp
@@ -1480,15 +1480,15 @@ def compress_now(history, cfg, threshold=0.75, force=False):
         _UI["spinner"] = None
     if not stats:
         if tokens > int(window * 0.6):
-            p_info("(nothing to compress — a single message dominates the window; consider /new)")
+            p_info("(nothing to compress - a single message dominates the window; consider /new)")
         else:
             p_info("(nothing to compress)")
         return False
     history[:] = new
-    p_ok("✓ context compressed · %d earlier message%s → summary"
+    p_ok("[OK] context compressed | %d earlier message%s -> summary"
          % (stats["dropped"], "" if stats["dropped"] == 1 else "s"))
     if stats.get("mode") == "fallback":
-        p_info("  (offline summary — the model call failed, kept a basic note)")
+        p_info("  (offline summary - the model call failed, kept a basic note)")
     return True
 
 
@@ -1514,7 +1514,7 @@ COLOR = bool(sys.stdout.isatty()) and not os.environ.get("NO_COLOR")
 # Each skin picks 256-color ANSI codes; the layout is always the same, only the
 # palette changes. '/skin' lists & switches them (persisted in config.json).
 SKINS = {
-    "midnight": {  # default — deep-space blues
+    "midnight": {  # default - deep-space blues
         "desc": "deep-space blues (default)",
         "accent": C.FG % 45, "user": C.FG % 220, "agent": C.FG % 81,
         "tool": C.FG % 141, "border": C.FG % 240, "chip": C.FG % 45,
@@ -1535,7 +1535,7 @@ SKINS = {
         "code": C.FG % 158, "ok": C.FG % 114, "err": C.FG % 203,
         "dim": C.FG % 244,
     },
-    "daylight": {  # for bright terminals — dark ink on light
+    "daylight": {  # for bright terminals - dark ink on light
         "desc": "bright terminals, dark ink",
         "accent": C.FG % 27, "user": C.FG % 130, "agent": C.FG % 27,
         "tool": C.FG % 90, "border": C.FG % 250, "chip": C.FG % 27,
@@ -1575,7 +1575,7 @@ def p_ok(s):
 
 
 def p_warn(s):
-    print(col(C.YELLOW, "  ⚠") + "  " + s)
+    print(col(C.YELLOW, "  [!]") + "  " + s)
 
 
 # ---------------- blocks & width-aware layout ----------------
@@ -1629,44 +1629,45 @@ def _wrap_text(text, w):
 
 
 def box_open(title, color):
-    """Top border of a rounded-corner block, e.g. '  ╭─ agent ─────╮'.
+    """Top border of a block, e.g. '  +-- agent --------+'.
 
-    The left gutter is always EXACTLY 4 visible chars: '  ╭─ ' (2 indent +
-    border + 1 inner space). box_line and box_close must match this so every
-    row aligns to the same column.
+    Uses ASCII borders so it renders on every terminal/font (some Android
+    Termux fonts drop Unicode box-drawing glyphs). The left gutter is always
+    EXACTLY 4 visible chars: '  +- ' (2 indent + border + 1 inner space).
+    box_line and box_close must match this so every row aligns.
     """
     w = _term_width()
     t = title
-    # left = '  ╭─ ' (4), then title, then ' ' (1) before the fill rule
+    # left = '  +- ' (4), then title, then ' ' (1) before the fill rule
     inner = col(color, t) + " "
-    left = "  ╭─ "
+    left = "  +- "
     used = 4 + _vlen(inner) + 1   # +1 for the space after the title
-    pad = w - used - 1            # -1 for the closing '╮'
+    pad = w - used - 1            # -1 for the closing '+'
     while pad < 1 and t:          # shrink an over-long title instead of overflowing
         t = t[:-1]
         inner = col(color, t) + " "
         used = 4 + _vlen(inner) + 1
         pad = w - used - 1
-    return left + inner + "─" * max(pad, 1) + "╮"
+    return left + inner + "-" * max(pad, 1) + "+"
 
 
 def box_close():
-    # left gutter must match box_open's '  ╭─ ' → here '  ╰' + fill + '╯'
+    # left gutter must match box_open's '  +- ' -> here '  +' + fill + '+'
     w = _term_width()
-    return "  ╰" + "─" * max(w - 4, 1) + "╯"
+    return "  +" + "-" * max(w - 4, 1) + "+"
 
 
 def box_line(content, color=None, right_pad=True):
-    """A content row: '  │ text │'. The left gutter is '  │ ' (4 chars) to
+    """A content row: '  | text |'. The left gutter is '  | ' (4 chars) to
     match box_open/box_close exactly."""
     w = _term_width()
     c = col(color, content) if color else content
-    left = "  │ "
+    left = "  | "
     if right_pad:
-        pad = w - 4 - _vlen(c) - 2   # 4 left + 2 right (' │')
+        pad = w - 4 - _vlen(c) - 2   # 4 left + 2 right (' |')
         if pad < 0:
             pad = 0
-        return left + c + " " * pad + " │"
+        return left + c + " " * pad + " |"
     return left + c
 
 
@@ -1681,7 +1682,7 @@ def box(title, lines, color):
 
 
 def style_inline(text, skin):
-    """Inline markdown → ANSI: `code`, **bold**, *italic*.
+    """Inline markdown -> ANSI: `code`, **bold**, *italic*.
 
     Returns text untouched when colors are off, so piped/NO_COLOR output keeps
     its original markdown characters.
@@ -1717,7 +1718,7 @@ class AgentWriter:
     def _write(self, s):
         if self.at_line_start:
             self.at_line_start = False
-            sys.stdout.write("  │ ")
+            sys.stdout.write("  | ")
         sys.stdout.write(s)
 
     def _nl(self):
@@ -1743,7 +1744,7 @@ class AgentWriter:
                     self._code_label = ""   # collect the language until the newline
                 else:
                     self._flush_code_label()
-                    self._emit_plain(col(self.skin["dim"], "─ end"))
+                    self._emit_plain(col(self.skin["dim"], "- end"))
             if part:
                 if self.in_code:
                     self._write_code(part)
@@ -1765,14 +1766,14 @@ class AgentWriter:
         print(box_close(), flush=True)
 
     def _flush_code_label(self):
-        """Code buffered while waiting for a language newline is real code —
+        """Code buffered while waiting for a language newline is real code -
         never drop it (single-line blocks have no newline at all)."""
         if self._code_label is None or not self._code_label.strip():
             self._code_label = None
             return
         text = self._code_label
         self._code_label = None
-        self._emit_plain(col(self.skin["dim"], "─ code ─"))
+        self._emit_plain(col(self.skin["dim"], "- code -"))
         lines = text.split("\n")
         for idx, piece in enumerate(lines):
             if piece:
@@ -1788,7 +1789,7 @@ class AgentWriter:
                 return
             label, rest = self._code_label.split("\n", 1)
             self._code_label = None
-            self._emit_plain(col(self.skin["dim"], "─ " + (label.strip() or "code") + " ─"))
+            self._emit_plain(col(self.skin["dim"], "- " + (label.strip() or "code") + " -"))
             part = rest
         lines = part.split("\n")
         for idx, piece in enumerate(lines):
@@ -1832,10 +1833,10 @@ def tool_summary(result):
     if "result" in result:
         return str(result["result"])[:80]
     if "status" in result:
-        return "HTTP %s · %s chars" % (result.get("status"), result.get("chars", "?"))
+        return "HTTP %s | %s chars" % (result.get("status"), result.get("chars", "?"))
     if "exit" in result:
         snippet = (result.get("stdout") or result.get("stderr") or "").strip()
-        return "exit %s%s" % (result.get("exit"), " · " + snippet[:60] if snippet else "")
+        return "exit %s%s" % (result.get("exit"), " | " + snippet[:60] if snippet else "")
     if "entries" in result:
         return "%d entries" % result.get("count", len(result.get("entries", [])))
     if "skills" in result:
@@ -1843,7 +1844,7 @@ def tool_summary(result):
     if "path" in result and "content" in result:
         return "%s (%s chars)" % (result.get("path"), result.get("chars", 0))
     if "path" in result and result.get("ok") is True:
-        return "%s ✓" % result.get("path")
+        return "%s [OK]" % result.get("path")
     if result.get("ok") is False:
         return str(result.get("error", "failed"))[:80]
     if "found" in result:
@@ -1858,8 +1859,8 @@ def tool_summary(result):
 class Spinner:
     """Tiny animated indicator; safe to start()/stop() repeatedly.
 
-    The verb (message) can change live — 'thinking', 'streaming', 'running
-    tools' — like the Hermes TUI's customizable busy verbs.
+    The verb (message) can change live - 'thinking', 'streaming', 'running
+    tools' - like the Hermes TUI's customizable busy verbs.
     """
 
     def __init__(self, msg="thinking"):
@@ -1906,29 +1907,29 @@ _UI = {"spinner": None}
 
 def tool_open(name, args):
     """Open line of a compact tool block, full-width to match the agent box:
-    '  ╭─ ⚙ name (args) ─────╮'."""
+    '  +- [name (args) -------+'."""
     a = fmt_args(args)
     w = _term_width()
-    label = col(CUR_SKIN["tool"], "╭─ ⚙ " + name + ((" (" + a + ")") if a else ""))
-    used = 4 + _vlen(label) + 1   # '  ╭─ '=4, +1 space before fill
+    label = col(CUR_SKIN["tool"], "+- [" + name + ((" (" + a + ")") if a else ""))
+    used = 4 + _vlen(label) + 1   # '  +- '=4, +1 space before fill
     pad = w - used - 1
     if pad < 1:
         pad = 1
-    print("  " + label + " " + "─" * pad + "╮", flush=True)
+    print("  " + label + " " + "-" * pad + "+", flush=True)
 
 
 def tool_close(name, status, result):
-    """Close line of a tool block: '  ╰─ ✓ name → summary ─╯'."""
-    mark = col(CUR_SKIN["ok"], "✓") if status == "done" else col(CUR_SKIN["err"], "✗")
+    """Close line of a tool block: '  +- [OK] name -> summary -+'."""
+    mark = col(CUR_SKIN["ok"], "[OK]") if status == "done" else col(CUR_SKIN["err"], "[ERR]")
     w = _term_width()
-    body = col(CUR_SKIN["tool"], "╰─") + " " + mark + " " + name
+    body = col(CUR_SKIN["tool"], "+- ") + " " + mark + " " + name
     if result is not None:
-        body += " " + col(CUR_SKIN["dim"], "→ " + tool_summary(result))
+        body += " " + col(CUR_SKIN["dim"], "-> " + tool_summary(result))
     used = 4 + _vlen(body) + 1
     pad = w - used - 1
     if pad < 1:
         pad = 1
-    print("  " + body + " " + "─" * pad + "╯", flush=True)
+    print("  " + body + " " + "-" * pad + "+", flush=True)
 
 
 def on_tool(tool_id, name, args, result, status):
@@ -1947,9 +1948,9 @@ def run_agent_tui(history, cfg):
     """Run the agent loop with streaming output, spinner, and live tool blocks.
 
     Returns the 'done' payload augmented with:
-      tools    — number of tool calls this turn
-      elapsed  — wall-clock seconds for the turn
-      streamed — whether any text was printed (so the caller can avoid
+      tools    - number of tool calls this turn
+      elapsed  - wall-clock seconds for the turn
+      streamed - whether any text was printed (so the caller can avoid
                  re-printing the answer, fixing the old double-print)
     """
     sp = Spinner("thinking")
@@ -1988,7 +1989,7 @@ def run_agent_tui(history, cfg):
 
 
 def trim_history(history):
-    # a pure safety net now — the context meter + auto-compress manage the real
+    # a pure safety net now - the context meter + auto-compress manage the real
     # per-model limit, so the hard cap is generous
     # never trim away a leading compression summary (that would silently lose
     # all of the summarized context)
@@ -2046,7 +2047,7 @@ def ask_permission(desc):
     if sp:
         sp.stop()
     print()
-    print(col(CUR_SKIN["err"], "  ⚠ permission needed") + "  " + desc)
+    print(col(CUR_SKIN["err"], "  [!] permission needed") + "  " + desc)
     try:
         v = input("    allow? [y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -2093,7 +2094,7 @@ def pick_model(base_url, api_key, current, fetch=True):
                 return models[idx]
         except ValueError:
             pass
-        p_info("  invalid choice — keeping %s" % keep)
+        p_info("  invalid choice - keeping %s" % keep)
         return current
     return ask("model", current)
 
@@ -2101,11 +2102,11 @@ def pick_model(base_url, api_key, current, fetch=True):
 def cmd_models(state):
     cfg = active_cfg(state)
     if not (cfg.get("base_url") or "").rstrip("/"):
-        p_err("no base url configured for '%s' — run /provider %s" % (state["active"], state["active"]))
+        p_err("no base url configured for '%s' - run /provider %s" % (state["active"], state["active"]))
         return
     cfg["model"] = pick_model(cfg.get("base_url", ""), cfg.get("api_key", ""), cfg.get("model", ""))
     save_state(state)
-    p_ok("saved ✓")
+    p_ok("saved [OK]")
 
 
 _SLASH_COMMANDS = [
@@ -2127,19 +2128,19 @@ def cmd_skin(state, rest):
         print("  usage: /skin <name>")
         return
     if arg not in SKINS:
-        p_err("unknown skin '%s' — see /skin" % arg)
+        p_err("unknown skin '%s' - see /skin" % arg)
         return
     state["skin"] = arg
     save_state(state)
     set_active_skin(state)
-    p_ok("skin set to '%s' ✓" % arg)
+    p_ok("skin set to '%s' [OK]" % arg)
 
 
 def cmd_sessions():
     """List saved sessions (name, message count, last updated)."""
     sess = sessions_map()
     if not sess:
-        print("  (no sessions yet — /session <name> starts one)")
+        print("  (no sessions yet - /session <name> starts one)")
         return
     active = _store_get(ACTIVE_SESSION_KEY, "default")
     print("  sessions (%d):" % len(sess))
@@ -2147,9 +2148,9 @@ def cmd_sessions():
         rec = sess[name]
         n = len(rec.get("messages") or [])
         upd = (rec.get("updated") or "")[11:16] or "?"
-        mark = "▶" if name == active else " "
-        print("   %s %-22s %3d msgs · %s" % (mark, name[:22], n, upd))
-    print("  usage: /session <name> · /session rm <name> · /session rename <old> <new>")
+        mark = ">" if name == active else " "
+        print("   %s %-22s %3d msgs | %s" % (mark, name[:22], n, upd))
+    print("  usage: /session <name> | /session rm <name> | /session rename <old> <new>")
 
 
 def cmd_context(state, rest, history):
@@ -2169,12 +2170,12 @@ def cmd_context(state, rest, history):
             return
         cfg["context_window"] = w
         save_state(state)
-        p_ok("context window set to %s ✓" % (_fmt_k(w) if w else "auto"))
+        p_ok("context window set to %s [OK]" % (_fmt_k(w) if w else "auto"))
         return
     if sub in ("auto", "autocompress", "auto-compress"):
         cfg["auto_compress"] = not cfg.get("auto_compress", True)
         save_state(state)
-        p_ok("auto-compress %s ✓" % ("on" if cfg["auto_compress"] else "off"))
+        p_ok("auto-compress %s [OK]" % ("on" if cfg["auto_compress"] else "off"))
         return
     tokens, window = context_usage(history, cfg)
     pct = tokens * 100 // window if window else 0
@@ -2188,13 +2189,13 @@ def cmd_context(state, rest, history):
     print("    auto-compress : %s  at 75%% of the window   (/context autocompress toggles)"
           % ("on" if cfg.get("auto_compress", True) else "off"))
     if pct >= 85:
-        p_warn("context is %d%% full — /new starts a fresh session · /compress summarizes now" % pct)
+        p_warn("context is %d%% full - /new starts a fresh session | /compress summarizes now" % pct)
 
 
 def cmd_compress(history, state, session):
     """Manually summarize older messages to free context (persists immediately)."""
     if len(history) < 8:
-        p_info("(conversation is short — nothing to compress)")
+        p_info("(conversation is short - nothing to compress)")
         return
     if compress_now(history, active_cfg(state), force=True):
         save_session(session, history)
@@ -2203,7 +2204,7 @@ def cmd_compress(history, state, session):
 def cmd_help():
     print("  commands:")
     print("    /help /?               this help")
-    print("    /sessions              list saved sessions (name · messages · updated)")
+    print("    /sessions              list saved sessions (name | messages | updated)")
     print("    /session <name>        switch to (or create) a session")
     print("    /session rm <name>     delete a session      /session rename <old> <new>")
     print("    /new                   start a fresh session (the current one is saved)")
@@ -2259,7 +2260,7 @@ def cmd_config(state):
              "y" if cfg.get("auto_compress", True) else "n").strip().lower()
     cfg["auto_compress"] = ac in ("y", "yes", "on", "1", "true")
     save_state(state)
-    p_ok("saved ✓")
+    p_ok("saved [OK]")
 
 
 def _list_providers(state):
@@ -2270,10 +2271,10 @@ def _list_providers(state):
     print("  providers:")
     for name, p in profiles.items():
         mark = "   <- active" if name == state["active"] else ""
-        print("    %-12s %s · model %s · key %s%s"
+        print("    %-12s %s | model %s | key %s%s"
               % (name, p.get("base_url") or "(no base)",
                  p.get("model") or "-", mask_key(p.get("api_key", "")), mark))
-    print("  usage: /provider <name> (add or switch) · /provider rm <name>")
+    print("  usage: /provider <name> (add or switch) | /provider rm <name>")
     print("  presets: openai | groq | openrouter | gemini | custom   (any other name = custom endpoint)")
 
 
@@ -2300,7 +2301,7 @@ def cmd_provider(state, rest):
             if state["active"] not in profiles:
                 profiles[state["active"]] = dict(DEFAULT_CFG)
         save_state(state)
-        p_ok("removed '%s' ✓" % sub)
+        p_ok("removed '%s' [OK]" % sub)
         return
     if not arg:
         _list_providers(state)
@@ -2310,10 +2311,10 @@ def cmd_provider(state, rest):
     if arg in profiles:
         state["active"] = arg
         save_state(state)
-        p_ok("switched to '%s' ✓" % arg)
+        p_ok("switched to '%s' [OK]" % arg)
         return
 
-    # add a new provider — a fresh profile, never inherits another provider's key
+    # add a new provider - a fresh profile, never inherits another provider's key
     p = PROVIDERS.get(arg)
     prof = dict(FIRST_RUN_CFG)
     if p:
@@ -2328,14 +2329,14 @@ def cmd_provider(state, rest):
     profiles[arg] = prof
     state["active"] = arg
     save_state(state)
-    p_ok("added '%s' ✓" % arg)
+    p_ok("added '%s' [OK]" % arg)
 
 
 def cmd_test(state):
     cfg = active_cfg(state)
     base = (cfg.get("base_url") or "").rstrip("/")
     if not base:
-        p_err("no base url configured for '%s' — run /provider %s" % (state["active"], state["active"]))
+        p_err("no base url configured for '%s' - run /provider %s" % (state["active"], state["active"]))
         return
     req = urllib.request.Request(
         base + "/models",
@@ -2345,10 +2346,10 @@ def cmd_test(state):
         with urllib.request.urlopen(req, timeout=20) as r:
             data = json.loads(r.read().decode("utf-8", errors="replace"))
         n = len(data.get("data") or [])
-        p_ok("Connected ✓ · %d model%s available" % (n, "" if n == 1 else "s"))
+        p_ok("Connected [OK] | %d model%s available" % (n, "" if n == 1 else "s"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        p_err("HTTP %d — %s" % (e.code, _readable_error(e.code, body)))
+        p_err("HTTP %d - %s" % (e.code, _readable_error(e.code, body)))
     except Exception as e:
         p_err("cannot reach API: %s" % e)
 
@@ -2429,7 +2430,7 @@ def cmd_skills():
     r = tool_skill_list()
     names = r.get("skills") or []
     if not names:
-        print("  (no skills yet — ask the agent to save one)")
+        print("  (no skills yet - ask the agent to save one)")
         return
     print("  skills (%d):" % len(names))
     for n in names:
@@ -2449,7 +2450,7 @@ def cmd_install_skill(rest):
         name = os.path.basename(path).replace(".md", "")
         r = tool_skill_save(name, content)
         if r.get("ok"):
-            p_ok("installed skill '%s' ✓" % name)
+            p_ok("installed skill '%s' [OK]" % name)
         else:
             p_err("failed to save skill: %s" % r.get("error", "unknown error"))
     except Exception as e:
@@ -2489,7 +2490,7 @@ def cmd_export(history):
 
 def cmd_multi():
     """Collect multi-line input until '.' on its own line or Ctrl+D."""
-    print(col(C.DIM, "  (multi-line mode — type '.' alone to submit, Ctrl+C to cancel)"))
+    print(col(C.DIM, "  (multi-line mode - type '.' alone to submit, Ctrl+C to cancel)"))
     lines = []
     try:
         while True:
@@ -2551,28 +2552,28 @@ def banner(state):
     skin = CUR_SKIN
     lines = [
         "autonomous terminal agent  " + col(C.DIM, "v" + ALVA_VERSION),
-        "shell · files · skills · self-improvement",
+        "shell | files | skills | self-improvement",
         "",
-        col(skin["chip"], "●") + " skin " + (state.get("skin") or DEFAULT_SKIN)
-        + "   " + col(skin["chip"], "●") + " provider " + state["active"]
-        + "   " + col(skin["chip"], "●") + " model " + (cfg.get("model") or "?"),
-        col(skin["chip"], "●") + " ctx " + _fmt_k(context_window_for(cfg))
-        + "   " + col(skin["chip"], "●") + " auto-compress "
+        col(skin["chip"], "*") + " skin " + (state.get("skin") or DEFAULT_SKIN)
+        + "   " + col(skin["chip"], "*") + " provider " + state["active"]
+        + "   " + col(skin["chip"], "*") + " model " + (cfg.get("model") or "?"),
+        col(skin["chip"], "*") + " ctx " + _fmt_k(context_window_for(cfg))
+        + "   " + col(skin["chip"], "*") + " auto-compress "
         + ("on" if cfg.get("auto_compress", True) else "off"),
         col(C.DIM, "config/store: " + DATA_DIR),
     ]
     print()
-    print(box("⚡ alvaagent", lines, skin["accent"]))
-    print("  " + col(C.DIM, "type a message · /help lists commands · Tab completes /commands"))
+    print(box("[*] alvaagent", lines, skin["accent"]))
+    print("  " + col(C.DIM, "type a message | /help lists commands | Tab completes /commands"))
     print()
     if not cfg.get("api_key"):
-        p_info("no API key set for '%s' — run /provider %s or /config" % (state["active"], state["active"]))
+        p_info("no API key set for '%s' - run /provider %s or /config" % (state["active"], state["active"]))
 
 
 def render_status_bar(state, session, elapsed, tools, history):
     """Render a one-line status footer after each agent turn (Hermes-style).
 
-    Uses normal print flow — no raw ANSI cursor jumps, which misalign on
+    Uses normal print flow - no raw ANSI cursor jumps, which misalign on
     Termux (no reliable terminal height). Prints a dim, boxed-style line.
     """
     cfg = active_cfg(state)
@@ -2581,13 +2582,13 @@ def render_status_bar(state, session, elapsed, tools, history):
     pct = tokens * 100 // window if window else 0
     ctx_col = skin["ok"] if pct < 60 else (C.YELLOW if pct < 85 else skin["err"])
     parts = [
-        col(skin["chip"], "●") + " " + col(skin["dim"], session[:16]),
-        col(skin["chip"], "●") + " " + col(skin["dim"], state["active"] + "/" + (cfg.get("model") or "?")),
-        col(skin["chip"], "●") + " " + col(ctx_col, "ctx %d%%" % pct),
-        col(skin["chip"], "●") + " " + col(skin["dim"], "%.1fs" % elapsed),
-        col(skin["chip"], "●") + " " + col(skin["dim"], "%d tool calls" % (tools or 0)),
+        col(skin["chip"], "*") + " " + col(skin["dim"], session[:16]),
+        col(skin["chip"], "*") + " " + col(skin["dim"], state["active"] + "/" + (cfg.get("model") or "?")),
+        col(skin["chip"], "*") + " " + col(ctx_col, "ctx %d%%" % pct),
+        col(skin["chip"], "*") + " " + col(skin["dim"], "%.1fs" % elapsed),
+        col(skin["chip"], "*") + " " + col(skin["dim"], "%d tool calls" % (tools or 0)),
     ]
-    print(col(C.DIM, "  └─ " + "   ".join(parts)))
+    print(col(C.DIM, "  |- " + "   ".join(parts)))
 
 def status_footer(state, session, elapsed, tools, history):
     render_status_bar(state, session, elapsed, tools, history)
@@ -2608,7 +2609,7 @@ def send_message(text, history, state, session):
     print(box("you", [text], CUR_SKIN["user"]))
     history.append({"role": "user", "content": text})
     trim_history(history)
-    # pre-turn safety: only act if the window is nearly full (0.9) — the post-turn
+    # pre-turn safety: only act if the window is nearly full (0.9) - the post-turn
     # check (0.75) is the normal compressor, so both rarely fire in one turn
     if cfg.get("auto_compress", True):
         compress_now(history, cfg, threshold=0.9)
@@ -2643,7 +2644,7 @@ def send_message(text, history, state, session):
     status_footer(state, session, res.get("elapsed", 0.0), res.get("tools", 0), history)
     pct = tokens * 100 // window if window else 0
     if not compressed and window and pct >= 85:
-        p_warn("context at %d%% of %s — /new starts a fresh session · /compress summarizes older messages"
+        p_warn("context at %d%% of %s - /new starts a fresh session | /compress summarizes older messages"
                % (pct, _fmt_k(window)))
     save_session(session, history)
     return session
@@ -2657,7 +2658,7 @@ def repl():
     history = load_session(session)
     while True:
         try:
-            prompt = col(CUR_SKIN["accent"], "❯ ") if COLOR else "❯ "
+            prompt = col(CUR_SKIN["accent"], "> ") if COLOR else "> "
             line = input(prompt)
         except EOFError:
             print()
@@ -2701,10 +2702,10 @@ def repl():
                     elif target is None:
                         p_err("no session named '%s'" % sub)
                     elif target.lower() == session.lower():
-                        p_err("that's the active session — switch first (/session <name>)")
+                        p_err("that's the active session - switch first (/session <name>)")
                     else:
                         delete_session(target)
-                        p_ok("deleted session '%s' ✓" % target)
+                        p_ok("deleted session '%s' [OK]" % target)
                 elif arg in ("rename", "mv"):
                     old, _, new = sub.partition(" ")
                     old, new = old.strip(), new.strip()
@@ -2719,7 +2720,7 @@ def repl():
                         _rename_session_in_store(target, new)
                         if session.lower() == target.lower():
                             session = new
-                        p_ok("renamed '%s' → '%s' ✓" % (target, new))
+                        p_ok("renamed '%s' -> '%s' [OK]" % (target, new))
                 else:
                     save_session(session, history)  # persist the outgoing session
                     target = _find_session(arg)
@@ -2729,7 +2730,7 @@ def repl():
                     history[:] = load_session(target)
                     session = target
                     save_session(session, history)  # mark active + refresh timestamp
-                    p_ok("switched to session '%s' · %d messages" % (session, len(history)))
+                    p_ok("switched to session '%s' | %d messages" % (session, len(history)))
             elif c == "/context":
                 cmd_context(state, rest, history)
             elif c == "/compress":
@@ -2756,7 +2757,7 @@ def repl():
                 cmd_export(history)
             elif c == "/stop":
                 cancel_agent()
-                p_info("stopping…")
+                p_info("stopping...")
             elif c in ("/exit", "/quit", "/q"):
                 break
             else:
@@ -2767,7 +2768,7 @@ def repl():
         save_completion_history()  # persist input history after each turn
     save_session(session, history)
     save_completion_history()  # flush readline history to disk on exit
-    print(col(C.DIM, "bye 👋"))
+    print(col(C.DIM, "bye"))
 
 
 def main():
