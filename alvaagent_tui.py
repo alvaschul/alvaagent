@@ -82,6 +82,7 @@ _LEGACY_DIRS = [
 ]
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 STORE_PATH = os.path.join(DATA_DIR, "store.json")
+HISTORY_PATH = os.path.join(DATA_DIR, "cmd_history.txt")
 
 PROVIDERS = {
     "openai":     {"label": "OpenAI",                   "base": "https://api.openai.com/v1",                      "model": "gpt-4o-mini"},
@@ -2487,10 +2488,27 @@ def new_session_name():
 
 def setup_completion():
     """Tab-complete slash commands via readline (Hermes-style autocomplete,
-    adapted to a line-oriented Termux prompt)."""
+    adapted to a line-oriented Termux prompt). Also loads + persists input
+    history so up-arrow recall survives restarts (important on Termux, where
+    you launch the TUI fresh each time you open the app)."""
     try:
+        # Clear any in-memory history first so re-loading the file doesn't
+        # duplicate entries (readline appends on read_history_file).
+        readline.clear_history()
+        # Load persisted command history (silent if absent)
+        if os.path.exists(HISTORY_PATH):
+            readline.read_history_file(HISTORY_PATH)
+        readline.set_history_length(2000)  # keep last 2000 entries
         readline.set_completer(_slash_complete)
         readline.parse_and_bind("tab: complete")
+    except Exception:
+        pass
+
+
+def save_completion_history():
+    """Flush readline history to disk (called on exit and after each turn)."""
+    try:
+        readline.write_history_file(HISTORY_PATH)
     except Exception:
         pass
 
@@ -2617,9 +2635,11 @@ def repl():
             line = input(prompt)
         except EOFError:
             print()
+            save_completion_history()
             break
         except KeyboardInterrupt:
             print()
+            save_completion_history()
             break
         line = line.strip()
         if not line:
@@ -2718,7 +2738,9 @@ def repl():
             continue
 
         session = send_message(line, history, state, session)
+        save_completion_history()  # persist input history after each turn
     save_session(session, history)
+    save_completion_history()  # flush readline history to disk on exit
     print(col(C.DIM, "bye 👋"))
 
 

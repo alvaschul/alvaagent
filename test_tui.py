@@ -377,6 +377,24 @@ try:
     finally:
         pa.urllib.request.urlopen = _orig_urlopen
 
+    # ---------- UX: command history persists across restarts ----------
+    import readline as _rl
+    _htmp = os.path.join(DATA, "_hist_probe.txt")
+    pa.HISTORY_PATH = _htmp
+    pa.setup_completion()           # fresh load (no file yet)
+    _rl.add_history("/provider add")
+    _rl.add_history("remember my name is Alex")
+    _rl.add_history("/help")
+    pa.save_completion_history()
+    assert_ok(os.path.exists(_htmp), "history file written to disk")
+    # simulate a restart: re-load from disk
+    pa.setup_completion()
+    assert_ok(_rl.get_current_history_length() == 3, "history reloads after restart (no dupes)")
+    # calling setup_completion again must not duplicate
+    pa.setup_completion()
+    assert_ok(_rl.get_current_history_length() == 3, "re-calling setup_completion does not duplicate history")
+    os.remove(_htmp)
+
     print("\nALL TESTS PASSED ✓" if failures == 0 else "\n%d TEST(S) FAILED ✗" % failures)
     sys.exit(0 if failures == 0 else 1)
 finally:

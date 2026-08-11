@@ -80,6 +80,8 @@ you> /sessions     # list saved conversations
 Slash commands: `/help /config /provider /models /test /tools /todos /todo
 /memory /skin /sessions /session /new /clear /context /compress /multi /export
 /stop /exit`. `Ctrl+C` cancels a running request; Tab completes slash commands.
+**Command history persists across restarts** (up-arrow recalls previous inputs) —
+stored in `.alvaagent/cmd_history.txt`.
 
 ## Tests
 ```bash

@@ -9,8 +9,10 @@ package-lock.json
 # Local data / runtime state
 .alvaagent/store.json
 .alvaagent/config.json
+.alvaagent/cmd_history.txt
 *.log
 
 # Secrets / runtime state (tracked by mistake earlier — now untracked)
 .alvaagent/config.json
 .alvaagent/store.json
+.alvaagent/cmd_history.txt
