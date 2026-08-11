@@ -30,7 +30,12 @@ pkg update && pkg install -y python git
 git clone https://github.com/alvaschul/alvaagent.git
 cd alvaagent
 
-# 3. Run
+# 3. (optional) make `alvaagent` runnable from anywhere — like hermes
+ln -sf "$PWD/alvaagent" /data/data/com.termux/files/usr/bin/alvaagent
+
+# 4. Run
+alvaagent            # if you did step 3
+# or:
 python3 alvaagent_tui.py
 ```
 
@@ -102,6 +107,7 @@ tests for the command classifier and atomic store writes).
 ## Updating
 ```bash
 git pull        # pull the latest from this repo
-python3 alvaagent_tui.py
+alvaagent       # run — the symlink always points at the updated script
 ```
-Your local `.alvaagent/` data is never touched by a pull.
+Your local `.alvaagent/` data is never touched by a pull. Because the launcher
+is a symlink, you never re-run the `ln` command after a pull.
