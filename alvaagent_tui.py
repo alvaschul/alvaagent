@@ -2,9 +2,9 @@
 # ============================================================
 #  alvaagent_tui.py — alvaagent terminal chat client
 #
-#  Same agent harness as the browser app (index.html), ported to
-#  plain Python so it runs entirely inside Termux — no browser,
-#  no web server, nothing to disconnect when you switch apps.
+#  Same agent harness ported to plain Python so it runs entirely inside
+#  Termux — no browser, no web server, nothing to disconnect when you
+#  switch apps.
 #
 #  Uses only the Python standard library (no pip installs needed).
 #
@@ -897,7 +897,7 @@ You can call tools to do real work. Guidelines:
    as a skill with a descriptive name and a concise body (trigger + steps).
    Keep skills small and self-contained so they stay easy to apply and test.
 8. Self-improvement: you may read your OWN source (alvaagent_tui.py,
-   index.html, start.sh, test_tui.py) and improve it with file_edit/
+   start.sh, test_tui.py) and improve it with file_edit/
    file_write, then validate with run_command("python3 -m py_compile
    alvaagent_tui.py") and run_command("python3 test_tui.py"). Changes take
    effect the next time the user restarts the TUI — always say so, and keep
