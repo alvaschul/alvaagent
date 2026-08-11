@@ -10,3 +10,7 @@ package-lock.json
 .alvaagent/store.json
 .alvaagent/config.json
 *.log
+
+# Secrets / runtime state (tracked by mistake earlier — now untracked)
+.alvaagent/config.json
+.alvaagent/store.json
