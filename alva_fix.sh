@@ -22,7 +22,13 @@ else
   echo "[!] no config found — you'll be prompted to set up a provider on first run"
 fi
 
-# 3) launch the correct version from the git repo
+# 3) ensure 'rich' is available (Hermes-style panels depend on it)
+python3 -c "import rich" 2>/dev/null || pip install --user rich 2>/dev/null || pip install rich 2>/dev/null || true
+if ! python3 -c "import rich" 2>/dev/null; then
+  echo "[!] 'rich' not importable - panels may fall back; try: pip install rich"
+fi
+
+# 4) launch the correct version from the git repo
 cd "$REPO" || { echo "cd $REPO failed"; exit 1; }
 echo "[ok] launching from: $(pwd)"
 exec python3 alvaagent_tui.py

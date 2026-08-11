@@ -6,7 +6,8 @@
 #  Termux - no browser, no web server, nothing to disconnect when you
 #  switch apps.
 #
-#  Uses only the Python standard library (no pip installs needed).
+#  Uses only the Python standard library plus `rich` (pure-Python, pip-installs
+#  on Termux - see alva_fix.sh). `rich` backs the Hermes-style panels.
 #
 #  Run:
 #    python3 alvaagent_tui.py     (or:  bash start.sh tui)
@@ -57,6 +58,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+# Rich backs the Hermes-style panels (pure-Python, pip-installs on Termux).
+# The Hermes agent TUI renders with Rich `Panel(box=HORIZONTALS)`; we mirror
+# that exactly so alvaagent reads as Hermes. `pip install rich` is run by
+# alva_fix.sh before launch.
+from rich.console import Console
+from rich.panel import Panel
+from rich.box import HORIZONTALS
+_CON = Console()
 
 # ---------------- paths / config ----------------
 # Data lives next to this script (survives distro reinstalls on Termux
@@ -1628,57 +1638,89 @@ def _wrap_text(text, w):
     return out
 
 
-def box_open(title, color):
-    """Top border of a block, e.g. '  +-- agent --------+'.
+# ---------------- Hermes-style display (rule-only panels) ----------------
+# Mirrors the Hermes agent TUI: Rich `Panel(box=HORIZONTALS)` for static
+# blocks (banner, buffered agent reply) and matching raw-ANSI rule borders
+# for live streaming. Hermes' palette is fixed (gold user bullet, bronze
+# agent border) so the UI reads as Hermes regardless of the /skin palette.
+HERMES_ACCENT = "#FFD700"   # gold   - user bullet / banner title
+HERMES_BORDER = "#CD7F32"   # bronze - agent reply border (Hermes response_border)
+HERMES_TEXT   = "#FFF8DC"   # cream  - agent text
+HERMES_DIM    = "#8B8682"   # session border / chips / tool dividers
+HERMES_OK     = "#8FBC8F"
+HERMES_ERR    = "#CD5C5C"
 
-    Uses ASCII borders so it renders on every terminal/font (some Android
-    Termux fonts drop Unicode box-drawing glyphs). The left gutter is always
-    EXACTLY 4 visible chars: '  +- ' (2 indent + border + 1 inner space).
-    box_line and box_close must match this so every row aligns.
-    """
+
+def _hrgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _fgh(h):
+    """Foreground ANSI for a hex color (respects COLOR/NO_COLOR)."""
+    return ("\x1b[38;2;%d;%d;%dm" % _hrgb(h)) if COLOR else ""
+
+
+def _rsth():
+    return C.RESET if COLOR else ""
+
+
+def _rule_h(top_title, hexcol, width=None):
+    """Top border of a Hermes HORIZONTALS panel: '─ title ─────'."""
+    w = width or _term_width()
+    inner = (" " + top_title + " ") if top_title else ""
+    dashes = "─" * max(w - len(inner) - 1, 1)
+    print(_fgh(hexcol) + "─" + inner + dashes + _rsth())
+
+
+def _rule_bottom(hexcol, width=None):
+    """Bottom border of a Hermes HORIZONTALS panel: '──────────'."""
+    w = width or _term_width()
+    print(_fgh(hexcol) + "─" * w + _rsth())
+
+
+def _rule_dim(label):
+    """A dim tool-call divider: '─ ▸ label ───────'."""
     w = _term_width()
-    t = title
-    # left = '  +- ' (4), then title, then ' ' (1) before the fill rule
-    inner = col(color, t) + " "
-    left = "  +- "
-    used = 4 + _vlen(inner) + 1   # +1 for the space after the title
-    pad = w - used - 1            # -1 for the closing '+'
-    while pad < 1 and t:          # shrink an over-long title instead of overflowing
-        t = t[:-1]
-        inner = col(color, t) + " "
-        used = 4 + _vlen(inner) + 1
-        pad = w - used - 1
-    return left + inner + "-" * max(pad, 1) + "+"
+    inner = " " + label + " "
+    dashes = "─" * max(w - len(inner) - 1, 1)
+    print(_fgh(HERMES_DIM) + "─" + inner + dashes + _rsth())
 
 
-def box_close():
-    # left gutter must match box_open's '  +- ' -> here '  +' + fill + '+'
-    w = _term_width()
-    return "  +" + "-" * max(w - 4, 1) + "+"
+def print_user_turn(text, show_ts=False):
+    """Hermes user scrollback: gold rule + '●' bullet + bold text."""
+    print(_fgh(HERMES_ACCENT) + "─" * 40 + _rsth())
+    ts = (" " + datetime.datetime.now().strftime("%H:%M")) if show_ts else ""
+    for i, line in enumerate(text.split("\n")):
+        if i == 0:
+            print(_fgh(HERMES_ACCENT) + "●" + _rsth() + " " + C.BOLD + line + _rsth()
+                  + _fgh(HERMES_DIM) + ts + _rsth())
+        else:
+            print("  " + C.BOLD + line + _rsth())
 
 
-def box_line(content, color=None, right_pad=True):
-    """A content row: '  | text |'. The left gutter is '  | ' (4 chars) to
-    match box_open/box_close exactly."""
-    w = _term_width()
-    c = col(color, content) if color else content
-    left = "  | "
-    if right_pad:
-        pad = w - 4 - _vlen(c) - 2   # 4 left + 2 right (' |')
-        if pad < 0:
-            pad = 0
-        return left + c + " " * pad + " |"
-    return left + c
+def render_agent_panel(text, skin=None):
+    """Buffered agent reply as a Rich HORIZONTALS panel (Hermes style)."""
+    _CON.print(Panel(
+        style_inline(text, skin or CUR_SKIN),
+        title="[bold %s]⚕ alvaagent[/]" % HERMES_BORDER,
+        title_align="left",
+        border_style=HERMES_BORDER,
+        box=HORIZONTALS,
+        padding=(1, 0),
+        width=_term_width(),
+    ))
 
 
-def box(title, lines, color):
-    """A complete static block (used for the 'you' bubble and the banner)."""
-    out = [box_open(title, color)]
-    for ln in lines:
-        for piece in _wrap_text(ln, _content_w()):
-            out.append(box_line(piece))
-    out.append(box_close())
-    return "\n".join(out)
+def banner_panel(lines, title, border_hex=HERMES_BORDER, title_hex=HERMES_ACCENT):
+    """Full-bordered Rich Panel for the startup banner (Hermes banner.py)."""
+    _CON.print(Panel(
+        "\n".join(lines),
+        title="[bold %s]%s[/]" % (title_hex, title),
+        border_style=border_hex,
+        padding=(0, 2),
+        width=_term_width(),
+    ))
 
 
 def style_inline(text, skin):
@@ -1707,7 +1749,7 @@ class AgentWriter:
 
     def __init__(self, skin, color):
         self.skin = skin
-        self.color = color
+        self.color = color  # kept for API compat; border is Hermes bronze
         self.in_code = False
         self._code_label = None   # not None while waiting for the code-fence language
         self.started = False
@@ -1718,7 +1760,7 @@ class AgentWriter:
     def _write(self, s):
         if self.at_line_start:
             self.at_line_start = False
-            sys.stdout.write("  | ")
+            sys.stdout.write("  ")   # Hermes HORIZONTALS gutter: 2-space indent
         sys.stdout.write(s)
 
     def _nl(self):
@@ -1735,7 +1777,7 @@ class AgentWriter:
     def feed(self, chunk):
         if not self.started:
             self.started = True
-            print(box_open("agent", self.color), flush=True)
+            _rule_h("⚕ alvaagent", HERMES_BORDER)   # top rule of the reply block
         parts = chunk.split("```")
         for i, part in enumerate(parts):
             if i > 0:
@@ -1744,7 +1786,7 @@ class AgentWriter:
                     self._code_label = ""   # collect the language until the newline
                 else:
                     self._flush_code_label()
-                    self._emit_plain(col(self.skin["dim"], "- end"))
+                    self._emit_plain("```")
             if part:
                 if self.in_code:
                     self._write_code(part)
@@ -1760,26 +1802,22 @@ class AgentWriter:
         if self.in_code:
             self.in_code = False
             self._flush_code_label()
-            self._emit_plain(col(self.skin["dim"], "─ end"))
+            self._emit_plain("```")
         if not self.at_line_start:
             self._nl()
-        print(box_close(), flush=True)
+        _rule_bottom(HERMES_BORDER)   # bottom rule of the reply block
 
     def _flush_code_label(self):
         """Code buffered while waiting for a language newline is real code -
-        never drop it (single-line blocks have no newline at all)."""
+        never drop it (single-line blocks have no newline at all). Emits a
+        clean ```lang fence (Hermes renders fenced code as-is, no labels)."""
         if self._code_label is None or not self._code_label.strip():
             self._code_label = None
             return
-        text = self._code_label
+        lang = self._code_label.strip()
         self._code_label = None
-        self._emit_plain(col(self.skin["dim"], "- code -"))
-        lines = text.split("\n")
-        for idx, piece in enumerate(lines):
-            if piece:
-                self._write(col(self.skin["code"], piece))
-            if idx < len(lines) - 1:
-                self._nl()
+        self._emit_plain("```" + lang)
+        # content follows in the next feed() part
 
     # ---- content writers ----
     def _write_code(self, part):
@@ -1789,7 +1827,7 @@ class AgentWriter:
                 return
             label, rest = self._code_label.split("\n", 1)
             self._code_label = None
-            self._emit_plain(col(self.skin["dim"], "- " + (label.strip() or "code") + " -"))
+            self._emit_plain("```" + label.strip())
             part = rest
         lines = part.split("\n")
         for idx, piece in enumerate(lines):
@@ -1906,30 +1944,19 @@ _UI = {"spinner": None}
 
 
 def tool_open(name, args):
-    """Open line of a compact tool block, full-width to match the agent box:
-    '  +- [name (args) -------+'."""
+    """Hermes-style tool divider: '─ ▸ name (args) ─────'. Dim, rule-only."""
     a = fmt_args(args)
-    w = _term_width()
-    label = col(CUR_SKIN["tool"], "+- [" + name + ((" (" + a + ")") if a else ""))
-    used = 4 + _vlen(label) + 1   # '  +- '=4, +1 space before fill
-    pad = w - used - 1
-    if pad < 1:
-        pad = 1
-    print("  " + label + " " + "-" * pad + "+", flush=True)
+    label = "▸ " + name + ((" (" + a + ")") if a else "")
+    _rule_dim(label)
 
 
 def tool_close(name, status, result):
-    """Close line of a tool block: '  +- [OK] name -> summary -+'."""
-    mark = col(CUR_SKIN["ok"], "[OK]") if status == "done" else col(CUR_SKIN["err"], "[ERR]")
-    w = _term_width()
-    body = col(CUR_SKIN["tool"], "+- ") + " " + mark + " " + name
+    """Close line of a tool block: '─ ✓ name -> summary ──────'."""
+    mark = ("✓ " if status == "done" else "✗ ")
+    label = mark + name
     if result is not None:
-        body += " " + col(CUR_SKIN["dim"], "-> " + tool_summary(result))
-    used = 4 + _vlen(body) + 1
-    pad = w - used - 1
-    if pad < 1:
-        pad = 1
-    print("  " + body + " " + "-" * pad + "+", flush=True)
+        label += "  " + tool_summary(result)
+    _rule_dim(label)
 
 
 def on_tool(tool_id, name, args, result, status):
@@ -2554,16 +2581,16 @@ def banner(state):
         "autonomous terminal agent  " + col(C.DIM, "v" + ALVA_VERSION),
         "shell | files | skills | self-improvement",
         "",
-        col(skin["chip"], "*") + " skin " + (state.get("skin") or DEFAULT_SKIN)
-        + "   " + col(skin["chip"], "*") + " provider " + state["active"]
-        + "   " + col(skin["chip"], "*") + " model " + (cfg.get("model") or "?"),
-        col(skin["chip"], "*") + " ctx " + _fmt_k(context_window_for(cfg))
-        + "   " + col(skin["chip"], "*") + " auto-compress "
+        col(C.DIM, "skin ") + (state.get("skin") or DEFAULT_SKIN)
+        + "   " + col(C.DIM, "provider ") + state["active"]
+        + "   " + col(C.DIM, "model ") + (cfg.get("model") or "?"),
+        col(C.DIM, "ctx ") + _fmt_k(context_window_for(cfg))
+        + "   " + col(C.DIM, "auto-compress ")
         + ("on" if cfg.get("auto_compress", True) else "off"),
-        col(C.DIM, "config/store: " + DATA_DIR),
+        col(C.DIM, "config/store: ") + DATA_DIR,
     ]
     print()
-    print(box("[*] alvaagent", lines, skin["accent"]))
+    banner_panel(lines, "⚕ alvaagent")
     print("  " + col(C.DIM, "type a message | /help lists commands | Tab completes /commands"))
     print()
     if not cfg.get("api_key"):
@@ -2582,13 +2609,14 @@ def render_status_bar(state, session, elapsed, tools, history):
     pct = tokens * 100 // window if window else 0
     ctx_col = skin["ok"] if pct < 60 else (C.YELLOW if pct < 85 else skin["err"])
     parts = [
-        col(skin["chip"], "*") + " " + col(skin["dim"], session[:16]),
-        col(skin["chip"], "*") + " " + col(skin["dim"], state["active"] + "/" + (cfg.get("model") or "?")),
-        col(skin["chip"], "*") + " " + col(ctx_col, "ctx %d%%" % pct),
-        col(skin["chip"], "*") + " " + col(skin["dim"], "%.1fs" % elapsed),
-        col(skin["chip"], "*") + " " + col(skin["dim"], "%d tool calls" % (tools or 0)),
+        col(skin["dim"], session[:16]),
+        col(skin["dim"], state["active"] + "/" + (cfg.get("model") or "?")),
+        col(ctx_col, "ctx %d%%" % pct),
+        col(skin["dim"], "%.1fs" % elapsed),
+        col(skin["dim"], "%d tool calls" % (tools or 0)),
     ]
-    print(col(C.DIM, "  |- " + "   ".join(parts)))
+    # Hermes-style footer: dim '│' prefix + space-separated chips.
+    print(col(C.DIM, "  " + "│".join([""] + parts)))
 
 def status_footer(state, session, elapsed, tools, history):
     render_status_bar(state, session, elapsed, tools, history)
@@ -2606,7 +2634,7 @@ def send_message(text, history, state, session):
             _rename_session_in_store(session, new_name)
             session = new_name
     print()
-    print(box("you", [text], CUR_SKIN["user"]))
+    print_user_turn(text)
     history.append({"role": "user", "content": text})
     trim_history(history)
     # pre-turn safety: only act if the window is nearly full (0.9) - the post-turn
@@ -2635,7 +2663,7 @@ def send_message(text, history, state, session):
         save_session(session, history)
         return session
     if not res.get("streamed"):
-        p_agent(res.get("content") or "")
+        render_agent_panel(res.get("content") or "")
     # post-turn: auto-compress if the response pushed us past the threshold
     compressed = False
     if cfg.get("auto_compress", True):
