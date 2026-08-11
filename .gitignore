@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Node (only needed for the optional Pyodide test harness)
+node_modules/
+package-lock.json
+
+# Local data / runtime state
+.alvaagent/store.json
+.alvaagent/config.json
+*.log
