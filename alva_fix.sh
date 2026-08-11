@@ -23,9 +23,20 @@ else
 fi
 
 # 3) ensure 'rich' is available (Hermes-style panels depend on it)
-python3 -c "import rich" 2>/dev/null || pip install --user rich 2>/dev/null || pip install rich 2>/dev/null || true
+#    Termux Python is externally-managed (PEP 668) -> plain `pip install`
+#    fails; use --break-system-packages (or `pkg install python-rich`).
 if ! python3 -c "import rich" 2>/dev/null; then
-  echo "[!] 'rich' not importable - panels may fall back; try: pip install rich"
+  echo "[*] rich not found - installing..."
+  python3 -m pip install --break-system-packages rich 2>&1 | tail -4 \
+    || pip install --break-system-packages rich 2>&1 | tail -4 \
+    || pkg install -y python-rich 2>&1 | tail -4 \
+    || true
+fi
+if python3 -c "import rich" 2>/dev/null; then
+  echo "[ok] rich ready"
+else
+  echo "[!] 'rich' still not importable."
+  echo "    Install manually, then re-run:  pip install --break-system-packages rich"
 fi
 
 # 4) launch the correct version from the git repo

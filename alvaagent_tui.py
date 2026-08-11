@@ -61,12 +61,36 @@ import urllib.request
 
 # Rich backs the Hermes-style panels (pure-Python, pip-installs on Termux).
 # The Hermes agent TUI renders with Rich `Panel(box=HORIZONTALS)`; we mirror
-# that exactly so alvaagent reads as Hermes. `pip install rich` is run by
-# alva_fix.sh before launch.
-from rich.console import Console
-from rich.panel import Panel
-from rich.box import HORIZONTALS
-_CON = Console()
+# that exactly so alvaagent reads as Hermes. `pip install --break-system-packages
+# rich` is run by alva_fix.sh; if it's somehow absent we fall back to a tiny
+# ANSI shim so the TUI still launches.
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.box import HORIZONTALS
+    _CON = Console()
+except Exception:  # pragma: no cover - only when rich is unavailable
+    import sys as _sys
+    class _ShimPanel:
+        def __init__(self, *a, **k):
+            self._render = (a[0] if a else "")
+            self.title = k.get("title", "")
+            self.border_style = k.get("border_style", "")
+            self.box = k.get("box")
+            self.padding = k.get("padding", (0, 0))
+            self.width = k.get("width")
+        def __str__(self):
+            return str(self._render)
+    class _ShimConsole:
+        def print(self, *a, **k):
+            for x in a:
+                _sys.stdout.write(str(x) + "\n")
+    class _ShimBox:
+        HORIZONTALS = "HORIZONTALS"
+    Console = _ShimConsole
+    Panel = _ShimPanel
+    HORIZONTALS = _ShimBox.HORIZONTALS
+    _CON = Console()
 
 # ---------------- paths / config ----------------
 # Data lives next to this script (survives distro reinstalls on Termux
