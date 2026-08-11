@@ -2724,13 +2724,15 @@ def banner(state):
     _CON.print()  # top spacer like Hermes
     # Hermes only prints its big wordmark when the terminal is wide enough; on
     # narrow terminals (phones) it would wrap ugly, so we mirror that gate.
+    # NOTE: use plain print() + raw ANSI here (not _CON.print) — the rest of the
+    # TUI renders color via print()+_fgh(), and Rich's Console leaks bare escapes.
     term_w = _term_width()
     if COLOR and term_w >= 72:
         for ln in ALVA_WORDMARK.split("\n"):
             if ln.strip():
-                _CON.print(_fgh(HERMES_ACCENT) + ln + _rsth())
+                print(_fgh(HERMES_ACCENT) + ln + _rsth())
     elif COLOR:
-        _CON.print(_fgh(HERMES_ACCENT) + C.BOLD + "ALVAAGENT" + _rsth())
+        print(_fgh(HERMES_ACCENT) + C.BOLD + "ALVAAGENT" + _rsth())
     else:
         print("ALVAAGENT")
     print()
