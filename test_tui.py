@@ -347,6 +347,36 @@ try:
     assert_ok(open(_ap).read() == "hello", "_atomic_write writes content")
     os.remove(_ap)
 
+    # ---------- performance: chunked streaming parses SSE correctly ----------
+    # Simulate an SSE byte stream and ensure the chunked reader yields the
+    # same content as the old 1-byte reader would.
+    import io as _io
+    fake_sse = (
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"
+        "data: [DONE]\n\n"
+    )
+    # monkeypatch urlopen to return our fake stream for the streaming path
+    _orig_urlopen = pa.urllib.request.urlopen
+    class _FakeResp:
+        def __init__(self, data):
+            self._b = data.encode("utf-8")
+            self._i = 0
+        def read(self, n=1024):
+            chunk = self._b[self._i:self._i + n]
+            self._i += len(chunk)
+            return chunk
+    def _fake_urlopen(req, timeout=180):
+        return _FakeResp(fake_sse)
+    pa.urllib.request.urlopen = _fake_urlopen
+    try:
+        cfg_s = {"base_url": "http://x/v1", "api_key": "k", "model": "m", "temperature": 0.5}
+        out = "".join(c for c, _ in pa.chat_completion_stream(
+            [{"role": "user", "content": "hi"}], cfg_s))
+        assert_ok(out == "Hello world", "chunked SSE reader reconstructs content correctly")
+    finally:
+        pa.urllib.request.urlopen = _orig_urlopen
+
     print("\nALL TESTS PASSED ✓" if failures == 0 else "\n%d TEST(S) FAILED ✗" % failures)
     sys.exit(0 if failures == 0 else 1)
 finally:

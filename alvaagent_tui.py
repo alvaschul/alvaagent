@@ -42,6 +42,7 @@
 #  line (the soft keyboard's Enter sends each line).
 # ============================================================
 import ast
+import codecs
 import datetime
 import json
 import math
@@ -1019,11 +1020,14 @@ def chat_completion_stream(messages, config, tools=None):
         raise RuntimeError("LLM request failed: %s" % e)
     buffer = ""
     tool_calls_acc = {}
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
-        chunk = resp.read(1)
+        # Read in chunks (1-byte reads = one syscall per byte, painfully slow
+        # on flaky mobile links). 1024 is plenty for SSE deltas.
+        chunk = resp.read(1024)
         if not chunk:
             break
-        buffer += chunk.decode("utf-8", errors="replace")
+        buffer += decoder.decode(chunk)
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             line = line.strip()
