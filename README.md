@@ -42,3 +42,4 @@ explicit approval.
 - `test_tui.py` — headless test suite
 - `start.sh` — launcher (`bash start.sh` = web, `bash start.sh tui` = terminal)
 - `.alvaagent/config.json` — provider profiles (regenerate on first run)
+# Last updated: Wed Aug 12 12:06:37 AM WIB 2026
