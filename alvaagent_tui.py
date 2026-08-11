@@ -1629,32 +1629,45 @@ def _wrap_text(text, w):
 
 
 def box_open(title, color):
-    """Top border of a rounded-corner block, e.g. '  ╭─ agent ──╮'."""
+    """Top border of a rounded-corner block, e.g. '  ╭─ agent ─────╮'.
+
+    The left gutter is always EXACTLY 4 visible chars: '  ╭─ ' (2 indent +
+    border + 1 inner space). box_line and box_close must match this so every
+    row aligns to the same column.
+    """
     w = _term_width()
     t = title
-    head = "  ╭─ " + col(color, t) + " "
-    pad = w - _vlen(head) - 1
-    while pad < 2 and t:  # shrink an over-long title instead of overflowing
+    # left = '  ╭─ ' (4), then title, then ' ' (1) before the fill rule
+    inner = col(color, t) + " "
+    left = "  ╭─ "
+    used = 4 + _vlen(inner) + 1   # +1 for the space after the title
+    pad = w - used - 1            # -1 for the closing '╮'
+    while pad < 1 and t:          # shrink an over-long title instead of overflowing
         t = t[:-1]
-        head = "  ╭─ " + col(color, t) + " "
-        pad = w - _vlen(head) - 1
-    return head + "─" * max(pad, 1) + "╮"
+        inner = col(color, t) + " "
+        used = 4 + _vlen(inner) + 1
+        pad = w - used - 1
+    return left + inner + "─" * max(pad, 1) + "╮"
 
 
 def box_close():
-    return "  ╰" + "─" * max(_term_width() - 4, 1) + "╯"
+    # left gutter must match box_open's '  ╭─ ' → here '  ╰' + fill + '╯'
+    w = _term_width()
+    return "  ╰" + "─" * max(w - 4, 1) + "╯"
 
 
 def box_line(content, color=None, right_pad=True):
-    """A content row: '  │ text │'. right_pad=False streams without the right border."""
+    """A content row: '  │ text │'. The left gutter is '  │ ' (4 chars) to
+    match box_open/box_close exactly."""
     w = _term_width()
     c = col(color, content) if color else content
+    left = "  │ "
     if right_pad:
-        pad = w - 6 - _vlen(c)
-        if pad > 0:
-            c += " " * pad
-        return "  │ " + c + " │"
-    return "  │ " + c
+        pad = w - 4 - _vlen(c) - 2   # 4 left + 2 right (' │')
+        if pad < 0:
+            pad = 0
+        return left + c + " " * pad + " │"
+    return left + c
 
 
 def box(title, lines, color):
@@ -1892,18 +1905,30 @@ _UI = {"spinner": None}
 
 
 def tool_open(name, args):
-    """Open line of a compact tool block: '  ╭─ ⚙ name (args)'."""
+    """Open line of a compact tool block, full-width to match the agent box:
+    '  ╭─ ⚙ name (args) ─────╮'."""
     a = fmt_args(args)
-    print("  " + col(CUR_SKIN["tool"], "╭─ ⚙ " + name + ((" (" + a + ")") if a else "")), flush=True)
+    w = _term_width()
+    label = col(CUR_SKIN["tool"], "╭─ ⚙ " + name + ((" (" + a + ")") if a else ""))
+    used = 4 + _vlen(label) + 1   # '  ╭─ '=4, +1 space before fill
+    pad = w - used - 1
+    if pad < 1:
+        pad = 1
+    print("  " + label + " " + "─" * pad + "╮", flush=True)
 
 
 def tool_close(name, status, result):
-    """Close line of a tool block: '  ╰─ ✓ name → summary'."""
+    """Close line of a tool block: '  ╰─ ✓ name → summary ─╯'."""
     mark = col(CUR_SKIN["ok"], "✓") if status == "done" else col(CUR_SKIN["err"], "✗")
-    line = "  " + col(CUR_SKIN["tool"], "╰─") + " " + mark + " " + name
+    w = _term_width()
+    body = col(CUR_SKIN["tool"], "╰─") + " " + mark + " " + name
     if result is not None:
-        line += " " + col(CUR_SKIN["dim"], "→ " + tool_summary(result))
-    print(line, flush=True)
+        body += " " + col(CUR_SKIN["dim"], "→ " + tool_summary(result))
+    used = 4 + _vlen(body) + 1
+    pad = w - used - 1
+    if pad < 1:
+        pad = 1
+    print("  " + body + " " + "─" * pad + "╯", flush=True)
 
 
 def on_tool(tool_id, name, args, result, status):
@@ -2545,25 +2570,26 @@ def banner(state):
 
 
 def render_status_bar(state, session, elapsed, tools, history):
-    # Render a persistent status bar at the bottom of the terminal.
+    """Render a one-line status footer after each agent turn (Hermes-style).
+
+    Uses normal print flow — no raw ANSI cursor jumps, which misalign on
+    Termux (no reliable terminal height). Prints a dim, boxed-style line.
+    """
     cfg = active_cfg(state)
     skin = CUR_SKIN
     tokens, window = context_usage(history, cfg)
     pct = tokens * 100 // window if window else 0
     ctx_col = skin["ok"] if pct < 60 else (C.YELLOW if pct < 85 else skin["err"])
-    
     parts = [
         col(skin["chip"], "●") + " " + col(skin["dim"], session[:16]),
         col(skin["chip"], "●") + " " + col(skin["dim"], state["active"] + "/" + (cfg.get("model") or "?")),
         col(skin["chip"], "●") + " " + col(ctx_col, "ctx %d%%" % pct),
-        col(skin["chip"], "●") + " " + col(skin["dim"], "%.1fs" % elapsed)
+        col(skin["chip"], "●") + " " + col(skin["dim"], "%.1fs" % elapsed),
+        col(skin["chip"], "●") + " " + col(skin["dim"], "%d tool calls" % (tools or 0)),
     ]
-    status_line = "  " + "   ".join(parts)
-    # ANSI: Save cursor, move to bottom, clear line, write status, restore cursor
-    print(f"\033[s\033[999;1H\033[K{status_line}\033[u", end="", flush=True)
+    print(col(C.DIM, "  └─ " + "   ".join(parts)))
 
 def status_footer(state, session, elapsed, tools, history):
-    # This now just acts as an alias or trigger to render the persistent bar
     render_status_bar(state, session, elapsed, tools, history)
 
 def send_message(text, history, state, session):
