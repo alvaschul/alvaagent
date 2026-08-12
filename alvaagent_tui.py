@@ -670,6 +670,24 @@ def _normalize_skill_list(raw_list):
             for s in raw_list]
 
 
+def _skill_list_all():
+    """Scan SKILLS_DIR and return a list of skill dicts (Hermes-style).
+
+    Each dict has: name, category, file, description, tags, related_skills.
+    Flat files (no category folder) get category=None; categorized files get
+    their folder name. Frontmatter is parsed from each .md file.
+    """
+    skills = []
+    for cat, name, path in _scan_skill_files():
+        info = _skill_read(path)
+        if info is None:
+            continue
+        info["category"] = cat
+        info["file"] = os.path.relpath(path, SKILLS_DIR)
+        skills.append(info)
+    return skills
+
+
 def tool_skill_list():
     """List every skill on the device with metadata (Hermes-style).
 
@@ -2420,7 +2438,8 @@ def cmd_models(state):
 _SLASH_COMMANDS = [
     "/help", "/config", "/provider", "/models", "/test", "/skin",
     "/sessions", "/session", "/new", "/clear", "/context", "/compress",
-    "/tools", "/todos", "/todo", "/memory", "/skills", "/install_skill",
+    "/tools", "/todos", "/todo", "/memory", "/skills", "/skill",
+    "/install_skill",
     "/multi", "/export", "/stop", "/exit", "/quit",
 ]
 
@@ -2534,7 +2553,10 @@ def cmd_help():
     print("    /todo done <i>         toggle task i      /todo rm <i>   remove task i")
     print("    /todo clear            empty the list")
     print("    /memory                show saved memory facts")
-    print("    /skills", "/install_skill                list saved skills")
+    print("    /skills                list saved skills (grouped by category)")
+    print("    /skill rm <name>       delete a skill (name or category/name)")
+    print("    /skill category [n]    list categories / show skills in category n")
+    print("    /install_skill <path>  install a skill from a .md file")
     print("    /stop                  cancel the running request")
     print("    /exit  /quit           leave the agent")
     print("    Tab                    completes slash commands")
@@ -2735,14 +2757,69 @@ def cmd_memory():
 
 
 def cmd_skills():
-    r = tool_skill_list()
-    names = r.get("skills") or []
-    if not names:
+    skills = tool_skill_list().get("skills") or []
+    if not skills:
         print("  (no skills yet - ask the agent to save one)")
         return
-    print("  skills (%d):" % len(names))
-    for n in names:
-        print("    - " + n)
+    # group by category
+    by_cat = {}
+    for s in skills:
+        cat = s.get("category") or "(flat)"
+        by_cat.setdefault(cat, []).append(s)
+    print("  skills (%d):" % len(skills))
+    for cat in sorted(by_cat):
+        entries = by_cat[cat]
+        print("    [%s] %d" % (cat, len(entries)))
+        for s in entries:
+            desc = s.get("description") or ""
+            if desc:
+                desc = "  " + desc[:55]
+            tags = s.get("tags") or []
+            tagstr = ("  " + ", ".join(str(t) for t in tags)) if tags else ""
+            print("      - %s%s%s" % (col(C.BOLD, s["name"]),
+                                      col(C.DIM, desc),
+                                      col(C.DIM, tagstr)))
+
+
+def cmd_skill_category(rest):
+    """List skills in a category, or list all categories."""
+    arg = (rest or "").strip().lower()
+    skills = tool_skill_list().get("skills") or []
+    if arg in ("ls", "list", "show"):
+        # list categories
+        cats = {}
+        for s in skills:
+            c = s.get("category") or "(flat)"
+            cats.setdefault(c, 0)
+            cats[c] += 1
+        if not cats:
+            print("  (no skills yet)")
+            return
+        print("  categories (%d):" % len(cats))
+        for c in sorted(cats):
+            print("    %s  (%d skill%s)" % (col(C.BOLD, c if c != "(flat)" else "flat"),
+                                             cats[c], "" if cats[c] == 1 else "s"))
+        return
+    if not arg:
+        # no arg: list all categories
+        cmd_skill_category("ls")
+        return
+    # show skills in one category
+    cat_skills = [s for s in skills if (s.get("category") or "(flat)") == arg]
+    if not cat_skills:
+        p_err("no skills in category '%s'" % arg)
+        return
+    print("  category '%s' (%d skill%s):" % (arg, len(cat_skills),
+                                              "" if len(cat_skills) == 1 else "s"))
+    for s in cat_skills:
+        desc = s.get("description") or ""
+        if desc:
+            desc = "  " + desc[:50]
+        tags = s.get("tags") or []
+        tagstr = ("  " + ", ".join(str(t) for t in tags)) if tags else ""
+        print("      - %s%s%s" % (col(C.BOLD, s["name"]),
+                                  col(C.DIM, desc),
+                                  col(C.DIM, tagstr)))
 
 
 
@@ -2906,20 +2983,25 @@ def _banner_tools_lines():
 
 
 def _banner_skills_lines():
-    """Hermes-style 'Available Skills' grid: skills from the on-device store.
-
-    Returns Rich-markup strings (Hermes' own convention inside Panels).
-    """
+    """Hermes-style 'Available Skills' grid: skills grouped by category."""
     lines = ["", "[bold %s]Available Skills[/]" % HERMES_ACCENT]
     try:
-        names = sorted(tool_skill_list().get("skills") or [])
+        skills = tool_skill_list().get("skills") or []
     except Exception:
-        names = []
-    if names:
-        lines.append("[dim %s]saved:[/] [bold %s]%s[/]"
-                     % (HERMES_DIM, HERMES_TEXT, ", ".join(names)))
-    else:
+        skills = []
+    if not skills:
         lines.append("[dim %s]saved: (none yet - ask the agent to save one)[/]" % HERMES_DIM)
+        return lines
+    # group by category
+    by_cat = {}
+    for s in skills:
+        cat = s.get("category") or "(flat)"
+        by_cat.setdefault(cat, []).append(s)
+    disp_name = lambda c: "flat" if c == "(flat)" else c
+    for cat in sorted(by_cat):
+        names = [s["name"] for s in by_cat[cat]]
+        lines.append("[dim %s]%s:[/] [bold %s]%s[/]"
+                     % (HERMES_DIM, disp_name(cat), HERMES_TEXT, ", ".join(names)))
     return lines
 
 
@@ -3177,6 +3259,24 @@ def repl():
                 cmd_install_skill(rest)
             elif c == "/skills":
                 cmd_skills()
+            elif c == "/skill":
+                op, _, arg = rest.strip().partition(" ")
+                op = op.strip().lower()
+                if op in ("rm", "remove", "del", "delete"):
+                    if not arg:
+                        p_err("usage: /skill rm <name>")
+                        continue
+                    r = tool_skill_remove(arg)
+                    if r.get("ok"):
+                        p_ok("removed skill '%s' (category: %s) [OK]"
+                             % (r.get("name", "?"), r.get("category") or "(flat)"))
+                    else:
+                        p_err("  " + r.get("error", "?"))
+                elif op in ("cat", "category", "cats", "categories"):
+                    cmd_skill_category(arg)
+                else:
+                    p_err("usage: /skill rm <name>  |  /skill category [name]")
+                continue
             elif c == "/memory":
                 cmd_memory()
             elif c == "/export":
