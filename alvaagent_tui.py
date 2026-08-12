@@ -1456,6 +1456,12 @@ def chat_completion_stream(messages, config, tools=None):
                     acc = tool_calls_acc[idx]
                     if tcc.get("id"):
                         acc["id"] += tcc["id"]
+                    # Some OpenAI-compatible gateways omit the tool_call id in the
+                    # streamed deltas. Fall back to a stable synthetic id so the
+                    # assistant tool_calls and the resulting tool message stay
+                    # paired (the API rejects empty/missing tool_call_id).
+                    if not acc["id"]:
+                        acc["id"] = "call_%d" % idx
                     fn = tcc.get("function") or {}
                     if fn.get("name"):
                         acc["function"]["name"] += fn["name"]
@@ -1520,6 +1526,46 @@ def cancel_agent():
     _cancel_flag[0] = True
 
 
+def _repair_tool_pairs(history):
+    """Heal persisted history so every role:"tool" message has a tool_call_id.
+
+    Older sessions saved by a buggy build dropped tool_call_id from tool
+    messages, which makes the OpenAI-compatible API reject the request
+    (400: missing field toolcallid). Walk the history and, for any tool
+    message missing tool_call_id, attach the id of the preceding assistant
+    tool_call (or a synthetic id as a last resort). Returns a new list.
+    """
+    if not isinstance(history, list):
+        return history
+    out = []
+    pending_ids = []
+    for m in history:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        m = dict(m)  # don't mutate the caller's dict
+        role = m.get("role")
+        if role == "assistant":
+            tcs = m.get("tool_calls") or []
+            ids = [tc.get("id") for tc in tcs if isinstance(tc, dict) and tc.get("id")]
+            pending_ids = ids
+            out.append(m)
+        elif role == "tool":
+            if not m.get("tool_call_id"):
+                if pending_ids:
+                    m["tool_call_id"] = pending_ids.pop(0)
+                else:
+                    # orphan tool result with no preceding call - synthesize
+                    m["tool_call_id"] = "repaired_%d" % len(out)
+            elif m["tool_call_id"] == "":
+                # previously emitted empty id - keep a stable synthetic one
+                m["tool_call_id"] = "repaired_%d" % len(out)
+            out.append(m)
+        else:
+            out.append(m)
+    return out
+
+
 def _report_tool(tool_id, name, args, result, status):
     if ON_TOOL is not None:
         try:
@@ -1533,9 +1579,10 @@ def run_agent(history_json, config_json):
     config = json.loads(str(config_json))
     _cancel_flag[0] = False
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    history = _repair_tool_pairs(history)
     for m in history:
         if m.get("role") == "system":
-            continue  # avoid duplicate system prompts
+            continue
         # Copy the full message dict so tool messages keep their tool_call_id
         # and assistant messages keep their tool_calls (required by the API).
         if not isinstance(m, dict):
@@ -1580,6 +1627,7 @@ def run_agent_stream(history, config):
     """Generator that yields ('text', chunk) or ('tool', tool_info) or ('done', final_dict)."""
     _cancel_flag[0] = False
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    history = _repair_tool_pairs(history)
     for m in history:
         if m.get("role") == "system":
             continue

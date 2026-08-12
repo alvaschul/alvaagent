@@ -7,9 +7,34 @@ REPO="$HOME/alvaagent"
 OLD="$HOME/.alvaagent"
 NEW="$REPO/.alvaagent"
 
-# 1) stop any running old/duplicate instance
-pkill -f alvaagent_tui 2>/dev/null || true
-sleep 1
+# 0) pull the latest code so fixes actually deploy (the TUI lives in the repo)
+cd "$REPO" || { echo "cd $REPO failed"; exit 1; }
+if [ -d ".git" ]; then
+  echo "[*] pulling latest alvaagent from origin/main..."
+  git pull --ff-only origin main 2>&1 | tail -5 || \
+    git pull origin main 2>&1 | tail -5 || \
+    echo "[!] git pull failed - continuing with local code"
+else
+  echo "[!] not a git repo - skipping pull"
+fi
+
+# 1) stop any running old/duplicate instance (kill harder, verify gone)
+echo "[*] stopping any running alvaagent_tui..."
+pkill -9 -f 'alvaagent_tui' 2>/dev/null || true
+pkill -9 -f 'python3.*alvaagent' 2>/dev/null || true
+# wait until no matching process remains (max ~5s)
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if pgrep -f 'alvaagent_tui' >/dev/null 2>&1; then
+    sleep 0.5
+  else
+    break
+  fi
+done
+if pgrep -f 'alvaagent_tui' >/dev/null 2>&1; then
+  echo "[!] WARNING: a stale alvaagent_tui process is still running - kill it manually"
+else
+  echo "[ok] no stale process"
+fi
 
 # 2) carry over API key + settings from the stale hidden install (if present)
 mkdir -p "$NEW"
