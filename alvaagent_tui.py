@@ -329,6 +329,8 @@ _load_store()  # load persisted todos/memory at import time
 
 TODO_KEY = "alvaagent.todos"
 MEM_PREFIX = "alvaagent.mem."
+FEEDBACK_KEY = "alvaagent.feedback"
+IMPROVEMENT_KEY = "alvaagent.improvements"
 HISTORY_KEY = "alvaagent.history"
 SESSION_KEY = "alvaagent.sessions"
 ACTIVE_SESSION_KEY = "alvaagent.active_session"
@@ -864,6 +866,104 @@ def tool_get_time():
     }
 
 
+
+def tool_feedback(rating, notes=None):
+    """Record user feedback on the agent's last response.
+
+    rating: "good", "bad", or "neutral". notes: optional free text.
+    The agent calls this when the user expresses satisfaction or frustration.
+    """
+    rating = str(rating or "").strip().lower()
+    if rating not in ("good", "bad", "neutral"):
+        return {"ok": False, "error": "rating must be good/bad/neutral"}
+    notes = str(notes or "").strip()
+    entry = {
+        "rating": rating,
+        "notes": notes,
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    fb = _store_get(FEEDBACK_KEY, [])
+    fb.append(entry)
+    if len(fb) > 50:
+        fb = fb[-50:]
+    _store_set(FEEDBACK_KEY, fb)
+    return {"ok": True, "rating": rating, "stored": True}
+
+
+def tool_improvement_set(area, action):
+    """Record an area to improve and a concrete action to take.
+
+    area: short label like "response brevity".
+    action: what to do about it.
+    Updates an existing area if present, else appends.
+    """
+    area = str(area or "").strip()
+    action = str(action or "").strip()
+    if not area or not action:
+        return {"ok": False, "error": "both area and action are required"}
+    items = _store_get(IMPROVEMENT_KEY, [])
+    updated = False
+    for it in items:
+        if it["area"].lower() == area.lower():
+            it["action"] = action
+            it["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+            updated = True
+            break
+    if not updated:
+        items.append({
+            "area": area,
+            "action": action,
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "updated": datetime.datetime.now().isoformat(timespec="seconds"),
+            "done": False,
+        })
+    if len(items) > 30:
+        items = items[-30:]
+    _store_set(IMPROVEMENT_KEY, items)
+    return {"ok": True, "area": area, "stored": True}
+
+
+def tool_improvement_list():
+    """List all improvement areas the agent has recorded."""
+    return {"ok": True, "improvements": _store_get(IMPROVEMENT_KEY, [])}
+
+
+def tool_improvement_done(area):
+    """Mark an improvement area as resolved."""
+    area = str(area or "").strip().lower()
+    if not area:
+        return {"ok": False, "error": "area is required"}
+    items = _store_get(IMPROVEMENT_KEY, [])
+    for it in items:
+        if it["area"].lower() == area:
+            it["done"] = True
+            it["resolved"] = datetime.datetime.now().isoformat(timespec="seconds")
+            _store_set(IMPROVEMENT_KEY, items)
+            return {"ok": True, "area": it["area"], "done": True}
+    return {"ok": False, "error": "no improvement area named: %s" % area}
+
+
+def tool_reflect():
+    """Run a structured self-reflection pass.
+
+    Reads the last 5 feedback entries and all pending improvements. Returns a
+    summary the agent can use to decide what to change.
+    """
+    fb = _store_get(FEEDBACK_KEY, [])
+    imps = _store_get(IMPROVEMENT_KEY, [])
+    pending = [i for i in imps if not i.get("done")]
+    recent_bad = [e for e in fb if e.get("rating") == "bad"][-5:]
+    return {
+        "ok": True,
+        "feedback_count": len(fb),
+        "bad_count": len([e for e in fb if e.get("rating") == "bad"]),
+        "recent_bad": recent_bad,
+        "improvement_count": len(imps),
+        "pending_count": len(pending),
+        "pending": pending,
+    }
+
+
 def tool_web_fetch(url):
     url = str(url).strip()
     if not (url.startswith("http://") or url.startswith("https://")):
@@ -1071,6 +1171,38 @@ TOOLS = [
             "path": {"type": "string", "description": "Directory path (default: current dir)"}},
             "required": []}}},
     {"type": "function", "function": {
+        "name": "feedback",
+        "description": "Record user feedback on the agent's last response (good/bad/neutral + optional notes). Call this when the user expresses satisfaction or frustration so the agent can learn what to repeat or avoid.",
+        "parameters": {"type": "object", "properties": {
+            "rating": {"type": "string", "description": "One of: good, bad, neutral"},
+            "notes": {"type": "string", "description": "Optional free-text context"}}},
+        "required": ["rating"]}},
+    {"type": "function", "function": {
+        "name": "improvement_set",
+        "description": "Record an area the agent should improve and a concrete action to take. Call this when feedback or mistakes reveal a pattern to fix (e.g. are too verbose, keep making the same mistake).",
+        "parameters": {"type": "object", "properties": {
+            "area": {"type": "string", "description": "Short label for the area to improve"},
+            "action": {"type": "string", "description": "Concrete step the agent plans to take"}}},
+        "required": ["area", "action"]}},
+    {"type": "function", "function": {
+        "name": "improvement_list",
+        "description": "List all improvement areas the agent has recorded for itself.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "improvement_done",
+        "description": "Mark an improvement area as resolved after the agent has verified the fix works.",
+        "parameters": {"type": "object", "properties": {
+            "area": {"type": "string", "description": "The area to mark done"}}},
+        "required": ["area"]}},
+    {"type": "function", "function": {
+        "name": "self_test",
+        "description": "Run the harness self-test suite (test_tui.py) to validate the TUI after editing its own source code. Returns pass/fail + output.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "reflect",
+        "description": "Run a structured self-reflection: read recent feedback and pending improvements. Call this when idle or after finishing a task to decide if anything needs fixing.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "skill_list",
         "description": "List available on-device skills (Hermes-style: YAML frontmatter + categorized storage). ALWAYS call this before starting a substantial task and read any skill whose name or tags match the task - skills encode the user's preferred way of doing that kind of work.",
         "parameters": {"type": "object", "properties": {}}}},
@@ -1111,6 +1243,12 @@ TOOL_IMPL = {
     "file_write": lambda a: tool_file_write(a.get("path"), a.get("content")),
     "file_edit": lambda a: tool_file_edit(a.get("path"), a.get("old"), a.get("new")),
     "file_list": lambda a: tool_file_list(a.get("path")),
+    "feedback": lambda a: tool_feedback(a.get("rating"), a.get("notes")),
+    "improvement_set": lambda a: tool_improvement_set(a.get("area"), a.get("action")),
+    "improvement_list": lambda a: tool_improvement_list(),
+    "improvement_done": lambda a: tool_improvement_done(a.get("area")),
+    "self_test": lambda a: tool_self_test(),
+    "reflect": lambda a: tool_reflect(),
     "skill_list": lambda a: tool_skill_list(),
     "skill_read": lambda a: tool_skill_read(a.get("name")),
     "skill_save": lambda a: tool_skill_save(
@@ -1150,12 +1288,20 @@ You can call tools to do real work. Guidelines:
    When you discover a reusable, non-obvious procedure during a task, save it
    as a skill with a descriptive name and a concise body (trigger + steps).
    Keep skills small and self-contained so they stay easy to apply and test.
-8. Self-improvement: you may read your OWN source (alvaagent_tui.py,
-   start.sh, test_tui.py) and improve it with file_edit/
-   file_write, then validate with run_command("python3 -m py_compile
-   alvaagent_tui.py") and run_command("python3 test_tui.py"). Changes take
-   effect the next time the user restarts the TUI - always say so, and keep
-   edits small, targeted, and tested.
+8. Self-improvement: you can read your OWN source (alvaagent_tui.py,
+   start.sh, test_tui.py) and improve it with file_edit / file_write, then
+   validate with run_command("python3 -m py_compile alvaagent_tui.py") and
+   run_command("python3 test_tui.py"). After any edit to your own source,
+   ALWAYS run self_test to confirm nothing is broken before you tell the user
+   the change is done. Changes take effect the next time the user restarts the
+   TUI - always say so, and keep edits small, targeted, and tested.
+9. Feedback loop: the user can rate your responses with /feedback good|bad.
+   When you notice the user expressing satisfaction or frustration, call
+   feedback(rating="good"|"bad"|"neutral", notes=...) so the harness records
+   it. Periodically call reflect() to review recent feedback and pending
+   improvements, and improvement_set(area, action) when a pattern emerges.
+   Mark improvements done with improvement_done(area) after you verify the fix.
+   Treat repeated "bad" feedback on the same thing as a real bug to fix.
 Only call a tool when it genuinely helps. If no tool is needed, answer directly.
 Respond in the same language the user writes in. Be concise, friendly, and precise."""
 
@@ -1508,7 +1654,132 @@ def self_test():
         tool_todo_remove(r["index"])
     checks.append(("memory", tool_memory_recall("__no_such_key__")["found"] is False))
     checks.append(("clock", isinstance(tool_get_time(), dict) and "iso" in tool_get_time()))
+
+    # skills: list should work
+    try:
+        skills = tool_skill_list()
+        checks.append(("skills_list", skills.get("ok") is True))
+    except Exception:
+        checks.append(("skills_list", False))
+
+    # command classification: allowlist and risky
+    checks.append(("classify_allow_ls", classify_command("ls -la") == "allow"))
+    checks.append(("classify_ask_rm", classify_command("rm -rf /") == "ask"))
+    checks.append(("classify_ask_subshell", classify_command("cat $(whoami)") == "ask"))
+
+    # file tools: read this file
+    try:
+        r = tool_file_read(__file__)
+        checks.append(("file_read", r.get("ok") is True))
+    except Exception:
+        checks.append(("file_read", False))
+
+    # file tools: write to temp dir
+    try:
+        import tempfile
+        tmp = os.path.join(tempfile.gettempdir(), ".alva_self_test_tmp.txt")
+        r = tool_file_write(tmp, "test content")
+        if r.get("ok"):
+            content = tool_file_read(tmp).get("content", "")
+            checks.append(("file_write", content == "test content"))
+            os.remove(tmp)
+        else:
+            checks.append(("file_write", False))
+    except Exception:
+        checks.append(("file_write", False))
+
+    # feedback + improvement + reflect tools
+    try:
+        r = tool_feedback("good", "self-test check")
+        checks.append(("feedback", r.get("ok") is True))
+    except Exception:
+        checks.append(("feedback", False))
+
+    try:
+        r = tool_improvement_set("test-area", "test action")
+        checks.append(("improvement_set", r.get("ok") is True))
+    except Exception:
+        checks.append(("improvement_set", False))
+
+    try:
+        imps = tool_improvement_list()
+        checks.append(("improvement_list", imps.get("ok") is True))
+    except Exception:
+        checks.append(("improvement_list", False))
+
+    try:
+        r = tool_reflect()
+        checks.append(("reflect", r.get("ok") is True))
+    except Exception:
+        checks.append(("reflect", False))
+
     return json.dumps({k: v for k, v in checks})
+
+
+def tool_self_test():
+    """Run the full self-test suite via `test_tui.py` and return results.
+
+    This is the tool the agent calls to validate itself after editing its own
+    source code. It runs the external `test_tui.py` harness (which tests the
+    full agent loop with a mock LLM) AND the built-in self_test() checks.
+    Always call this after any file_edit or file_write to your own source.
+    """
+    my_dir = os.path.dirname(os.path.abspath(__file__))
+    tpath = os.path.join(my_dir, "test_tui.py")
+
+    result = {"tests": [], "all_passed": True}
+
+    # Run the external test harness
+    if os.path.isfile(tpath):
+        try:
+            proc = subprocess.run([sys.executable, tpath],
+                                  capture_output=True, text=True, timeout=30)
+            test_tui_passed = proc.returncode == 0
+            result["tests"].append({
+                "name": "test_tui.py (external harness)",
+                "passed": test_tui_passed,
+                "exit_code": proc.returncode,
+                "stdout": (proc.stdout or "")[-2000:],
+                "stderr": (proc.stderr or "")[-800:],
+            })
+            if not test_tui_passed:
+                result["all_passed"] = False
+        except Exception as e:
+            result["tests"].append({
+                "name": "test_tui.py (external harness)",
+                "passed": False,
+                "error": repr(e),
+            })
+            result["all_passed"] = False
+    else:
+        result["tests"].append({
+            "name": "test_tui.py (external harness)",
+            "passed": False,
+            "error": "test_tui.py not found",
+        })
+        result["all_passed"] = False
+
+    # Run built-in self_test checks
+    try:
+        builtin_json = self_test()
+        builtin_checks = json.loads(builtin_json) if isinstance(builtin_json, str) else builtin_json
+        builtin_ok = all(v for v in builtin_checks.values())
+        result["tests"].append({
+            "name": "builtin self_test checks",
+            "passed": builtin_ok,
+            "details": builtin_checks,
+        })
+        if not builtin_ok:
+            result["all_passed"] = False
+    except Exception as e:
+        result["tests"].append({
+            "name": "builtin self_test checks",
+            "passed": False,
+            "error": repr(e),
+        })
+        result["all_passed"] = False
+
+    return result
 
 
 # ---------------- context tracking & sessions ----------------
@@ -2439,7 +2710,7 @@ _SLASH_COMMANDS = [
     "/help", "/config", "/provider", "/models", "/test", "/skin",
     "/sessions", "/session", "/new", "/clear", "/context", "/compress",
     "/tools", "/todos", "/todo", "/memory", "/skills", "/skill",
-    "/install_skill",
+    "/install_skill", "/feedback", "/reflect", "/self-test", "/improve",
     "/multi", "/export", "/stop", "/exit", "/quit",
 ]
 
@@ -2528,6 +2799,136 @@ def cmd_compress(history, state, session):
         save_session(session, history)
 
 
+
+def cmd_self_test():
+    """Run the harness self-test suite and show results.
+
+    Tests calculator, sandbox, todo, memory, skills, command classification,
+    file tools, and the feedback/improvement/reflect tools.
+    """
+    import json
+    tests = [
+        ("calculator basic", lambda: _check(tool_calculator("2+2")["ok"])),
+        ("calculator sqrt", lambda: _check(tool_calculator("sqrt(144)")["ok"])),
+        ("sandbox rejects div0", lambda: _check(tool_calculator("1/0")["ok"] is False)),
+        ("todo add+list+remove", lambda: _check(_todo_check())),
+        ("memory save+recall", lambda: _check(_mem_check())),
+        ("skills list+read", lambda: _check(_skill_check())),
+        ("classify allow: ls", lambda: _check(classify_command("ls -la") == "allow")),
+        ("classify ask: rm -rf", lambda: _check(classify_command("rm -rf /") == "ask")),
+        ("classify ask: subshell", lambda: _check(classify_command("echo $(whoami)") == "ask")),
+        ("file_read in project", lambda: _check(tool_file_read(__file__)["ok"])),
+        ("file_write temp", lambda: _check(_file_write_check())),
+        ("file_edit temp", lambda: _check(_file_edit_check())),
+        ("feedback+improvement+reflect", lambda: _check(_feedback_check())),
+    ]
+    total = len(tests)
+    passed = 0
+    for name, fn in tests:
+        try:
+            ok = fn()
+        except Exception as e:
+            ok = False
+            print("  [FAIL] %-35s -> %s" % (name, e))
+            continue
+        if ok:
+            passed += 1
+            print("  [PASS] %-35s" % name)
+        else:
+            print("  [FAIL] %-35s" % name)
+    print("\n  %d/%d tests passed" % (passed, total))
+    if passed == total:
+        print("  self-test: ALL PASSED")
+    else:
+        print("  self-test: %d FAILED" % (total - passed))
+    return {"passed": passed, "total": total}
+
+
+def _check(cond):
+    return bool(cond)
+
+
+def _todo_check():
+    r = tool_todo_add("self-test-todo")
+    if not r.get("ok"):
+        return False
+    items = tool_todo_list().get("todos", [])
+    found = any(t.get("text") == "self-test-todo" and not t.get("done") for t in items)
+    tool_todo_remove(len(items) - 1)
+    return found
+
+
+def _mem_check():
+    r = tool_memory_save("self-test-mem", "hello")
+    if not r.get("ok"):
+        return False
+    v = tool_memory_recall("self-test-mem").get("value")
+    tool_memory_save("self-test-mem", "")
+    return v == "hello"
+
+
+def _skill_check():
+    skills = tool_skill_list().get("skills", [])
+    if not skills:
+        return True
+    name = skills[0]["name"]
+    r = tool_skill_read(name)
+    return r.get("ok") and r.get("content")
+
+
+def _file_write_check():
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), ".alva_sst_write.txt")
+    r = tool_file_write(tmp, "test")
+    if not r.get("ok"):
+        return False
+    content = tool_file_read(tmp).get("content", "")
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return content == "test"
+
+
+def _file_edit_check():
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), ".alva_sst_edit.txt")
+    tool_file_write(tmp, "hello world")
+    r = tool_file_edit(tmp, "hello", "goodbye")
+    if not r.get("ok"):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    content = tool_file_read(tmp).get("content", "")
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return content == "goodbye world"
+
+
+def _feedback_check():
+    r1 = tool_feedback("good", "self-test check")
+    if not r1.get("ok"):
+        return False
+    fb = _store_get(FEEDBACK_KEY, [])
+    if not fb or fb[-1].get("rating") != "good":
+        return False
+    r2 = tool_improvement_set("self-test-area", "fix something")
+    if not r2.get("ok"):
+        return False
+    imps = _store_get(IMPROVEMENT_KEY, [])
+    if not imps or imps[-1].get("area") != "self-test-area":
+        return False
+    r3 = tool_reflect()
+    if not r3.get("ok"):
+        return False
+    tool_improvement_done("self-test-area")
+    return True
+
+
 def cmd_help():
     print("  commands:")
     print("    /help /?               this help")
@@ -2557,6 +2958,10 @@ def cmd_help():
     print("    /skill rm <name>       delete a skill (name or category/name)")
     print("    /skill category [n]    list categories / show skills in category n")
     print("    /install_skill <path>  install a skill from a .md file")
+    print("    /feedback <good|bad>   record feedback on the last response")
+    print("    /reflect               review feedback + improvements, propose actions")
+    print("    /improve               manage self-improvement areas (list/add/done)")
+    print("    /self-test             run harness self-test suite (validate after edits)")
     print("    /stop                  cancel the running request")
     print("    /exit  /quit           leave the agent")
     print("    Tab                    completes slash commands")
@@ -2756,6 +3161,28 @@ def cmd_memory():
         print("  %-16s %-20s %s" % (k, tags, val))
 
 
+
+def cmd_feedback(rest):
+    """Record feedback on the agent's last response.
+
+    Usage: /feedback good | /feedback bad <notes> | /feedback neutral
+    """
+    parts = rest.strip().split(None, 1)
+    if not parts:
+        p_err("usage: /feedback <good|bad|neutral> [notes]")
+        return
+    rating = parts[0].lower()
+    if rating not in ("good", "bad", "neutral"):
+        p_err("rating must be good, bad, or neutral")
+        return
+    notes = parts[1] if len(parts) > 1 else ""
+    r = tool_feedback(rating, notes or None)
+    if r.get("ok"):
+        p_ok("feedback recorded: %s%s" % (rating, " - " + notes if notes else ""))
+    else:
+        p_err("  " + r.get("error", "?"))
+
+
 def cmd_skills():
     skills = tool_skill_list().get("skills") or []
     if not skills:
@@ -2820,6 +3247,96 @@ def cmd_skill_category(rest):
         print("      - %s%s%s" % (col(C.BOLD, s["name"]),
                                   col(C.DIM, desc),
                                   col(C.DIM, tagstr)))
+
+
+
+
+def cmd_reflect():
+    """Review all feedback + improvement areas and propose actions."""
+    fb = _store_get(FEEDBACK_KEY, [])
+    imps = _store_get(IMPROVEMENT_KEY, [])
+    if not fb and not imps:
+        p_info("(no feedback or improvements yet)")
+        return
+    if fb:
+        print("  --- recent feedback (%d entries) ---" % len(fb))
+        for e in fb[-10:]:
+            tag = {"good": "+", "bad": "-", "neutral": "~"}.get(e["rating"], "?")
+            note = " - " + e["notes"] if e.get("notes") else ""
+            print("    %s [%s]%s" % (tag, e["rating"], note))
+    if imps:
+        print("  --- improvement areas (%d) ---" % len(imps))
+        for it in imps:
+            mark = "[x]" if it.get("done") else "[ ]"
+            print("    %s %s" % (mark, it["area"]))
+            print("        -> %s" % it["action"])
+    print("  --- suggested actions ---")
+    bad = [e for e in fb if e["rating"] == "bad"]
+    if bad:
+        print("    - review %d negative feedback entries above" % len(bad))
+    open_imgs = [it for it in imps if not it.get("done")]
+    if open_imgs:
+        print("    - %d improvement area(s) still open - act on them" % len(open_imgs))
+    if not bad and not open_imgs:
+        print("    - no open issues - keep doing what works")
+    print("  (re-run /reflect after making changes to mark them done)")
+def cmd_improve(rest):
+    """Manage self-improvement areas.
+
+    Usage:
+      /improve list          - show all pending + done improvements
+      /improve add <area> <action>  - record a new area to improve
+      /improve done <area>   - mark an area as resolved
+    """
+    parts = rest.strip().split(None, 2)
+    if not parts:
+        print("  Usage:")
+        print("    /improve list")
+        print("    /improve add <area> <action>")
+        print("    /improve done <area>")
+        return
+    sub = parts[0].lower()
+    if sub in ("list", "ls", "show"):
+        items = _store_get(IMPROVEMENT_KEY, [])
+        if not items:
+            p_info("(no improvement areas yet)")
+            return
+        pending = [it for it in items if not it.get("done")]
+        done = [it for it in items if it.get("done")]
+        if pending:
+            print("  --- pending (%d) ---" % len(pending))
+            for it in pending:
+                print("    [ ] %s" % it["area"])
+                print("        -> %s" % it["action"])
+        if done:
+            print("  --- done (%d) ---" % len(done))
+            for it in done:
+                print("    [x] %s" % it["area"])
+        print("  (use /improve done <area> to mark resolved)")
+    elif sub in ("add", "set"):
+        if len(parts) < 3:
+            p_err("usage: /improve add <area> <action>")
+            return
+        area = parts[1]
+        action = parts[2]
+        r = tool_improvement_set(area, action)
+        if r.get("ok"):
+            p_ok("improvement recorded: %s" % area)
+        else:
+            p_err("  " + r.get("error", "?"))
+    elif sub in ("done", "mark", "resolve"):
+        if len(parts) < 2:
+            p_err("usage: /improve done <area>")
+            return
+        r = tool_improvement_done(parts[1])
+        if r.get("ok"):
+            p_ok("marked done: %s" % r.get("area", parts[1]))
+        else:
+            p_err("  " + r.get("error", "?"))
+    else:
+        p_err("unknown subcommand: %s (list/add/done)" % sub)
+
+
 
 
 
@@ -3257,6 +3774,10 @@ def repl():
                     session = send_message(text.strip(), history, state, session)
             elif c == "/install_skill":
                 cmd_install_skill(rest)
+            elif c == "/self-test":
+                cmd_self_test()
+            elif c == "/improve":
+                cmd_improve(rest)
             elif c == "/skills":
                 cmd_skills()
             elif c == "/skill":
