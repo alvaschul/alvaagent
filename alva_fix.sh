@@ -22,16 +22,17 @@ else
   echo "[!] no config found — you'll be prompted to set up a provider on first run"
 fi
 
-# 3) ensure 'rich' is available (Hermes-style panels depend on it)
+# 3) ensure 'rich' + 'yaml' are available (Hermes-style panels + skills depend on them)
 #    Termux Python is externally-managed (PEP 668) -> plain `pip install`
 #    fails; use --break-system-packages (or `pkg install python-rich`).
-if ! python3 -c "import rich" 2>/dev/null; then
-  echo "[*] rich not found - installing..."
-  python3 -m pip install --break-system-packages rich 2>&1 | tail -4 \
-    || pip install --break-system-packages rich 2>&1 | tail -4 \
-    || pkg install -y python-rich 2>&1 | tail -4 \
-    || true
-fi
+for mod in rich yaml; do
+  if ! python3 -c "import $mod" 2>/dev/null; then
+    echo "[*] $mod not found - installing..."
+    python3 -m pip install --break-system-packages $mod 2>&1 | tail -2 \
+      || pip install --break-system-packages $mod 2>&1 | tail -2 \
+      || true
+  fi
+done
 if python3 -c "import rich" 2>/dev/null; then
   echo "[ok] rich ready"
 else

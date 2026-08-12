@@ -52,12 +52,14 @@ import re
 import readline
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import yaml
 
 # Rich backs the Hermes-style panels (pure-Python, pip-installs on Termux).
 # The Hermes agent TUI renders with Rich `Panel(box=HORIZONTALS)`; we mirror
@@ -536,24 +538,184 @@ def tool_file_list(path="."):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
+# ---------------- skills: Hermes-style frontmatter + categorized storage ----------------
+# Skills mirror Hermes: each skill file is a Markdown doc with an optional YAML
+# frontmatter block between `---` fences. The frontmatter carries `name`,
+# `description`, optional `version`/`author`/`tags`/`related_skills`, and the
+# body is the procedure itself (trigger + numbered steps).
+#
+# Storage layout (Hermes-style):
+#   ~/.alvaagent/skills/<category>/<name>.md
+#     e.g. skills/productivity/product-price-monitor.md
+#     e.g. skills/research/competitor-news-monitor.md
+# `<category>` is a slash-free folder name; `<name>.md` is the skill filename.
+# `tool_skill_save` writes into SKILLS_DIR/<category>/<name>.md when a category
+# is supplied, otherwise falls back to the legacy flat layout so old skills keep
+# working. `tool_skill_list` returns [{"name": ..., "category": ..., "file": ...,
+# "description": ..., "tags": ..., "related_skills": ...}, ...] and strips the
+# legacy flat names so callers that only want names still work.
+#
+# Backward compat: flat files (skills/<name>.md with no category folder) are
+# still readable and listable. On save, if `category` is omitted or empty the
+# skill lives flat; if supplied it goes into the categorized layout. `skill_read`
+# accepts either "name" (flat) or "category/name" (categorized).
+
+_SKILL_FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+_SKILL_FM_DEFAULT = {
+    "name": None,       # filled from the filename on save
+    "description": None,
+    "version": None,
+    "author": None,
+    "tags": [],
+    "related_skills": [],
+}
+
+_VALID_FM_KEYS = frozenset(("name", "description", "version", "author", "tags", "related_skills"))
+
+
+def _parse_frontmatter(text):
+    """Return (fm_dict, body) from a skill .md file. fm_dict shares the default
+    template so callers always get the same keys; unknown frontmatter keys are
+    dropped (like Hermes' strict frontmatter model)."""
+    fm = dict(_SKILL_FM_DEFAULT)
+    body = text
+    m = _SKILL_FM_RE.match(text)
+    if m:
+        raw = m.group(1)
+        body = text[m.end():]
+        try:
+            loaded = yaml.safe_load(raw) or {}
+        except yaml.YAMLError:
+            loaded = {}
+        if isinstance(loaded, dict):
+            for k in _VALID_FM_KEYS:
+                v = loaded.get(k)
+                if v is not None:
+                    if k in ("tags", "related_skills") and isinstance(v, list):
+                        fm[k] = [str(x) for x in v]
+                    elif k == "description":
+                        fm[k] = str(v)
+                    elif k in ("version", "author"):
+                        fm[k] = str(v) if v is not None else None
+                    else:
+                        fm[k] = v
+    return fm, body
+
+
+def _skill_body_for_tool(fm, body):
+    """Render a skill's frontmatter as a one-line description the agent can
+    scan, then the full body. This is what tool_skill_read returns as 'content'
+    so the agent sees metadata + procedure in one call (Hermes injects the full
+    SKILL.md including frontmatter into context)."""
+    parts = []
+    if fm.get("description"):
+        parts.append("# " + fm["description"])
+    if fm.get("tags"):
+        parts.append("")
+        parts.append("tags: " + ", ".join(str(t) for t in fm["tags"]))
+    if fm.get("related_skills"):
+        parts.append("related: " + ", ".join(str(r) for r in fm["related_skills"]))
+    if body.strip():
+        if parts:
+            parts.append("")
+        parts.append(body.rstrip())
+    return "\n".join(parts).strip() or body.rstrip()
+
+
+def _detect_category(name):
+    """If `name` already contains a slash, treat the left of it as a category
+    and the right as the skill name (so "category/name" works everywhere)."""
+    if "/" in name:
+        cat, _, nm = name.partition("/")
+        return cat.strip(), nm.strip()
+    return None, name.strip()
+
+
+def _skill_filepath(category, name):
+    if category:
+        return os.path.join(SKILLS_DIR, category, name + ".md")
+    return os.path.join(SKILLS_DIR, name + ".md")
+
+
+def _scan_skill_files():
+    """Walk SKILLS_DIR and yield (category_or_None, name, filepath) for every
+    .md file, including legacy flat files. Categorized files take precedence:
+    a file under skills/<cat>/<name>.md is NOT confused with a flat
+    skills/<cat>.md (the latter is only produced by old saves)."""
+    if not os.path.isdir(SKILLS_DIR):
+        return
+    for entry in os.listdir(SKILLS_DIR):
+        full = os.path.join(SKILLS_DIR, entry)
+        if os.path.isfile(full) and entry.endswith(".md"):
+            yield None, entry[:-3], full
+        elif os.path.isdir(full):
+            cat = entry
+            for sub in os.listdir(full):
+                sub_full = os.path.join(full, sub)
+                if os.path.isfile(sub_full) and sub.endswith(".md"):
+                    yield cat, sub[:-3], sub_full
+
+
+def _normalize_skill_list(raw_list):
+    """Accept either the new list-of-dicts or the legacy list-of-strings and
+    return a list of dicts (legacy entries get category=None, description=None)."""
+    if not raw_list:
+        return []
+    if isinstance(raw_list, list) and raw_list and isinstance(raw_list[0], dict):
+        return raw_list
+    # legacy: plain strings (flat skill names)
+    return [{"name": str(s), "category": None, "file": None,
+             "description": None, "tags": [], "related_skills": []}
+            for s in raw_list]
+
+
 def tool_skill_list():
+    """List every skill on the device with metadata (Hermes-style).
+
+    Returns {"ok": True, "skills": [dict, ...]} where each dict has:
+      name, category, file, description, tags, related_skills.
+    When the caller only wants names it can read d["name"].
+    """
     try:
-        os.makedirs(SKILLS_DIR, exist_ok=True)
-        names = sorted(n[:-3] for n in os.listdir(SKILLS_DIR) if n.endswith(".md"))
-        return {"ok": True, "skills": names}
+        return {"ok": True, "skills": _skill_list_all()}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
 def tool_skill_read(name):
+    """Read a skill by name (flat) or category/name (categorized).
+
+    Returns {"ok": True, "name": ..., "category": ..., "file": ...,
+             "description": ..., "tags": ..., "content": ...}
+    where 'content' is the frontmatter-annotated body the agent applies.
+    """
     name = str(name).strip()
-    path = os.path.join(SKILLS_DIR, name if name.endswith(".md") else name + ".md")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-        return {"ok": True, "name": name, "content": content}
-    except FileNotFoundError:
+    if not name:
+        return {"ok": False, "error": "empty name"}
+    category, skill_name = _detect_category(name)
+    path = _skill_filepath(category, skill_name)
+    info = _skill_read(path)
+    if info is None:
         return {"ok": False, "error": "no such skill: %s" % name}
+    return {"ok": True, **info}
+
+
+def tool_skill_remove(name):
+    """Delete a skill by name (flat) or category/name (categorized).
+
+    Returns {"ok": True} on success, {"ok": False, "error": ...} otherwise.
+    """
+    name = str(name).strip()
+    if not name:
+        return {"ok": False, "error": "empty name"}
+    category, skill_name = _detect_category(name)
+    path = _skill_filepath(category, skill_name)
+    if not os.path.isfile(path):
+        return {"ok": False, "error": "no such skill: %s" % name}
+    try:
+        os.remove(path)
+        return {"ok": True, "name": skill_name, "category": category}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -579,15 +741,44 @@ def _atomic_write(path, text, mode="w"):
                 pass
 
 
-def tool_skill_save(name, content):
+def tool_skill_save(name, content, category=None):
+    """Save a skill with optional YAML frontmatter.
+
+    `name` may be "skill-name" (flat) or "category/skill-name" (categorized);
+    the explicit `category` kwarg overrides any slash in `name`.
+    `content` is the full .md source including an optional leading `---` block.
+    If no frontmatter is present, one is synthesized from the name so every
+    skill carries at least a name (Hermes-style self-describing skills).
+    """
     name = str(name).strip()
-    if not name or "/" in name or "\\" in name or name.startswith("."):
-        return {"ok": False, "error": "invalid skill name: %r" % name}
+    if not name or "/" in name:
+        return {"ok": False, "error": "invalid skill name: %r (use category kwarg for folders)" % name}
+    if category:
+        cat = str(category).strip()
+        if "/" in cat or "\\" in cat or not cat:
+            return {"ok": False, "error": "invalid category: %r" % category}
+    else:
+        cat = None
+    if not content:
+        content = ""
+    fm, body = _parse_frontmatter(content)
+    # ensure name is always present
+    if not fm.get("name"):
+        fm["name"] = name
+    if not fm.get("description"):
+        fm["description"] = name.replace("-", " ").replace("_", " ").title()
+    path = _skill_filepath(cat, name)
     try:
-        os.makedirs(SKILLS_DIR, exist_ok=True)
-        path = os.path.join(SKILLS_DIR, name + ".md")
-        _atomic_write(path, str(content))
-        return {"ok": True, "name": name, "path": path, "chars": len(str(content))}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # rebuild the .md source with a clean frontmatter block
+        fm_block = "---\n" + yaml.safe_dump(
+            {k: fm[k] for k in ("name", "description", "version", "author", "tags", "related_skills")
+             if fm.get(k) is not None},
+            sort_keys=False, allow_unicode=True).rstrip() + "\n---\n\n"
+        full = fm_block + body
+        _atomic_write(path, full)
+        return {"ok": True, "name": name, "category": cat, "path": path,
+                "chars": len(full)}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -863,21 +1054,28 @@ TOOLS = [
             "required": []}}},
     {"type": "function", "function": {
         "name": "skill_list",
-        "description": "List available on-device skill files. ALWAYS call this before starting a substantial task and read any skill whose name matches the task - skills encode the user's preferred way of doing that kind of work.",
+        "description": "List available on-device skills (Hermes-style: YAML frontmatter + categorized storage). ALWAYS call this before starting a substantial task and read any skill whose name or tags match the task - skills encode the user's preferred way of doing that kind of work.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "skill_read",
-        "description": "Read the full body of a named skill. Use the exact name from skill_list (without .md). Apply the skill's guidance faithfully when it matches the current task.",
+        "description": "Read the full body of a named skill (name or category/name). Returns the skill's YAML frontmatter (name, description, tags, related_skills) plus its procedure body. Apply the skill's guidance faithfully when it matches the current task.",
         "parameters": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "Skill name (without .md)"}},
+            "name": {"type": "string", "description": "Skill name, or category/name for a categorized skill"}},
             "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "skill_save",
-        "description": "Save a reusable procedure as a skill so it can be applied on later tasks. Give it a descriptive name (lowercase-hyphenated) and a concise body that states the TRIGGER (when to use it) followed by numbered STEPS. Only save genuinely reusable, non-obvious procedures.",
+        "description": "Save a reusable procedure as a skill so it can be applied on later tasks. Give it a descriptive name (lowercase-hyphenated) and a body that states the TRIGGER (when to use it) followed by numbered STEPS. Use the category parameter to place it in a category folder (Hermes-style). Only save genuinely reusable, non-obvious procedures.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "Skill name, lowercase-hyphenated, without .md"},
-            "content": {"type": "string", "description": "Skill body: a one-line trigger condition followed by concise numbered steps."}},
+            "content": {"type": "string", "description": "Skill body: a one-line trigger condition followed by concise numbered steps. May include a YAML frontmatter block between --- fences (name, description, version, tags, related_skills)."},
+            "category": {"type": "string", "description": "Optional category folder (e.g. 'productivity'). When omitted the skill is saved flat."}},
             "required": ["name", "content"]}}},
+    {"type": "function", "function": {
+        "name": "skill_remove",
+        "description": "Delete a skill from the device by name (or category/name). Use after confirming with the user that a skill should be removed.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Skill name, or category/name for a categorized skill"}},
+            "required": ["name"]}}},
 ]
 
 TOOL_IMPL = {
@@ -897,7 +1095,10 @@ TOOL_IMPL = {
     "file_list": lambda a: tool_file_list(a.get("path")),
     "skill_list": lambda a: tool_skill_list(),
     "skill_read": lambda a: tool_skill_read(a.get("name")),
-    "skill_save": lambda a: tool_skill_save(a.get("name"), a.get("content")),
+    "skill_save": lambda a: tool_skill_save(
+        a.get("name"), a.get("content"),
+        category=a.get("category")),
+    "skill_remove": lambda a: tool_skill_remove(a.get("name")),
 }
 
 
@@ -2149,6 +2350,7 @@ def ask_key(current):
 def ask_permission(desc):
     """Interactive y/N prompt used as ON_PERMISSION in the REPL."""
     sp = _UI.get("spinner")
+    was_running = sp is not None
     if sp:
         sp.stop()
     print()
@@ -2157,10 +2359,11 @@ def ask_permission(desc):
         v = input("    allow? [y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
-        return False
-    finally:
-        if sp:
+        if was_running and sp:
             sp.start()
+        return False
+    if was_running and sp:
+        sp.start()
     return v in ("y", "yes", "a", "allow")
 
 
@@ -2561,6 +2764,17 @@ def cmd_install_skill(rest):
     except Exception as e:
         p_err("failed to install skill: %s" % e)
 def cmd_clear(history):
+    if not history:
+        p_info("(conversation is already empty)")
+        return
+    try:
+        v = input("  clear %d messages? [y/N]: " % len(history)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if v not in ("y", "yes"):
+        p_info("(cleared skipped)")
+        return
     history.clear()
     _store_set(HISTORY_KEY, [])
     p_ok("conversation cleared")
@@ -2632,8 +2846,8 @@ def setup_completion():
         readline.set_history_length(2000)  # keep last 2000 entries
         readline.set_completer(_slash_complete)
         readline.parse_and_bind("tab: complete")
-    except Exception:
-        pass
+    except Exception as e:
+        p_info("(tab completion unavailable: %s)" % e)
 
 
 def save_completion_history():
@@ -2741,11 +2955,11 @@ def banner(state):
     if "/" in model_short:
         model_short = model_short.split("/")[-1]
     ctx = _fmt_k(context_window_for(cfg))
-    # Left meta column (Hermes banner left side): model · context · Nous Research.
+    # Left meta column (Hermes banner left side): model · context · provider.
     left_lines = [
         "",
-        "[bold %s]%s[/]  [dim %s]·[/] [dim %s]%s context[/]  [dim %s]·[/] [dim %s]Nous Research[/]"
-        % (HERMES_ACCENT, model_short, HERMES_DIM, HERMES_DIM, ctx, HERMES_DIM, HERMES_DIM),
+        "[bold %s]%s[/]  [dim %s]·[/] [dim %s]%s context[/]"
+        % (HERMES_ACCENT, model_short, HERMES_DIM, HERMES_DIM, ctx),
         "[dim %s]skin[/] %s" % (HERMES_DIM, state.get("skin") or DEFAULT_SKIN),
         "[dim %s]provider[/] %s" % (HERMES_DIM, state["active"]),
         "[dim %s]config/store:[/] %s" % (HERMES_DIM, DATA_DIR),
@@ -2991,6 +3205,45 @@ def main():
     ON_PERMISSION = ask_permission  # interactive y/N for risky actions
     state = load_state()
     set_active_skin(state)
+
+    # Guarantee screen restoration even on SIGTERM / OOM kill / crash.
+    # SIGTERM and SIGINT both route through _cleanup so the alternate-screen
+    # escape always lands; without this, `kill` from another session leaves the
+    # stale TUI buffer on screen (the issue the user hit).
+    _restored = threading.Event()
+
+    def _cleanup(signum=None, frame=None):
+        if _restored.is_set():
+            return
+        _restored.set()
+        try:
+            sys.stdout.write("\x1b[?1049l")
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        if signum is not None:
+            sys.exit(signum)
+
+    def _on_sigterm(signum, frame):
+        _cleanup(signum, frame)
+
+    # SIGINT is left at the default handler (KeyboardInterrupt) — see main().
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception:
+        pass
+    # Don't install a SIGINT handler -- let the default raise KeyboardInterrupt so
+    # the REPL's except KeyboardInterrupt (Ctrl+C during input), the agent's
+    # except KeyboardInterrupt (Ctrl+C during a network call), and any library
+    # that catches it all work as expected. The finally block still calls
+    # _cleanup() on every exit path.
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+    except Exception:
+        pass
+
     # Alternate-screen buffer: take over the whole terminal like Hermes' TUI
     # (prior scrollback hidden on launch, restored on exit). Emit the enter
     # code, run, and always emit the leave code (even on Ctrl-C / error).
@@ -3000,8 +3253,7 @@ def main():
         banner(state)
         repl()
     finally:
-        sys.stdout.write("\x1b[?1049l")
-        sys.stdout.flush()
+        _cleanup()
 
 
 if __name__ == "__main__":
