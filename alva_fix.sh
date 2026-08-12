@@ -25,11 +25,15 @@ fi
 # 3) ensure 'rich' + 'yaml' are available (Hermes-style panels + skills depend on them)
 #    Termux Python is externally-managed (PEP 668) -> plain `pip install`
 #    fails; use --break-system-packages (or `pkg install python-rich`).
-for mod in rich yaml; do
+for mod in rich; do
+  pkg="${mod}"
+  case "$mod" in
+    yaml) pkg="PyYAML" ;;
+  esac
   if ! python3 -c "import $mod" 2>/dev/null; then
-    echo "[*] $mod not found - installing..."
-    python3 -m pip install --break-system-packages $mod 2>&1 | tail -2 \
-      || pip install --break-system-packages $mod 2>&1 | tail -2 \
+    echo "[*] $mod not found - installing $pkg..."
+    python3 -m pip install --break-system-packages "$pkg" 2>&1 | tail -2 \
+      || pip install --break-system-packages "$pkg" 2>&1 | tail -2 \
       || true
   fi
 done
