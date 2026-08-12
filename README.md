@@ -12,8 +12,9 @@ Built for Termux, runs offline-friendly, and survives flaky mobile connections.
 
 ## Features
 - **Python TUI** (`alvaagent_tui.py`) — stdlib only, no dependencies to install.
-- **17 tools**: calculator, web_fetch, get_time, memory, todos, shell, file
-  read/write/edit/list, skill save/read/list.
+- **24 tools**: calculator, web_fetch, get_time, memory, todos, shell, file
+  read/write/edit/list, skill save/read/list/remove, feedback/improvement/reflect,
+  self_test.
 - **Provider profiles**: point at any OpenAI-compatible endpoint. Each
   `/provider` is a saved named profile, switchable anytime.
 - **Sessions** persist to `store.json`; **context auto-compression** keeps long

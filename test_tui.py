@@ -58,7 +58,7 @@ try:
     print("[mock server ready]")
 
     # ---------- tools registered ----------
-    assert_ok(len(pa.TOOLS) == 17, "17 tools registered (9 base + shell/files/skills)")
+    assert_ok(len(pa.TOOLS) == 24, "24 tools registered")
 
     # ---------- calculator ----------
     assert_ok(pa.tool_calculator("6*7")["result"] == 42, "calculator: 6*7 = 42")
@@ -139,8 +139,22 @@ try:
               "classify: plain find search stays allowed")
     assert_ok(pa.classify_command("find / -delete") == "ask",
               "classify: find -delete is rejected")
-    assert_ok(pa.classify_command("find / -exec rm {} \;") == "ask",
+    assert_ok(pa.classify_command(r"find / -exec rm {} \;") == "ask",
               "classify: find -exec is rejected")
+    # regression: quoted commands executed through `env` / shell interpreters
+    # must NOT classify as read-only (quoted content hides the risky token)
+    assert_ok(pa.classify_command("env sh -c 'rm -rf /'") == "ask",
+              "classify: env executing a quoted shell command is rejected")
+    assert_ok(pa.classify_command("env -S 'echo hi'") == "ask",
+              "classify: env -S string-execution is rejected")
+    assert_ok(pa.classify_command("sh -c 'rm -rf /'") == "ask",
+              "classify: bare shell interpreter is rejected")
+    assert_ok(pa.classify_command("bash -c 'rm -rf /'") == "ask",
+              "classify: bash -c is rejected")
+    assert_ok(pa.classify_command("env") == "ask",
+              "classify: env alone is no longer treated as read-only")
+    assert_ok(pa.classify_command("env X=1 date") == "ask",
+              "classify: env with env-prefixed args is rejected")
 
     pa.ON_PERMISSION = lambda d: False
     denied = pa.tool_run_command("touch /tmp/should-not-exist-alva")
@@ -162,8 +176,13 @@ try:
     r = pa.tool_file_read(proj_test)
     assert_ok(r.get("ok") is True and "first line" in r.get("content", ""), "file_read round-trips content")
     e = pa.tool_file_edit(proj_test, "first", "FIRST")
-    assert_ok(e.get("ok") is True and e.get("replaced") >= 1, "file_edit replaces text")
+    assert_ok(e.get("ok") is True and e.get("replaced") == 1, "file_edit replaces text (honest count)")
     assert_ok("FIRST line" in pa.tool_file_read(proj_test)["content"], "file_edit change persisted")
+    pa.tool_file_write(proj_test, "a a a")
+    e2 = pa.tool_file_edit(proj_test, "a", "b")
+    assert_ok(e2.get("ok") is True and e2.get("replaced") == 1
+              and pa.tool_file_read(proj_test)["content"] == "b a a",
+              "file_edit replaces only the first occurrence")
     lst = pa.tool_file_list(DATA)
     assert_ok(lst.get("ok") is True and any(x["name"] == "proj-demo.txt" for x in lst.get("entries", [])),
               "file_list shows the created file")
@@ -180,10 +199,32 @@ try:
     # ---------- autonomy: skills ----------
     sk = pa.tool_skill_save("test-skill", "Always check the time before planning.")
     assert_ok(sk.get("ok") is True, "skill_save writes a skill")
-    assert_ok("test-skill" in (pa.tool_skill_list().get("skills") or []), "skill_list shows saved skill")
+    skill_names = [s.get("name") for s in (pa.tool_skill_list().get("skills") or [])]
+    assert_ok("test-skill" in skill_names, "skill_list shows saved skill")
     sr = pa.tool_skill_read("test-skill")
     assert_ok(sr.get("ok") is True and "check the time" in sr.get("content", ""), "skill_read returns skill body")
     assert_ok(pa.tool_skill_read("missing-skill").get("ok") is False, "skill_read reports missing skills")
+    # categorized skills: save/read/list round-trip
+    sc = pa.tool_skill_save("cat-skill", "Steps go here.", category="productivity")
+    assert_ok(sc.get("ok") is True and sc.get("category") == "productivity",
+              "skill_save places a categorized skill")
+    scr = pa.tool_skill_read("productivity/cat-skill")
+    assert_ok(scr.get("ok") is True and scr.get("category") == "productivity",
+              "skill_read resolves category/name")
+    # skills work even with NO PyYAML installed (frontmatter fallback)
+    saved_yaml = pa.yaml
+    try:
+        pa.yaml = None
+        sf = pa.tool_skill_save("no-yaml-skill", "---\ndescription: parsed without yaml\ntags:\n  - a\n  - b\n---\nbody here")
+        assert_ok(sf.get("ok") is True, "skill_save works without PyYAML")
+        sfr = pa.tool_skill_read("no-yaml-skill")
+        assert_ok(sfr.get("ok") is True and sfr.get("description") == "parsed without yaml"
+                  and sfr.get("tags") == ["a", "b"], "frontmatter fallback parses keys + lists")
+        pa.tool_skill_remove("no-yaml-skill")
+    finally:
+        pa.yaml = saved_yaml
+    pa.tool_skill_remove("test-skill")
+    pa.tool_skill_remove("productivity/cat-skill")
 
     # ---------- web_fetch (offline: the mock's own /mock-page) ----------
     wf = pa.tool_web_fetch(BASE + "/mock-page")
@@ -322,6 +363,12 @@ try:
 
     # ---------- reliability: atomic store writes ----------
     # A store save must leave VALID json even under a racing second write.
+    # regression: main() must never bind SIGINT to SIG_DFL - that skips
+    # KeyboardInterrupt handling and the alt-screen _cleanup() on Ctrl+C
+    import inspect as _inspect
+    _main_src = _inspect.getsource(pa.main)
+    assert_ok("signal.signal(pa.signal.SIGINT, pa.signal.SIG_DFL)" not in _main_src,
+              "main() must not set SIGINT to SIG_DFL (breaks Ctrl+C cleanup)")
     pa._store["alvaagent.todos"] = [{"text": "atomic test", "done": False}]
     pa._save_store()
     sp = os.path.join(DATA, "store.json")
@@ -377,6 +424,43 @@ try:
     finally:
         pa.urllib.request.urlopen = _orig_urlopen
 
+    # ---------- UX: command history persists across restarts ----------
+    # ---------- streaming: tool_call ids ----------
+    id_sse = (
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\","
+        "\"function\":{\"name\":\"calculator\",\"arguments\":\"\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\","
+        "\"function\":{\"arguments\":\"{\\\"expression\\\":\\\"2+2\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+    )
+    def _fake_urlopen2(req, timeout=180):
+        return _FakeResp(id_sse)
+    pa.urllib.request.urlopen = _fake_urlopen2
+    try:
+        _events = list(pa.chat_completion_stream(
+            [{"role": "user", "content": "calc"}], cfg_s))
+        _tc = [tc for _, tcs in _events for tc in (tcs or [])]
+        assert_ok(len(_tc) == 1 and _tc[0]["id"] == "call_abc",
+                  "tool_call id is not concatenated across repeated deltas")
+    finally:
+        pa.urllib.request.urlopen = _orig_urlopen
+    # tool_call id: no id in stream -> stable synthetic id
+    noid_sse = (
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,"
+        "\"function\":{\"name\":\"calculator\",\"arguments\":\"{\\\"expression\\\":\\\"1\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+    )
+    def _fake_urlopen3(req, timeout=180):
+        return _FakeResp(noid_sse)
+    pa.urllib.request.urlopen = _fake_urlopen3
+    try:
+        _events = list(pa.chat_completion_stream(
+            [{"role": "user", "content": "calc"}], cfg_s))
+        _tc = [tc for _, tcs in _events for tc in (tcs or [])]
+        assert_ok(len(_tc) == 1 and _tc[0]["id"] == "call_0",
+                  "tool_call falls back to a stable synthetic id")
+    finally:
+        pa.urllib.request.urlopen = _orig_urlopen
     # ---------- UX: command history persists across restarts ----------
     import readline as _rl
     _htmp = os.path.join(DATA, "_hist_probe.txt")

@@ -59,7 +59,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import yaml
+
+# PyYAML is OPTIONAL: it powers full YAML parsing of skill frontmatter, but the
+# harness ships a tiny fallback parser/serializer for the simple key:value +
+# list format it writes, so the TUI stays runnable with zero pip installs
+# (stdlib only, as the README promises).
+try:
+    import yaml
+except Exception:
+    yaml = None
 
 # Rich backs the Hermes-style panels (pure-Python, pip-installs on Termux).
 # The Hermes agent TUI renders with Rich `Panel(box=HORIZONTALS)`; we mirror
@@ -347,9 +355,12 @@ SKILLS_DIR = os.path.join(DATA_DIR, "skills")
 ON_PERMISSION = None  # hook: ON_PERMISSION(description) -> bool
 
 # commands that are safe to run without asking
+# NOTE: `env` is intentionally NOT here - `env` executes its arguments
+# (`env sh -c '...'`, `env -S '...'`) and would let a quoted destructive
+# command bypass the risk scan.
 _READONLY_PREFIXES = (
     "ls", "cat", "pwd", "whoami", "echo", "date", "which", "find",
-    "head", "tail", "grep", "stat", "df", "du", "free", "uname", "env",
+    "head", "tail", "grep", "stat", "df", "du", "free", "uname",
     "wc", "readlink", "basename", "dirname", "python3 --version",
     "python3 -V", "python3 -m py_compile", "git status", "git diff",
     "git log", "git --version", "git branch", "git remote -v",
@@ -363,6 +374,10 @@ _RISKY_TOKENS = frozenset({
     "dd", "wget", "curl", "git push", "git commit",
     "git reset", "git clean", "git checkout", "git branch",
     "systemctl", "service", "mount", "umount", "fdisk", "tee",
+    # command interpreters/executors: `sh -c '...'` runs arbitrary (quoted)
+    # commands, so they can never be treated as read-only.
+    "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "pwsh",
+    "eval", "exec", "source", "command", "xargs", "nohup", "env",
 })
 _RISKY_OPERATORS = frozenset({">", ">>", "|", "&&", ";"})
 
@@ -517,9 +532,8 @@ def tool_file_edit(path, old, new):
         if old not in content:
             return {"ok": False, "error": "old string not found in %s" % path}
         updated = content.replace(old, new, 1)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(updated)
-        return {"ok": True, "path": path, "replaced": content.count(old)}
+        _atomic_write(path, updated)
+        return {"ok": True, "path": path, "replaced": 1}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -576,6 +590,93 @@ _SKILL_FM_DEFAULT = {
 _VALID_FM_KEYS = frozenset(("name", "description", "version", "author", "tags", "related_skills"))
 
 
+def _mini_scalar(v):
+    """Coerce a bare frontmatter scalar to a Python value (strips quotes)."""
+    s = v.strip()
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    if s.lower() in ("null", "none", "~"):
+        return None
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _mini_yaml(text):
+    """Tiny YAML-subset parser for the frontmatter format the harness writes:
+    'key: scalar' lines and 'key:' followed by '  - item' list entries.
+    Used only when PyYAML isn't installed."""
+    out = {}
+    current_list = None
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.strip().startswith("- "):
+            item = line.split("- ", 1)[1].strip()
+            if current_list is not None:
+                current_list.append(_mini_scalar(item))
+            continue
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip()
+        if not key or key.startswith(" "):
+            continue
+        val = val.strip()
+        if val == "":
+            out[key] = []
+            current_list = out[key]
+        else:
+            out[key] = _mini_scalar(val)
+            current_list = None
+    return out
+
+
+def _frontmatter_load(raw):
+    """Parse skill frontmatter with PyYAML when available, else the mini parser."""
+    if yaml is not None:
+        try:
+            loaded = yaml.safe_load(raw)
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            pass
+    try:
+        loaded = _mini_yaml(raw)
+    except Exception:
+        loaded = {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _frontmatter_dump(fm):
+    """Serialize frontmatter to the YAML block (PyYAML when available, else the
+    mini writer, so skill_save works with zero extra installs)."""
+    if yaml is not None:
+        try:
+            return yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).rstrip()
+        except Exception:
+            pass
+    lines = []
+    for k, v in fm.items():
+        if v is None:
+            continue
+        if isinstance(v, list):
+            if not v:
+                lines.append("%s: []" % k)
+            else:
+                lines.append("%s:" % k)
+                for item in v:
+                    lines.append("  - %s" % str(item))
+        elif isinstance(v, bool):
+            lines.append("%s: %s" % (k, "true" if v else "false"))
+        else:
+            lines.append("%s: %s" % (k, v))
+    return "\n".join(lines)
+
+
 def _parse_frontmatter(text):
     """Return (fm_dict, body) from a skill .md file. fm_dict shares the default
     template so callers always get the same keys; unknown frontmatter keys are
@@ -586,10 +687,7 @@ def _parse_frontmatter(text):
     if m:
         raw = m.group(1)
         body = text[m.end():]
-        try:
-            loaded = yaml.safe_load(raw) or {}
-        except yaml.YAMLError:
-            loaded = {}
+        loaded = _frontmatter_load(raw)
         if isinstance(loaded, dict):
             for k in _VALID_FM_KEYS:
                 v = loaded.get(k)
@@ -638,6 +736,29 @@ def _skill_filepath(category, name):
     if category:
         return os.path.join(SKILLS_DIR, category, name + ".md")
     return os.path.join(SKILLS_DIR, name + ".md")
+
+
+def _skill_read(path):
+    """Parse a skill .md file into its metadata dict plus the body the agent
+    applies. Returns None when the file is missing or unreadable. This backs
+    _skill_list_all() and tool_skill_read()."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return None
+    fm, body = _parse_frontmatter(text)
+    return {
+        "name": fm.get("name"),
+        "description": fm.get("description"),
+        "version": fm.get("version"),
+        "author": fm.get("author"),
+        "tags": fm.get("tags"),
+        "related_skills": fm.get("related_skills"),
+        "content": _skill_body_for_tool(fm, body),
+    }
 
 
 def _scan_skill_files():
@@ -718,6 +839,8 @@ def tool_skill_read(name):
     info = _skill_read(path)
     if info is None:
         return {"ok": False, "error": "no such skill: %s" % name}
+    info["category"] = category
+    info["file"] = os.path.relpath(path, SKILLS_DIR)
     return {"ok": True, **info}
 
 
@@ -791,10 +914,9 @@ def tool_skill_save(name, content, category=None):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # rebuild the .md source with a clean frontmatter block
-        fm_block = "---\n" + yaml.safe_dump(
+        fm_block = "---\n" + _frontmatter_dump(
             {k: fm[k] for k in ("name", "description", "version", "author", "tags", "related_skills")
-             if fm.get(k) is not None},
-            sort_keys=False, allow_unicode=True).rstrip() + "\n---\n\n"
+             if fm.get(k) is not None}) + "\n---\n\n"
         full = fm_block + body
         _atomic_write(path, full)
         return {"ok": True, "name": name, "category": cat, "path": path,
@@ -1454,8 +1576,8 @@ def chat_completion_stream(messages, config, tools=None):
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
                     acc = tool_calls_acc[idx]
-                    if tcc.get("id"):
-                        acc["id"] += tcc["id"]
+                    if tcc.get("id") and not acc["id"]:
+                        acc["id"] = tcc["id"]
                     # Some OpenAI-compatible gateways omit the tool_call id in the
                     # streamed deltas. Fall back to a stable synthetic id so the
                     # assistant tool_calls and the resulting tool message stay
@@ -1730,10 +1852,10 @@ def self_test():
     except Exception:
         checks.append(("file_read", False))
 
-    # file tools: write to temp dir
+    # file tools: write to temp dir (inside DATA_DIR so the headless default
+    # deny-on-outside-write never blocks the check)
     try:
-        import tempfile
-        tmp = os.path.join(tempfile.gettempdir(), ".alva_self_test_tmp.txt")
+        tmp = os.path.join(DATA_DIR, ".alva_self_test_tmp.txt")
         r = tool_file_write(tmp, "test content")
         if r.get("ok"):
             content = tool_file_read(tmp).get("content", "")
@@ -3587,8 +3709,10 @@ def banner(state):
     two-column grid (exactly how Hermes aligns its banner). Colors use the fixed
     Hermes palette (gold accent, bronze border) regardless of /skin. The wordmark
     is pyfiglet output; grid cells use Rich markup tags (Hermes' own convention).
+    NOTE: Table is imported lazily (inside try/except) so the banner still
+    renders when rich is absent — the module-level fallback shim covers
+    Console/Panel only.
     """
-    from rich.table import Table
     cfg = active_cfg(state)
     _CON.print()  # top spacer like Hermes
     # Hermes only prints its big wordmark when the terminal is wide enough; on
@@ -3716,7 +3840,9 @@ def send_message(text, history, state, session):
         save_session(session, history)
         return session
     if not res.get("streamed"):
-        render_agent_panel(res.get("content") or "")
+        content = (res.get("content") or "").strip()
+        if content:
+            render_agent_panel(content)
     # post-turn: auto-compress if the response pushed us past the threshold
     compressed = False
     if cfg.get("auto_compress", True):
@@ -3905,21 +4031,18 @@ def main():
     def _on_sigterm(signum, frame):
         _cleanup(signum, frame)
 
-    # SIGINT is left at the default handler (KeyboardInterrupt) — see main().
-
     try:
         signal.signal(signal.SIGTERM, _on_sigterm)
     except Exception:
         pass
-    # Don't install a SIGINT handler -- let the default raise KeyboardInterrupt so
-    # the REPL's except KeyboardInterrupt (Ctrl+C during input), the agent's
-    # except KeyboardInterrupt (Ctrl+C during a network call), and any library
-    # that catches it all work as expected. The finally block still calls
-    # _cleanup() on every exit path.
-    try:
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-    except Exception:
-        pass
+    # SIGINT is deliberately left untouched (Python's default raises
+    # KeyboardInterrupt): the REPL's `except KeyboardInterrupt` (Ctrl+C during
+    # input), the agent's `except KeyboardInterrupt` (Ctrl+C during a network
+    # call), and any library that catches it all work as expected, and the
+    # `finally: _cleanup()` below still runs on every exit path. Do NOT set
+    # SIGINT to SIG_DFL here — that kills the process outright, skipping both
+    # KeyboardInterrupt handling and _cleanup(), leaving the terminal stuck in
+    # the alternate-screen buffer.
 
     # Alternate-screen buffer: take over the whole terminal like Hermes' TUI
     # (prior scrollback hidden on launch, restored on exit). Emit the enter

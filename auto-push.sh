@@ -3,7 +3,7 @@
 # Runs from cron. Safe to run frequently — only pushes when there's a diff.
 set -euo pipefail
 
-REPO_DIR="/root/alvaagent"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 # Nothing to do if working tree is clean
