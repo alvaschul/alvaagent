@@ -1536,7 +1536,11 @@ def run_agent(history_json, config_json):
     for m in history:
         if m.get("role") == "system":
             continue  # avoid duplicate system prompts
-        messages.append({"role": m["role"], "content": m.get("content")})
+        # Copy the full message dict so tool messages keep their tool_call_id
+        # and assistant messages keep their tool_calls (required by the API).
+        if not isinstance(m, dict):
+            continue
+        messages.append(dict(m))
 
     for step in range(MAX_STEPS):
         if _cancel_flag[0]:
@@ -1579,7 +1583,11 @@ def run_agent_stream(history, config):
     for m in history:
         if m.get("role") == "system":
             continue
-        messages.append({"role": m["role"], "content": m.get("content")})
+        # Copy the full message dict so tool messages keep their tool_call_id
+        # and assistant messages keep their tool_calls (required by the API).
+        if not isinstance(m, dict):
+            continue
+        messages.append(dict(m))
 
     for step in range(MAX_STEPS):
         if _cancel_flag[0]:
