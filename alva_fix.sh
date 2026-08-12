@@ -25,7 +25,7 @@ fi
 # 3) ensure 'rich' + 'yaml' are available (Hermes-style panels + skills depend on them)
 #    Termux Python is externally-managed (PEP 668) -> plain `pip install`
 #    fails; use --break-system-packages (or `pkg install python-rich`).
-for mod in rich; do
+for mod in rich yaml; do
   pkg="${mod}"
   case "$mod" in
     yaml) pkg="PyYAML" ;;
@@ -42,6 +42,12 @@ if python3 -c "import rich" 2>/dev/null; then
 else
   echo "[!] 'rich' still not importable."
   echo "    Install manually, then re-run:  pip install --break-system-packages rich"
+fi
+if python3 -c "import yaml" 2>/dev/null; then
+  echo "[ok] yaml ready"
+else
+  echo "[!] 'yaml' still not importable."
+  echo "    Install manually, then re-run:  pip install --break-system-packages PyYAML"
 fi
 
 # 4) launch the correct version from the git repo
