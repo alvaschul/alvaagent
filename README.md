@@ -113,7 +113,16 @@ tests for the command classifier and atomic store writes).
 
 ## Security model
 - Headless runs default to **deny** for risky/mutating commands; the TUI prompts
-  `y/N` for anything dangerous.
+  `allow? [y/N/a]` for anything dangerous.
+- **Anti-nagging**: an approved action is remembered for the rest of the
+  session (exact-match, in-memory only — `y` or `a`) so the agent can repeat it
+  without re-asking. Nothing is ever permanently approved; a restart resets the
+  cache.
+- The read-only allowlist covers everyday inspection (`ls/cat/ps/sort/diff/...`),
+  the dev loop (`python3 -m pyflakes`, `python3 test_tui.py`,
+  `python3 -m py_compile`), git read commands, and archive *listing*
+  (`unzip -l`, `tar -tf`) — while execution (`python3 -c`, `pip`, `sh -c`,
+  extraction, chaining, substitution) always stays gated.
 - Blocked without approval: command substitution (`$()`, backticks), env-prefixed
   risky tokens (`env X=1 rm -rf /`), destructive `find` flags (`-delete`,
   `-exec`), and reading files outside the project folder.

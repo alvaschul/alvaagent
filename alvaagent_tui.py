@@ -373,11 +373,24 @@ ON_PERMISSION = None  # hook: ON_PERMISSION(description) -> bool
 # (`env sh -c '...'`, `env -S '...'`) and would let a quoted destructive
 # command bypass the risk scan.
 _READONLY_PREFIXES = (
+    # everyday inspection (single commands only - any `|`, `>`, `&&`, `;`
+    # or shell metachar is rejected earlier in classify_command)
     "ls", "cat", "pwd", "whoami", "echo", "date", "which", "find",
     "head", "tail", "grep", "stat", "df", "du", "free", "uname",
-    "wc", "readlink", "basename", "dirname", "python3 --version",
-    "python3 -V", "python3 -m py_compile", "git status", "git diff",
-    "git log", "git --version", "git branch", "git remote -v",
+    "wc", "readlink", "basename", "dirname", "file", "tree", "ps",
+    "id", "hostname", "uptime", "who", "cal", "printf", "realpath", "cd",
+    "sort", "uniq", "cut", "tr", "fmt", "paste", "join", "comm",
+    "diff", "cmp", "md5sum", "sha256sum", "strings",
+    # dev loop: the agent edits its own source, so its own tooling must not nag
+    "python3 --version", "python3 -V", "python3 -m py_compile",
+    "python3 -m pyflakes", "python3 -m json.tool", "python3 test_tui.py",
+    # git read-only inspection (NOT git add/commit/push/pull/branch/reset)
+    "git status", "git diff", "git log", "git --version", "git branch",
+    "git remote -v", "git show", "git blame", "git ls-files",
+    # archive listing only (extract/write variants are NOT allowlisted)
+    "tar -tf", "unzip -l", "zipinfo",
+    # Termux read-only queries
+    "termux-battery-status", "termux-clipboard-get",
 )
 
 # anything containing these is treated as mutating/risky -> ask the user
@@ -473,12 +486,24 @@ def classify_file_action(path, kind):
     return "allow" if _in_project(path) else "ask"
 
 
+# Descriptions approved this session run again WITHOUT prompting (exact-match,
+# in-memory only - nothing survives a restart). This is the anti-nagging layer:
+# approve `python3 test_tui.py` once and the agent can rerun it freely until
+# the process exits. Reset any time with _APPROVED_SET.clear().
+_APPROVED_SET = set()
+
+
 def _permission(desc):
-    """Resolve a permission request: hook -> env override -> default deny."""
+    """Resolve a permission request: session cache -> env override -> hook."""
     if os.environ.get("ALVA_AUTO_APPROVE") == "1":
         return True
+    if desc in _APPROVED_SET:
+        return True
     if ON_PERMISSION is not None:
-        return ON_PERMISSION(desc)
+        ok = ON_PERMISSION(desc)
+        if ok:
+            _APPROVED_SET.add(desc)  # remember for the rest of this session
+        return ok
     return False  # headless default: deny
 
 
@@ -3637,7 +3662,11 @@ def ask_key(current):
 
 
 def ask_permission(desc):
-    """Interactive y/N prompt used as ON_PERMISSION in the REPL."""
+    """Interactive y/N/a prompt used as ON_PERMISSION in the REPL.
+
+    y or a approve (and are remembered for this session, so the same action
+    won't prompt again); anything else denies.
+    """
     sp = _UI.get("spinner")
     was_running = sp is not None
     if sp:
@@ -3645,7 +3674,7 @@ def ask_permission(desc):
     print()
     print(col(CUR_SKIN["err"], "  [!] permission needed") + "  " + desc)
     try:
-        v = input("    allow? [y/N]: ").strip().lower()
+        v = input("    allow? [y/N/a]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         if was_running and sp:
@@ -3653,7 +3682,10 @@ def ask_permission(desc):
         return False
     if was_running and sp:
         sp.start()
-    return v in ("y", "yes", "a", "allow")
+    if v in ("y", "yes", "a", "allow", "always"):
+        print("    (remembered for this session - restart to reset)")
+        return True
+    return False
 
 
 # ---------------- slash commands ----------------

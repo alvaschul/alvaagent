@@ -179,6 +179,78 @@ try:
     assert_ok(ok2.get("ok") is True and "approved-run" in ok2.get("stdout", ""),
               "run_command: risky command runs when user approves")
     pa.ON_PERMISSION = None
+    pa._APPROVED_SET.clear()
+
+    # widened read-only allowlist (anti-nagging: dev-loop + inspection commands)
+    assert_ok(pa.classify_command("python3 -m pyflakes alvaagent_tui.py") == "allow",
+              "classify: pyflakes lint is read-only -> allow")
+    assert_ok(pa.classify_command("python3 test_tui.py") == "allow",
+              "classify: running the project test suite is read-only -> allow")
+    assert_ok(pa.classify_command("python3 -m json.tool x.json") == "allow",
+              "classify: json.tool pretty-print is read-only -> allow")
+    assert_ok(pa.classify_command("ps aux") == "allow",
+              "classify: ps is read-only -> allow")
+    assert_ok(pa.classify_command("sort x.txt") == "allow",
+              "classify: sort is read-only -> allow")
+    assert_ok(pa.classify_command("git show HEAD") == "allow",
+              "classify: git show is read-only -> allow")
+    assert_ok(pa.classify_command("unzip -l a.zip") == "allow",
+              "classify: unzip -l lists without extracting -> allow")
+    assert_ok(pa.classify_command("cd /sdcard") == "allow",
+              "classify: bare cd is read-only -> allow")
+    # the widened list must NOT silently allow mutating/executing variants
+    assert_ok(pa.classify_command("python3 -c 'print(1)'") == "ask",
+              "classify: python3 -c arbitrary execution stays ask")
+    assert_ok(pa.classify_command("python3 -m pip install x") == "ask",
+              "classify: pip stays ask")
+    assert_ok(pa.classify_command("unzip a.zip -d out") == "ask",
+              "classify: unzip (extract) stays ask")
+    assert_ok(pa.classify_command("tar -xf a.tar") == "ask",
+              "classify: tar extract stays ask")
+    assert_ok(pa.classify_command("cd /x && rm -rf /") == "ask",
+              "classify: cd chained with a mutating command stays ask")
+    assert_ok(pa.classify_command("git remote add o x") == "ask",
+              "classify: git remote add mutates config -> ask")
+
+    # session-remember cache: an approved action never prompts again
+    pa._APPROVED_SET.clear()
+    pa.ON_PERMISSION = lambda d: True
+    assert_ok(pa.tool_run_command("touch /tmp/alva-cache-demo").get("ok") is True,
+              "cache: first approval runs the command")
+    pa.ON_PERMISSION = lambda d: False
+    _cached = pa.tool_run_command("touch /tmp/alva-cache-demo")
+    assert_ok(_cached.get("ok") is True,
+              "cache: identical approved command reruns WITHOUT prompting (session)")
+    _notcached = pa.tool_run_command("touch /tmp/alva-cache-demo-2")
+    assert_ok(_notcached.get("ok") is False and "permission" in str(_notcached.get("error", "")),
+              "cache: a different command still prompts")
+    pa.ON_PERMISSION = None
+    pa._APPROVED_SET.clear()
+
+    # prompt accepts the 'a' (always) key and caches through ask_permission
+    import builtins
+    _orig_input = builtins.input
+    try:
+        builtins.input = lambda *a, **k: "a"
+        assert_ok(pa.ask_permission("run command: python3 -m pyflakes demo.py") is True,
+                  "ask_permission 'a' approves")
+        builtins.input = lambda *a, **k: "n"
+        assert_ok(pa.ask_permission("run command: python3 -m pyflakes demo2.py") is False,
+                  "ask_permission 'n' denies")
+    finally:
+        builtins.input = _orig_input
+    pa._APPROVED_SET.clear()
+    # the cache itself is populated by _permission (the hook result feeds it)
+    pa.ON_PERMISSION = lambda d: True
+    assert_ok(pa._permission("run command: python3 -m pyflakes demo3.py") is True,
+              "cache: _permission approves on first ask")
+    assert_ok("run command: python3 -m pyflakes demo3.py" in pa._APPROVED_SET,
+              "cache: approval is stored for the session")
+    pa.ON_PERMISSION = lambda d: False
+    assert_ok(pa._permission("run command: python3 -m pyflakes demo3.py") is True,
+              "cache: stored approval reruns without re-asking")
+    pa.ON_PERMISSION = None
+    pa._APPROVED_SET.clear()
 
     # ---------- autonomy: files ----------
     proj_test = os.path.join(DATA, "proj-demo.txt")
