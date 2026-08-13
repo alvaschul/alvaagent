@@ -59,7 +59,7 @@ try:
     print("[mock server ready]")
 
     # ---------- tools registered ----------
-    assert_ok(len(pa.TOOLS) == 28, "28 tools registered")
+    assert_ok(len(pa.TOOLS) == 30, "30 tools registered")
 
     # ---------- calculator ----------
     assert_ok(pa.tool_calculator("6*7")["result"] == 42, "calculator: 6*7 = 42")
@@ -328,6 +328,90 @@ try:
         pa.yaml = saved_yaml
     pa.tool_skill_remove("test-skill")
     pa.tool_skill_remove("productivity/cat-skill")
+
+    # ---------- skills: install from file / URL / repo ----------
+    _loc_skill = os.path.join(DATA, "loc-skill.md")
+    with open(_loc_skill, "w", encoding="utf-8") as _f:
+        _f.write("---\ndescription: A local skill\n---\nsteps here")
+    _ri = pa.tool_skill_install(_loc_skill)
+    assert_ok(_ri.get("ok") is True and _ri.get("name") == "loc-skill",
+              "skill_install imports a local .md file")
+    _rr = pa.tool_skill_read("loc-skill")
+    assert_ok(_rr.get("ok") is True and _rr.get("description") == "A local skill",
+              "installed skill is readable with its frontmatter")
+    pa.tool_skill_remove("loc-skill")
+    os.remove(_loc_skill)
+    # GitHub blob URL -> raw.githubusercontent.com + category
+    _fetched = {}
+    _saved_raw = pa._raw_fetch
+    pa._raw_fetch = lambda u: (_fetched.__setitem__("url", u),
+                               "---\ndescription: Remote skill\n---\nbody")[1]
+    try:
+        _ru = pa.tool_skill_install(
+            "https://github.com/alvaschul/skills/blob/main/skills/foo.md", "remote")
+        assert_ok(_ru.get("ok") is True and _ru.get("name") == "foo"
+                  and _ru.get("category") == "remote",
+                  "skill_install fetches a GitHub URL and categorizes it")
+        assert_ok(_fetched.get("url") ==
+                  "https://raw.githubusercontent.com/alvaschul/skills/main/skills/foo.md",
+                  "skill_install rewrites github.com blob URLs to raw")
+    finally:
+        pa._raw_fetch = _saved_raw
+    pa.tool_skill_remove("remote/foo")
+    # non-markdown page (HTML) is rejected, not imported
+    assert_ok(pa._looks_like_html("<html><body>page</body></html>") is True,
+              "HTML guard catches a repo page")
+    assert_ok(pa._looks_like_html("---\ndescription: skill\n---\nbody") is False,
+              "HTML guard lets real markdown through")
+    _saved_raw = pa._raw_fetch
+    pa._raw_fetch = lambda u: None  # simulate an un-fetchable/non-markdown URL
+    try:
+        _rh = pa.tool_skill_install("https://github.com/alvaschul/skills")
+        assert_ok(_rh.get("ok") is False,
+                  "skill_install rejects an un-fetchable (HTML) page")
+    finally:
+        pa._raw_fetch = _saved_raw
+    # dispatch registration
+    _disp = pa.dispatch_tool("skill_install", {"source": "/no/such/file.md"})
+    assert_ok(_disp.get("ok") is False and "error" in _disp,
+              "skill_install is registered in TOOL_IMPL (dispatchable)")
+    # skill_sync_repo: permission-gated
+    pa._APPROVED_SET.clear()
+    _sync = pa.tool_skill_sync_repo("https://example.com/skills.git")
+    assert_ok(_sync.get("ok") is False and "permission" in str(_sync.get("error", "")),
+              "skill_sync_repo asks permission (headless denies)")
+    # skill_sync_repo: fake a successful shallow clone and import every .md
+    pa.ON_PERMISSION = lambda d: True
+    _rc_obj = type("RC", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+    _saved_run = pa.subprocess.run
+
+    def _fake_clone(args, **kw):
+        tmp = args[-1]
+        for rel, content in (("skills/prod/a.md", "---\ndescription: A\n---\nsteps"),
+                             ("skills/research/b.md", "body b"),
+                             ("skills/README.md", "docs to skip"),
+                             ("skills/prod/.github/ci.md", "hidden")):
+            p = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(content)
+        return _rc_obj
+
+    pa.subprocess.run = _fake_clone
+    try:
+        _sy = pa.tool_skill_sync_repo("https://example.com/skills.git")
+        assert_ok(_sy.get("ok") is True and _sy.get("count") == 2,
+                  "skill_sync_repo imports every .md (%d)" % _sy.get("count"))
+        _cats = sorted({s.get("category") for s in _sy.get("installed", [])})
+        assert_ok(_cats == ["prod", "research"],
+                  "skill_sync_repo uses folders as categories (%s)" % _cats)
+        assert_ok(any(s == "README.md" for s in _sy.get("skipped", [])),
+                  "skill_sync_repo skips README.md")
+    finally:
+        pa.subprocess.run = _saved_run
+        pa.ON_PERMISSION = None
+    pa.tool_skill_remove("prod/a")
+    pa.tool_skill_remove("research/b")
 
     # ---------- web_fetch (offline: the mock's own /mock-page) ----------
     wf = pa.tool_web_fetch(BASE + "/mock-page")

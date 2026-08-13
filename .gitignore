@@ -16,3 +16,7 @@ package-lock.json
 .alvaagent/config.json
 .alvaagent/store.json
 .alvaagent/cmd_history.txt
+
+# Local opencode session config (not part of the project)
+.opencode/
+opencode.json

@@ -1076,6 +1076,143 @@ def tool_skill_save(name, content, category=None):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
+# ---------------- skills: install from URL / git repo ----------------
+_SKILL_RAW_MAX = 300_000  # cap for a fetched skill body (chars)
+
+
+def _looks_like_html(raw):
+    """True when a fetched body looks like an HTML page rather than markdown."""
+    head = str(raw).lstrip()[:120].lower()
+    return head.startswith("<html") or head.startswith("<!doctype")
+
+
+def _raw_fetch(url):
+    """Fetch a URL's raw body (up to _SKILL_RAW_MAX). Returns None on network
+    failure or when the response looks like an HTML page rather than markdown
+    (e.g. a GitHub repo page that isn't a raw file)."""
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "alvaagent-tui/1.0", "Accept-Encoding": "identity"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            if r.getcode() >= 400:
+                return None
+            raw = r.read(_SKILL_RAW_MAX).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    if _looks_like_html(raw):
+        return None
+    return raw
+
+
+def tool_skill_install(source, category=None):
+    """Install a skill from a local .md file, a raw .md URL, or a GitHub URL.
+
+    GitHub repo/blob URLs are rewritten to raw.githubusercontent.com so the
+    full markdown is fetched (not the web_fetch snippet), parsed for
+    frontmatter, and saved into SKILLS_DIR via tool_skill_save. Returns the
+    installed skill's name/category/path.
+    """
+    source = str(source or "").strip()
+    if not source:
+        return {"ok": False, "error": "empty source"}
+    if os.path.exists(source):
+        try:
+            with open(source, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        name = os.path.basename(source)
+        if name.lower().endswith(".md"):
+            name = name[:-3]
+        return tool_skill_save(name, content, category)
+    if source.startswith(("http://", "https://")):
+        url = source
+        if "github.com/" in url and "/blob/" in url:
+            m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/blob/(.+)$", url)
+            if m:
+                url = "https://raw.githubusercontent.com/%s/%s/%s" % (
+                    m.group(1), m.group(2), m.group(3))
+        content = _raw_fetch(url)
+        if content is None:
+            return {"ok": False, "error":
+                    "could not fetch skill from %s (network error or non-markdown page)" % url}
+        name = os.path.basename(url)
+        if name.lower().endswith(".md"):
+            name = name[:-3]
+        fm, _ = _parse_frontmatter(content)
+        if fm.get("name"):
+            name = str(fm["name"])
+        if not name or name in (".", ""):
+            return {"ok": False, "error": "cannot determine a skill name from %s" % url}
+        return tool_skill_save(name, content, category)
+    return {"ok": False, "error": "source must be a local path or an http(s) URL"}
+
+
+def tool_skill_sync_repo(repo, subdir=None):
+    """Clone a git repo of skills and import every .md as a skill.
+
+    Categories come from each file's folder (top-level folder only - nested
+    folders are collapsed to their first component). README.md and .github are
+    skipped. Permission-gated (network + disk writes) like run_command.
+    """
+    repo = str(repo or "").strip()
+    if not repo:
+        return {"ok": False, "error": "empty repo URL"}
+    if not _permission("clone skills repo: %s" % repo[:160]):
+        return {"ok": False, "error": "permission denied by user"}
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp(prefix="alva_skills_")
+    try:
+        try:
+            proc = subprocess.run(
+                ["git", "clone", "--depth", "1", "--quiet", repo, tmp],
+                capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "git clone timed out after 120s"}
+        if proc.returncode != 0:
+            return {"ok": False, "error": "git clone failed: %s"
+                    % (proc.stderr or proc.stdout or "").strip()[:500]}
+        root = os.path.join(tmp, str(subdir).strip()) if str(subdir or "").strip() else tmp
+        # most skills repos nest everything under a top-level `skills/` folder -
+        # treat that as the import root so folder names become real categories.
+        if not str(subdir or "").strip() and os.path.isdir(os.path.join(tmp, "skills")):
+            root = os.path.join(tmp, "skills")
+        if not os.path.isdir(root):
+            return {"ok": False, "error": "subdir %r not found in the repo" % subdir}
+        installed, skipped, errors = [], [], []
+        for dirpath, _dirs, files in os.walk(root):
+            for f in sorted(files):
+                if not f.lower().endswith(".md"):
+                    continue
+                rel = os.path.relpath(dirpath, root)
+                relpath = os.path.join("" if rel == "." else rel, f)
+                parts = [p.lower() for p in relpath.split(os.sep)]
+                if f.lower() == "readme.md" or ".github" in parts:
+                    skipped.append(relpath)
+                    continue
+                try:
+                    with open(os.path.join(dirpath, f), encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
+                except Exception as e:
+                    errors.append((relpath, "%s: %s" % (type(e).__name__, e)))
+                    continue
+                name = f[:-3] if f.lower().endswith(".md") else f
+                fm, _ = _parse_frontmatter(content)
+                if fm.get("name"):
+                    name = str(fm["name"])
+                category = rel.split(os.sep)[0] if rel not in (".", "") else None
+                r = tool_skill_save(name, content, category)
+                if r.get("ok"):
+                    installed.append({"name": r["name"], "category": r.get("category"),
+                                      "path": r.get("path")})
+                else:
+                    errors.append((relpath, r.get("error", "?")))
+        return {"ok": True, "count": len(installed), "installed": installed,
+                "skipped": skipped, "errors": errors}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---------------- tools ----------------
 def tool_todo_list():
     todos = _store_get(TODO_KEY, [])
@@ -1643,6 +1780,20 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "Skill name, or category/name for a categorized skill"}},
             "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "skill_install",
+        "description": "Install a skill from a local .md file path or a URL (a raw.githubusercontent.com link, or any GitHub blob URL which is auto-rewritten to raw). Fetches the full markdown, parses its frontmatter, and saves it on-device. Use this whenever the user shares a skill as a link or file.",
+        "parameters": {"type": "object", "properties": {
+            "source": {"type": "string", "description": "Local .md path or an http(s) URL to the skill file"},
+            "category": {"type": "string", "description": "Optional category folder to save the skill into"}},
+            "required": ["source"]}}},
+    {"type": "function", "function": {
+        "name": "skill_sync_repo",
+        "description": "Bulk-import a whole skills repository: clone a git repo (asks the user for permission, like run_command) and install every .md as a skill, using folder names as categories. Use when the user hands you a GitHub repo that contains skills.",
+        "parameters": {"type": "object", "properties": {
+            "repo": {"type": "string", "description": "Git clone URL, e.g. https://github.com/owner/skills-repo.git"},
+            "subdir": {"type": "string", "description": "Optional: only import skills under this subfolder"}},
+            "required": ["repo"]}}},
 ]
 
 # --- tiered tool selection -------------------------------------------------
@@ -1666,6 +1817,7 @@ _ADVANCED_TOOL_NAMES = {
     "feedback", "improvement_set", "improvement_list", "improvement_done",
     "self_test", "reflect",
     "skill_list", "skill_read", "skill_save", "skill_remove",
+    "skill_install", "skill_sync_repo",
 }
 
 
@@ -1741,6 +1893,8 @@ TOOL_IMPL = {
         a.get("name"), a.get("content"),
         category=a.get("category")),
     "skill_remove": lambda a: tool_skill_remove(a.get("name")),
+    "skill_install": lambda a: tool_skill_install(a.get("source"), a.get("category")),
+    "skill_sync_repo": lambda a: tool_skill_sync_repo(a.get("repo"), a.get("subdir")),
 }
 
 
@@ -1791,6 +1945,10 @@ You can call tools to do real work. Guidelines:
    When you discover a reusable, non-obvious procedure during a task, save it
    as a skill with a descriptive name and a concise body (trigger + steps).
    Keep skills small and self-contained so they stay easy to apply and test.
+   When the user shares a skill as a link or file, install it with
+   skill_install (single .md from a URL or path); when they hand you a whole
+   skills repo, use skill_sync_repo (clones it, permission-gated, imports every
+   .md with folder names as categories).
 8. Self-improvement: you can read your OWN source (alvaagent_tui.py,
    start.sh, test_tui.py) and improve it with file_edit / file_write, then
    validate with run_command("python3 -m py_compile alvaagent_tui.py") and
@@ -3999,9 +4157,11 @@ def cmd_help():
     print("    /todo clear            empty the list")
     print("    /memory                show saved memory facts")
     print("    /skills                list saved skills (grouped by category)")
+    print("    /skills install <u>    install a skill from a URL or local .md [category]")
+    print("    /skills sync <repo>    bulk-import a whole skills git repo [subdir]")
     print("    /skill rm <name>       delete a skill (name or category/name)")
     print("    /skill category [n]    list categories / show skills in category n")
-    print("    /install_skill <path>  install a skill from a .md file")
+    print("    /install_skill <u>     install a skill from a URL or local .md file")
     print("    /feedback <good|bad>   record feedback on the last response")
     print("    /reflect               review feedback + improvements, propose actions")
     print("    /improve               manage self-improvement areas (list/add/done)")
@@ -4256,7 +4416,41 @@ def cmd_feedback(rest):
         p_err("  " + r.get("error", "?"))
 
 
-def cmd_skills():
+def cmd_skills(rest=""):
+    arg = (rest or "").strip()
+    if arg.startswith("install "):
+        target = arg[len("install "):].strip()
+        if not target:
+            p_err("usage: /skills install <url|path> [category]")
+            return
+        parts = target.split(None, 1)
+        r = tool_skill_install(parts[0], parts[1].strip() if len(parts) > 1 else None)
+        if r.get("ok"):
+            p_ok("installed skill '%s' [OK]" % r.get("name"))
+            if r.get("category"):
+                print("    category: %s" % r["category"])
+        else:
+            p_err("  " + r.get("error", "?"))
+        return
+    if arg.startswith("sync "):
+        parts = arg[len("sync "):].strip().split(None, 1)
+        if not parts:
+            p_err("usage: /skills sync <repo-url> [subdir]")
+            return
+        r = tool_skill_sync_repo(parts[0], parts[1].strip() if len(parts) > 1 else None)
+        if r.get("ok"):
+            p_ok("synced %d skills from repo [OK]" % r.get("count"))
+            for s in r.get("installed", []):
+                print("    - %s%s" % (s["name"], (" (" + s["category"] + ")") if s.get("category") else ""))
+            if r.get("errors"):
+                for name, err in r.get("errors", []):
+                    p_err("    %s: %s" % (name, err))
+        else:
+            p_err("  " + r.get("error", "?"))
+        return
+    if arg:
+        cmd_skill_category(arg)
+        return
     skills = tool_skill_list().get("skills") or []
     if not skills:
         print("  (no skills yet - ask the agent to save one)")
@@ -4414,22 +4608,15 @@ def cmd_improve(rest):
 
 
 def cmd_install_skill(rest):
-    # Parse and install a skill from a markdown file.
-    path = rest.strip()
-    if not path or not os.path.exists(path):
-        p_err("usage: /install_skill <path_to_skill.md>")
-        return
-    try:
-        with open(path, "r") as f:
-            content = f.read()
-        name = os.path.basename(path).replace(".md", "")
-        r = tool_skill_save(name, content)
-        if r.get("ok"):
-            p_ok("installed skill '%s' [OK]" % name)
-        else:
-            p_err("failed to save skill: %s" % r.get("error", "unknown error"))
-    except Exception as e:
-        p_err("failed to install skill: %s" % e)
+    # Install a skill from a local .md file or a URL (delegates to
+    # tool_skill_install so GitHub/blob URLs are auto-rewritten to raw).
+    r = tool_skill_install(rest.strip())
+    if r.get("ok"):
+        p_ok("installed skill '%s' [OK]" % r.get("name"))
+        if r.get("category"):
+            print("    category: %s" % r["category"])
+    else:
+        p_err("failed to install skill: %s" % r.get("error", "unknown error"))
 def cmd_clear(history):
     if not history:
         p_info("(conversation is already empty)")
@@ -4557,7 +4744,7 @@ ALVA_WORDMARK = (
 TOOLSETS = {
     "shell":   ["run_command", "run_python"],
     "files":   ["file_read", "file_write", "file_edit", "file_list", "file_search"],
-    "skills":  ["skill_list", "skill_read", "skill_save"],
+    "skills":  ["skill_list", "skill_read", "skill_save", "skill_install", "skill_sync_repo"],
     "memory":  ["memory_save", "memory_recall", "memory_search", "memory_list"],
     "todos":   ["todo_add", "todo_list", "todo_toggle", "todo_remove"],
     "web":     ["web_fetch"],
@@ -4909,7 +5096,7 @@ def repl():
             elif c == "/improve":
                 cmd_improve(rest)
             elif c == "/skills":
-                cmd_skills()
+                cmd_skills(rest)
             elif c == "/skill":
                 op, _, arg = rest.strip().partition(" ")
                 op = op.strip().lower()
