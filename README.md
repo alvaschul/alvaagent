@@ -12,9 +12,17 @@ Built for Termux, runs offline-friendly, and survives flaky mobile connections.
 
 ## Features
 - **Python TUI** (`alvaagent_tui.py`) — stdlib only, no dependencies to install.
-- **27 tools**: calculator, web_fetch, get_time, memory save/recall/search/list,
-  todos, shell, file read/write/edit/list/search, skill save/read/list/remove,
+- **28 tools** (curated for the model): calculator, sandboxed run_python,
+  web_fetch, get_time, memory save/recall/search/list, todos, shell, file
+  read/write/edit/list/search, skill save/read/list/remove,
   feedback/improvement/reflect, self_test.
+- **Tiered tool selection**: by default the model only sees a curated 15-tool
+  CORE set (computation, memory, todos, shell, files) — not all 28 at once, so
+  it mis-picks tools less and answers faster. Advanced meta-tools (skills,
+  self-improvement, self_test, reflect) stay one keystroke away:
+  `/tools full` advertises everything, `/tools core` reverts, and any advanced
+  tool call auto-enables full mode so work never breaks. The choice persists in
+  `.alvaagent/config.json` (`tool_mode`).
 - **Resilient by default**: automatic retry with backoff on flaky mobile
   connections (transient HTTP 408/409/429/5xx, timeouts, dropped links), a
   stall watchdog for streams, a `/redo` command to replay the last turn, a
@@ -87,10 +95,12 @@ you> /skills       # list saved procedures
 you> /sessions     # list saved conversations
 ```
 
-Slash commands: `/help /config /provider /models /test /tools /todos /todo
-/memory /skin /sessions /session /new /clear /context /compress /multi /export
-/stop /trace /exit`. `Ctrl+C` cancels a running request; Tab completes slash
-commands.
+Slash commands: `/help /config /provider /models /test /tools /trace /todos
+/todo /memory /skin /sessions /session /new /clear /context /compress /multi
+/export /stop /exit`. `Ctrl+C` cancels a running request; Tab completes slash
+commands. `/tools` lists what the model can currently see (and `/tools full` /
+`/tools core` switch the advertised set); `/trace [n]` shows the last n agent
+turns.
 **Command history persists across restarts** (up-arrow recalls previous inputs) —
 stored in `.alvaagent/cmd_history.txt`.
 

@@ -973,6 +973,46 @@ try:
     assert_ok(_rp5.get("ok") is True and "... (truncated)" in _rp5.get("output", ""),
               "run_python truncates large outputs to _PY_MAX_CHARS")
 
+    # ---------- tiered tool selection (core vs full) ----------
+    _saved_mode = pa._TOOLS_MODE
+    try:
+        pa._TOOLS_MODE = "core"
+        _core = pa.active_tools()
+        _core_names = {t["function"]["name"] for t in _core}
+        assert_ok(0 < len(_core) < len(pa.TOOLS),
+                  "core mode advertises a curated subset (%d/%d)"
+                  % (len(_core), len(pa.TOOLS)))
+        assert_ok("run_command" in _core_names and "calculator" in _core_names,
+                  "core set keeps the everyday tools")
+        assert_ok("skill_list" not in _core_names and "self_test" not in _core_names,
+                  "core set hides the advanced meta-tools")
+        pa._TOOLS_MODE = "full"
+        assert_ok(len(pa.active_tools()) == len(pa.TOOLS),
+                  "full mode advertises all tools")
+    finally:
+        pa._TOOLS_MODE = _saved_mode
+    # lazy auto-enable: an advanced tool call flips the mode to full (one-way)
+    _saved_mode = pa._TOOLS_MODE
+    try:
+        pa._TOOLS_MODE = "core"
+        _r = pa.dispatch_tool("self_test", {})
+        assert_ok(pa._TOOLS_MODE == "full",
+                  "calling an advanced tool auto-enables full mode")
+        assert_ok("Advanced tool set enabled" in _r.get("hint", ""),
+                  "auto-enable tells the model the full set is now visible")
+    finally:
+        pa._TOOLS_MODE = _saved_mode
+    # /trace plumbing: _read_trace + cmd_trace render without crashing
+    try:
+        import io as _io, contextlib as _cl
+        _buf = _io.StringIO()
+        with _cl.redirect_stdout(_buf):
+            pa.cmd_trace("3")
+        assert_ok(bool(_buf.getvalue().strip()),
+                  "cmd_trace renders trace output")
+    except Exception as _e:
+        assert_ok(False, "cmd_trace crashed: %s" % _e)
+
     print("\nALL TESTS PASSED ✓" if failures == 0 else "\n%d TEST(S) FAILED ✗" % failures)
     sys.exit(0 if failures == 0 else 1)
 finally:

@@ -22,9 +22,13 @@
 #  script (override the folder with ALVA_DATA_DIR).
 #
 #  Commands:
-#    /help /config /provider /models /test /tools /todos /todo /memory
+#    /help /config /provider /models /test /tools /trace /todos /todo /memory
 #    /skin /sessions /session /new /clear /context /compress /multi /export
 #    /stop /exit /quit
+#
+#  Tool selection: by default the model sees a curated CORE tool set (~15);
+#  /tools full advertises all tools, and any advanced tool call auto-enables
+#  full mode. The choice persists in config.json ("tool_mode").
 #    Ctrl+C cancels a running request | Tab completes slash commands
 #    (at the api key prompt, type 'none' to clear the key)
 #
@@ -197,7 +201,8 @@ def _normalize_state(raw):
                 active = raw.get("active")
                 if active not in profiles:
                     active = next(iter(profiles))
-                return {"active": active, "profiles": profiles, "skin": _skin_of(raw)}
+                return {"active": active, "profiles": profiles, "skin": _skin_of(raw),
+                        "tool_mode": _tool_mode_of(raw)}
         # legacy flat config: {"provider": ..., "base_url": ..., ...}
         if raw.get("provider") or raw.get("base_url"):
             name = raw.get("provider") or "default"
@@ -206,9 +211,11 @@ def _normalize_state(raw):
             prof = {k: raw.get(k, DEFAULT_CFG[k]) for k in
                     ("base_url", "api_key", "model", "temperature",
                      "context_window", "auto_compress")}
-            return {"active": name, "profiles": {name: prof}, "skin": _skin_of(raw)}
+            return {"active": name, "profiles": {name: prof}, "skin": _skin_of(raw),
+                    "tool_mode": _tool_mode_of(raw)}
     # first run: a neutral, keyless profile
-    return {"active": "default", "profiles": {"default": dict(FIRST_RUN_CFG)}, "skin": DEFAULT_SKIN}
+    return {"active": "default", "profiles": {"default": dict(FIRST_RUN_CFG)},
+            "skin": DEFAULT_SKIN, "tool_mode": "core"}
 
 
 def load_state():
@@ -236,6 +243,8 @@ def load_state():
             prof["context_window"] = int(float(_env("ALVA_CONTEXT_WINDOW", "POCKET_CONTEXT_WINDOW")))
         except ValueError:
             pass
+    global _TOOLS_MODE
+    _TOOLS_MODE = state.get("tool_mode", "core")
     return state
 
 
@@ -1465,18 +1474,18 @@ TOOLS = [
             "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "get_time",
-        "description": "Get the current date and time on the user's device.",
+        "description": "Get the current date and time on the user's device. Use this whenever a task depends on 'now' (timestamps, file ages, scheduling, relative dates like 'tomorrow'). Do not guess the current date from memory.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "memory_save",
-        "description": "Save a fact to the on-device memory store so it can be recalled later.",
+        "description": "Save a fact to the on-device memory store so it can be recalled later. Use for durable user preferences, recurring details, or anything worth remembering across sessions (e.g. 'user is on Android/Termux'). Prefer specific keys over vague ones.",
         "parameters": {"type": "object", "properties": {
-            "key": {"type": "string", "description": "Short label for the fact"},
+            "key": {"type": "string", "description": "Short label for the fact (e.g. 'timezone', 'editor')"},
             "value": {"type": "string", "description": "The fact to remember"}},
             "required": ["key", "value"]}}},
     {"type": "function", "function": {
         "name": "memory_recall",
-        "description": "Recall a previously saved fact from on-device memory.",
+        "description": "Recall a previously saved fact from on-device memory by its exact key. Use memory_search instead when you know the topic but not the exact key.",
         "parameters": {"type": "object", "properties": {
             "key": {"type": "string", "description": "The label of the fact to recall"}},
             "required": ["key"]}}},
@@ -1488,23 +1497,23 @@ TOOLS = [
             "required": []}}},
     {"type": "function", "function": {
         "name": "memory_list",
-        "description": "List every saved memory fact (key + value).",
+        "description": "List every saved memory fact (key + value). Use when you need an overview of what the agent remembers, or before saving a new fact to avoid duplicates.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "todo_add",
-        "description": "Add a new task to the user's to-do list.",
+        "description": "Add a new task to the user's to-do list. Use when a multi-step request is underway so progress stays visible.",
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string", "description": "Task text"}},
             "required": ["text"]}}},
     {"type": "function", "function": {
         "name": "todo_list",
-        "description": "List all tasks in the user's to-do list with done/undone status.",
+        "description": "List all tasks in the user's to-do list with done/undone status. Use before working on or updating tasks.",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "todo_toggle",
-        "description": "Mark a task as done or undone.",
+        "description": "Mark a task as done or undone. Use to close out a task once its work is finished and verified.",
         "parameters": {"type": "object", "properties": {
-            "index": {"type": "integer", "description": "Zero-based index of the task"}},
+            "index": {"type": "integer", "description": "Zero-based index of the task (see todo_list)"}},
             "required": ["index"]}}},
     {"type": "function", "function": {
         "name": "todo_remove",
@@ -1611,6 +1620,71 @@ TOOLS = [
             "required": ["name"]}}},
 ]
 
+# --- tiered tool selection -------------------------------------------------
+# The model only sees a curated CORE set by default (~half of the registry).
+# Advertising 28 tools at once makes the model mis-pick tools and slows every
+# turn; the meta tools (skills, self-improvement, self-test, reflect) stay one
+# `/tools` keystroke away. `_TOOLS_MODE` is module-global (single-user TUI)
+# and persisted via config.json under "tool_mode".
+_TOOLS_MODE = "core"
+_TOOL_MODES = ("core", "full")
+
+_CORE_TOOL_NAMES = {
+    "calculator", "run_python", "web_fetch", "get_time",
+    "memory_save", "memory_recall", "memory_search",
+    "todo_add", "todo_list", "todo_toggle",
+    "run_command", "file_read", "file_write", "file_list", "file_edit",
+}
+
+_ADVANCED_TOOL_NAMES = {
+    "memory_list", "todo_remove", "file_search",
+    "feedback", "improvement_set", "improvement_list", "improvement_done",
+    "self_test", "reflect",
+    "skill_list", "skill_read", "skill_save", "skill_remove",
+}
+
+
+def _tool_mode_of(raw):
+    """Persisted tool mode from raw state (validated), else 'core'."""
+    if isinstance(raw, dict) and raw.get("tool_mode") in _TOOL_MODES:
+        return raw["tool_mode"]
+    return "core"
+
+
+def active_tools():
+    """Tool schemas sent to the model: the CORE set, or everything in 'full' mode."""
+    if _TOOLS_MODE == "full":
+        return TOOLS
+    return [t for t in TOOLS if t["function"]["name"] in _CORE_TOOL_NAMES]
+
+
+def _maybe_enable_full(name):
+    """Lazy-load advanced tools: the first time the model calls an advanced
+    tool while in core mode, widen the advertised set to 'full' (one-way until
+    the user runs /tools core). Returns True when the mode was just switched."""
+    global _TOOLS_MODE
+    if _TOOLS_MODE != "full" and name in _ADVANCED_TOOL_NAMES:
+        _TOOLS_MODE = "full"
+        _trace({"event": "tool_mode", "mode": "full", "tool": name,
+                "reason": "advanced tool requested by the model"})
+        return True
+    return False
+
+
+def _set_tool_mode(state, mode):
+    """Switch the advertised tool set and persist the choice in config.json."""
+    global _TOOLS_MODE
+    if mode not in _TOOL_MODES:
+        mode = "core"
+    _TOOLS_MODE = mode
+    if isinstance(state, dict):
+        state["tool_mode"] = mode
+        try:
+            save_state(state)
+        except Exception:
+            pass
+    _trace({"event": "tool_mode", "mode": mode, "reason": "user /tools"})
+
 TOOL_IMPL = {
     "calculator": lambda a: tool_calculator(a.get("expression")),
     "web_fetch": lambda a: tool_web_fetch(a.get("url")),
@@ -1657,10 +1731,13 @@ def dispatch_tool(name, args):
     fn = TOOL_IMPL.get(name)
     if fn is None:
         return {"error": "unknown tool: %s" % name}
+    switched = _maybe_enable_full(name)
     try:
         result = fn(args)
         if isinstance(result, dict) and not result.get("ok", True) and "hint" not in result:
             result["hint"] = _TOOL_ERROR_HINTS.get(name, "")
+        if switched and isinstance(result, dict):
+            result.setdefault("hint", "Advanced tool set enabled: all %d tools are now advertised to the model." % len(TOOLS))
         return result
     except Exception as e:
         return {"error": "%s: %s" % (type(e).__name__, e),
@@ -2160,7 +2237,7 @@ def run_agent(history_json, config_json):
             messages.append({"role": "assistant", "content": note})
             _trace({"event": "turn_end", "reason": "timeout", "steps": step})
             return json.dumps({"content": note, "history": messages, "cancelled": False})
-        data = chat_completion(messages, config, tools=TOOLS)
+        data = chat_completion(messages, config, tools=active_tools())
         msg = data["choices"][0]["message"]
         if msg.get("content") is None:
             msg["content"] = ""
@@ -2330,7 +2407,7 @@ def run_agent_stream(history, config):
         content_parts = []
         tool_calls_result = None
         try:
-            for chunk, tcs in chat_completion_stream(messages, config, tools=TOOLS):
+            for chunk, tcs in chat_completion_stream(messages, config, tools=active_tools()):
                 if _cancel_flag[0]:
                     yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
                     return
@@ -2439,6 +2516,20 @@ def self_test():
     except Exception:
         checks.append(("run_python_dispatch", False))
     checks.append(("run_python_gate", classify_python("import os") == "ask"))
+
+    # tiered tool selection: core mode advertises a subset, full mode all
+    global _TOOLS_MODE
+    _saved_mode = _TOOLS_MODE
+    try:
+        _TOOLS_MODE = "core"
+        checks.append(("tools_core_subset",
+                       len(active_tools()) < len(TOOLS)
+                       and "skill_list" not in _CORE_TOOL_NAMES
+                       and "run_command" in _CORE_TOOL_NAMES))
+        _TOOLS_MODE = "full"
+        checks.append(("tools_full_all", len(active_tools()) == len(TOOLS)))
+    finally:
+        _TOOLS_MODE = _saved_mode
 
     # skills: list should work
     try:
@@ -3618,7 +3709,7 @@ def cmd_models(state):
 _SLASH_COMMANDS = [
     "/help", "/config", "/provider", "/models", "/test", "/skin",
     "/sessions", "/session", "/new", "/clear", "/context", "/compress",
-    "/tools", "/todos", "/todo", "/memory", "/skills", "/skill",
+    "/tools", "/trace", "/todos", "/todo", "/memory", "/skills", "/skill",
     "/install_skill", "/feedback", "/reflect", "/self-test", "/improve",
     "/multi", "/export", "/redo", "/stop", "/exit", "/quit",
 ]
@@ -3868,7 +3959,8 @@ def cmd_help():
     print("    /test                  test the active provider's connection")
     print("    /skin [name]           list / switch the UI skin (midnight, ember, ocean, daylight)")
     print("    (at the api key prompt, type 'none' to clear the key)")
-    print("    /tools                 list the agent's tools")
+    print("    /tools                 list the agent's tools (and switch mode: /tools full|core)")
+    print("    /trace [n]             show the last n agent-trace lines (default 15)")
     print("    /todos                 show the to-do list")
     print("    /todo <text>           add a task")
     print("    /todo done <i>         toggle task i      /todo rm <i>   remove task i")
@@ -4010,9 +4102,38 @@ def cmd_test(state):
 
 
 def cmd_tools():
-    for t in TOOLS:
+    """List the active tool set (only what the model can currently see)."""
+    active = active_tools()
+    print("  tool mode: %s - %d/%d tools advertised to the model"
+          % (_TOOLS_MODE, len(active), len(TOOLS)))
+    for t in active:
         fn = t["function"]
-        print("  %-12s %s" % (fn["name"], fn.get("description", "")))
+        print("  %-14s %s" % (fn["name"], fn.get("description", "")))
+    hidden = len(TOOLS) - len(active)
+    if hidden:
+        print("  hidden (%d advanced; /tools full to advertise, /tools core to revert): %s"
+              % (hidden, ", ".join(sorted(_ADVANCED_TOOL_NAMES))))
+
+
+def cmd_trace(rest):
+    """Print the last n lines of trace.log, oldest first (default 15)."""
+    try:
+        n = max(1, min(200, int(str(rest or "15").strip())))
+    except ValueError:
+        n = 15
+    lines = _read_trace(n)
+    if not lines:
+        print("  (trace.log is empty - run some turns first)")
+        return
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            print("  " + ln[:200])
+            continue
+        ev = rec.get("event", "?")
+        rest_rec = {k: v for k, v in rec.items() if k not in ("event", "ts")}
+        print("  %s %s" % (ev, json.dumps(rest_rec, ensure_ascii=False)[:220]))
 
 
 def cmd_todos():
@@ -4420,14 +4541,21 @@ def _markup_safe(s):
 
 
 def _banner_tools_lines():
-    """Hermes-style 'Available Tools' grid: 'toolset: tool, tool, ...' rows.
+    """Hermes-style 'Available Tools' grid: active tools grouped by toolset,
+    with a footer noting how many advanced tools are hidden in core mode.
 
     Returns Rich-markup strings (Hermes' own convention inside Panels).
     """
+    active = set(t["function"]["name"] for t in active_tools())
     lines = ["[bold %s]Available Tools[/]" % HERMES_ACCENT]
     for ts, names in TOOLSETS.items():
-        lines.append("[dim %s]%s:[/] [bold %s]%s[/]"
-                     % (HERMES_DIM, ts, HERMES_TEXT, ", ".join(names)))
+        shown = [n for n in names if n in active]
+        if shown:
+            lines.append("[dim %s]%s:[/] [bold %s]%s[/]"
+                         % (HERMES_DIM, ts, HERMES_TEXT, ", ".join(shown)))
+    hidden = len(TOOLS) - len(active)
+    if hidden:
+        lines.append("[dim %s]%d advanced tools hidden - /tools full shows them[/]" % (HERMES_DIM, hidden))
     return lines
 
 
@@ -4499,8 +4627,8 @@ def banner(state):
     ]
     right_lines = _banner_tools_lines() + _banner_skills_lines()
     right_lines.append("")
-    right_lines.append("[dim %s]%d tools · v%s · you are here · /help for commands[/]"
-                       % (HERMES_DIM, len(TOOLS), ALVA_VERSION))
+    right_lines.append("[dim %s]%d/%d tools (%s) · v%s · you are here · /help for commands[/]"
+                       % (HERMES_DIM, len(active_tools()), len(TOOLS), _TOOLS_MODE, ALVA_VERSION))
 
     try:
         from rich.table import Table
@@ -4668,6 +4796,16 @@ def repl():
                 cmd_provider(state, rest)
             elif c == "/test":
                 cmd_test(state)
+            elif c == "/tools":
+                arg = rest.strip().lower()
+                if arg in _TOOL_MODES:
+                    _set_tool_mode(state, arg)
+                    p_ok("tool mode: %s (%d tools advertised to the model)"
+                         % (_TOOLS_MODE, len(active_tools())))
+                else:
+                    cmd_tools()
+            elif c == "/trace":
+                cmd_trace(rest)
             elif c == "/models":
                 cmd_models(state)
             elif c == "/skin":
