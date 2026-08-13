@@ -1883,6 +1883,12 @@ def _repair_tool_pairs(history):
         role = m.get("role")
         if role == "assistant":
             tcs = m.get("tool_calls") or []
+            # Heal assistant tool_calls that have an empty/missing id (old
+            # buggy streaming builds emitted id=""), so the following tool
+            # message can be paired to a valid id.
+            for i, tc in enumerate(tcs):
+                if isinstance(tc, dict) and not tc.get("id"):
+                    tc["id"] = "repaired_a%d" % (len(out) * 10 + i)
             ids = [tc.get("id") for tc in tcs if isinstance(tc, dict) and tc.get("id")]
             pending_ids = ids
             out.append(m)
