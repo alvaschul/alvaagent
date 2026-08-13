@@ -502,6 +502,28 @@ try:
     finally:
         pa.urllib.request.urlopen = _orig_urlopen
 
+    # ---------- streaming: plain-JSON fallback (non-SSE gateways) ----------
+    # Some gateways ignore "stream": true and answer with a plain JSON
+    # completion (minified on one line, or pretty-printed). The stream reader
+    # must parse the raw body directly instead of crashing on a str/bytes flush
+    # or silently dropping the reply.
+    _plain_msg = {"choices": [{"message": {"role": "assistant",
+                                           "content": "plain-json-reply"},
+                               "finish_reason": "stop"}]}
+    for _label, _body in (("minified", json.dumps(_plain_msg)),
+                          ("pretty", json.dumps(_plain_msg, indent=2))):
+        def _fake_plain(req, timeout=180, _b=_body):
+            return _FakeResp(_b)
+        pa.urllib.request.urlopen = _fake_plain
+        try:
+            _events = list(pa.chat_completion_stream(
+                [{"role": "user", "content": "hi"}], cfg_s))
+            _text = "".join(c for c, _ in _events)
+            assert_ok(_text == "plain-json-reply",
+                      "plain-JSON (%s) fallback parses the response body" % _label)
+        finally:
+            pa.urllib.request.urlopen = _orig_urlopen
+
     # ---------- resilience: retry/backoff on transient API failures ----------
     _orig_sleep = pa._sleep_retry
     pa._sleep_retry = lambda a: None

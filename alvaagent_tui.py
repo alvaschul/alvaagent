@@ -1764,6 +1764,8 @@ def chat_completion_stream(messages, config, tools=None):
     except Exception:
         sock = None  # non-socket response (tests/fakes): fall back to blocking reads
     buffer = ""
+    raw_parts = []          # full raw response body, for the plain-JSON fallback
+    saw_sse = False         # True once a real "data:" SSE line is processed
     tool_calls_acc = {}
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     last_byte_at = time.monotonic()
@@ -1790,6 +1792,7 @@ def chat_completion_stream(messages, config, tools=None):
         if not chunk:
             break
         last_byte_at = time.monotonic()
+        raw_parts.append(chunk)
         buffer += decoder.decode(chunk)
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
@@ -1797,6 +1800,7 @@ def chat_completion_stream(messages, config, tools=None):
             if not line or line.startswith(":"):
                 continue
             if line.startswith("data: "):
+                saw_sse = True
                 data_str = line[6:]
                 if data_str.strip() == "[DONE]":
                     return
@@ -1844,28 +1848,30 @@ def chat_completion_stream(messages, config, tools=None):
                 if finish == "length":
                     return
     # Fallback: some gateways/proxies ignore "stream": true and answer with a
-    # plain JSON completion instead of SSE lines. If nothing SSE-ish arrived,
-    # parse the raw body directly so responses still render. Flush the
-    # incremental decoder so a trailing partial multi-byte sequence is decoded
-    # (errors="replace" turns it into U+FFFD rather than dropping it).
-    buffer += decoder.decode("", final=True)
-    body = buffer.strip()
-    if body and not tool_calls_acc:
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            return
-        choices = data.get("choices") or []
-        if not choices:
-            return
-        msg = choices[0].get("message", {})
-        content = msg.get("content") or ""
-        if content:
-            yield content, None
-        tc = msg.get("tool_calls") or []
-        if tc:
-            yield "", tc
-        return
+    # plain JSON completion instead of SSE lines (minified or pretty-printed).
+    # If no real SSE "data:" line arrived, parse the whole raw body directly so
+    # responses still render. (This must use the raw bytes: the incremental
+    # decoder can't be flushed with a str, and the line loop above drains
+    # pretty-printed JSON, so `buffer` alone would be empty and the reply would
+    # be silently lost.)
+    if not saw_sse and not tool_calls_acc:
+        body = b"".join(raw_parts).decode("utf-8", errors="replace").strip()
+        if body:
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                return
+            choices = data.get("choices") or []
+            if not choices:
+                return
+            msg = choices[0].get("message", {})
+            content = msg.get("content") or ""
+            if content:
+                yield content, None
+            tc = msg.get("tool_calls") or []
+            if tc:
+                yield "", tc
+    return
 
 
 def fetch_models(base_url, api_key, timeout=20):
@@ -4365,6 +4371,13 @@ def send_message(text, history, state, session):
         content = (res.get("content") or "").strip()
         if content:
             render_agent_panel(content)
+        elif not res.get("tools"):
+            # no streamed text AND no tool calls = a dead turn (empty/ignored
+            # response, or a gateway that didn't answer). Say so loudly instead
+            # of leaving the user staring at a blank line (which used to prompt
+            # resending the same message, piling duplicates into the session).
+            p_warn("the model returned an empty response - is the endpoint/streaming working?"
+                   "  (your message was kept in the session)")
     # post-turn: auto-compress if the response pushed us past the threshold
     compressed = False
     if cfg.get("auto_compress", True):
