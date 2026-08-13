@@ -57,6 +57,26 @@ gracefully skipped). No package, no modules; the test suite imports it as
   frontmatter `name` or `category/name` to a path and `_inside_skills` blocks
   traversal outside the skills dir.
 
+## Self-modification hygiene (leave nothing behind)
+When you improve / modify / test your own system (`alvaagent_tui.py`,
+`test_tui.py`, `mock_llm_server.py`, README, `start.sh`, skills):
+
+1. **Edit in place, never copy-then-patch** — no `.orig`, `.bak`, `_backup`, or
+   duplicate source files. If a backup is unavoidable, put it in `/tmp`.
+2. **Tests clean up after themselves** — every skill, todo, memory fact, and
+   scratch file a test creates must be removed (use `try/finally`). Never leave
+   `proj-demo.txt`-style artifacts or test skills behind.
+3. **Scratch work goes to `/tmp`** (or `tempfile.mkdtemp`), never into the repo
+   or `.alvaagent/`. Downloaded/cloned skill material is wiped after importing.
+4. **Finish with a clean tree** — `git status` must show ONLY the intended
+   changes; delete stray untracked files (draft skills, exploratory scripts,
+   dumps). Commit specific files with `git add <file>`, never `git add -A`.
+5. **Don't commit session/runtime junk** — `.opencode/`, `opencode.json`,
+   `.alvaagent/config.json`, `store.json`, `cmd_history.txt`, and `*.log` are
+   gitignored; keep them out. API keys in config.json must never be committed.
+6. **New reusable skills/scripts are optional, not automatic** — ask the user
+   before committing anything you created only to explore or test.
+
 ## Git
 - Remote `https://github.com/alvaschul/alvaagent.git`, branch `main`, **no
   credential helper**. Push with the token in the URL:

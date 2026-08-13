@@ -1949,13 +1949,20 @@ You can call tools to do real work. Guidelines:
    skill_install (single .md from a URL or path); when they hand you a whole
    skills repo, use skill_sync_repo (clones it, permission-gated, imports every
    .md with folder names as categories).
-8. Self-improvement: you can read your OWN source (alvaagent_tui.py,
-   start.sh, test_tui.py) and improve it with file_edit / file_write, then
-   validate with run_command("python3 -m py_compile alvaagent_tui.py") and
-   run_command("python3 test_tui.py"). After any edit to your own source,
-   ALWAYS run self_test to confirm nothing is broken before you tell the user
-   the change is done. Changes take effect the next time the user restarts the
-   TUI - always say so, and keep edits small, targeted, and tested.
+ 8. Self-improvement: you can read your OWN source (alvaagent_tui.py,
+    start.sh, test_tui.py) and improve it with file_edit / file_write, then
+    validate with run_command("python3 -m py_compile alvaagent_tui.py") and
+    run_command("python3 test_tui.py"). After any edit to your own source,
+    ALWAYS run self_test to confirm nothing is broken before you tell the user
+    the change is done. Changes take effect the next time the user restarts the
+    TUI - always say so, and keep edits small, targeted, and tested.
+    LEAVE NOTHING BEHIND: clean up every file you create while working - put
+    scratch/exploratory files in /tmp and delete them after, remove any test
+    skill/todo/file you made, and finish by running git status to confirm only
+    your intended changes remain. Do not commit session junk (.opencode/,
+    opencode.json) or runtime state (.alvaagent/config.json, store.json,
+    cmd_history.txt). Ask the user before committing any skill or script you
+    created only to explore or test.
 9. Feedback loop: the user can rate your responses with /feedback good|bad.
    When you notice the user expressing satisfaction or frustration, call
    feedback(rating="good"|"bad"|"neutral", notes=...) so the harness records
