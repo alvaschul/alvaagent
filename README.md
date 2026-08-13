@@ -12,13 +12,16 @@ Built for Termux, runs offline-friendly, and survives flaky mobile connections.
 
 ## Features
 - **Python TUI** (`alvaagent_tui.py`) — stdlib only, no dependencies to install.
-- **24 tools**: calculator, web_fetch, get_time, memory, todos, shell, file
-  read/write/edit/list, skill save/read/list/remove, feedback/improvement/reflect,
-  self_test.
+- **27 tools**: calculator, web_fetch, get_time, memory save/recall/search/list,
+  todos, shell, file read/write/edit/list/search, skill save/read/list/remove,
+  feedback/improvement/reflect, self_test.
+- **Resilient by default**: automatic retry with backoff on flaky mobile
+  connections (transient HTTP 408/409/429/5xx, timeouts, dropped links), a
+  stall watchdog for streams, and a `/redo` command to replay the last turn.
 - **Provider profiles**: point at any OpenAI-compatible endpoint. Each
   `/provider` is a saved named profile, switchable anytime.
-- **Sessions** persist to `store.json`; **context auto-compression** keeps long
-  chats inside the model window.
+- **Sessions** persist to `store.json` (auto-pruned to the newest 30);
+  **context auto-compression** keeps long chats inside the model window.
 - **Security-first**: command substitution, destructive flags, and out-of-project
   file access all require explicit approval. Store/config writes are atomic.
 

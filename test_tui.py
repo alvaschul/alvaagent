@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 
 PORT = 8210
 BASE = "http://127.0.0.1:%d" % PORT
@@ -58,7 +59,7 @@ try:
     print("[mock server ready]")
 
     # ---------- tools registered ----------
-    assert_ok(len(pa.TOOLS) == 24, "24 tools registered")
+    assert_ok(len(pa.TOOLS) == 27, "27 tools registered")
 
     # ---------- calculator ----------
     assert_ok(pa.tool_calculator("6*7")["result"] == 42, "calculator: 6*7 = 42")
@@ -101,6 +102,16 @@ try:
     rec = pa.tool_memory_recall("testkey")
     assert_ok(rec["found"] is True and rec["value"] == "hello world", "memory_recall round-trips value")
     assert_ok(pa.tool_memory_recall("missing_key")["found"] is False, "memory_recall reports missing keys")
+    ml = pa.tool_memory_list()
+    assert_ok(ml.get("ok") is True and any(f["key"] == "testkey" for f in ml.get("facts", [])),
+              "memory_list returns all saved facts")
+    ms = pa.tool_memory_search("hello")
+    assert_ok(ms.get("ok") is True and ms.get("count", 0) >= 1, "memory_search finds facts by value")
+    ms2 = pa.tool_memory_search("testkey")
+    assert_ok(ms2.get("ok") is True and any(f["key"] == "testkey" for f in ms2.get("facts", [])),
+              "memory_search finds facts by key")
+    assert_ok(pa.tool_memory_search("no-such-fact-xyz").get("count") == 0,
+              "memory_search misses unmatched queries")
 
     # ---------- clock ----------
     t = pa.tool_get_time()
@@ -187,6 +198,16 @@ try:
     assert_ok(lst.get("ok") is True and any(x["name"] == "proj-demo.txt" for x in lst.get("entries", [])),
               "file_list shows the created file")
 
+    # ---------- file_search (glob) ----------
+    fs = pa.tool_file_search("proj-demo.txt", path=DATA)
+    assert_ok(fs.get("ok") is True and fs.get("count", 0) >= 1, "file_search finds an exact filename")
+    fs2 = pa.tool_file_search("*.txt", path=DATA)
+    assert_ok(fs2.get("ok") is True and any(m.get("path", "").endswith("proj-demo.txt") for m in fs2.get("matches", [])),
+              "file_search glob matches *.txt")
+    assert_ok(pa.tool_file_search("", path=DATA).get("ok") is False, "file_search rejects an empty pattern")
+    assert_ok(pa.tool_file_search("*.md", path="/no/such/dir").get("ok") is False,
+              "file_search rejects a missing base dir")
+
     pa.ON_PERMISSION = lambda d: False
     denied_w = pa.tool_file_write("/tmp/alva-outside-write.txt", "nope")
     assert_ok(denied_w.get("ok") is False and "permission" in str(denied_w.get("error", "")),
@@ -221,6 +242,16 @@ try:
         assert_ok(sfr.get("ok") is True and sfr.get("description") == "parsed without yaml"
                   and sfr.get("tags") == ["a", "b"], "frontmatter fallback parses keys + lists")
         pa.tool_skill_remove("no-yaml-skill")
+        # block-scalar frontmatter (description: >) + inline arrays without PyYAML
+        sf2 = pa.tool_skill_save("block-scalar-skill",
+                                 "---\ndescription: >\n  Procedure the agent follows\n  across folded lines\ntags: [alpha, beta]\nrelated_skills: []\n---\nbody")
+        assert_ok(sf2.get("ok") is True, "skill_save accepts block-scalar frontmatter")
+        sfr2 = pa.tool_skill_read("block-scalar-skill")
+        assert_ok(sfr2.get("description") == "Procedure the agent follows across folded lines",
+                  "mini-YAML folds '>' block scalars into a single line")
+        assert_ok(sfr2.get("tags") == ["alpha", "beta"], "mini-YAML parses inline [a, b] arrays")
+        assert_ok(sfr2.get("related_skills") == [], "mini-YAML parses empty inline arrays")
+        pa.tool_skill_remove("block-scalar-skill")
     finally:
         pa.yaml = saved_yaml
     pa.tool_skill_remove("test-skill")
@@ -272,6 +303,15 @@ try:
     assert_ok("test-sess" not in pa.sessions_map(), "delete_session removes a session")
     assert_ok(pa.auto_title("   hello   world  ") == "hello world", "auto_title normalizes text")
     assert_ok(pa._unique_session_name("x") == "x", "unique name passes through when free")
+
+    # ---------- session pruning (store.json stays bounded) ----------
+    for i in range(pa.MAX_SESSIONS + 5):
+        pa.save_session("prune-%02d" % i, [{"role": "user", "content": "m"}])
+    assert_ok(len(pa.sessions_map()) <= pa.MAX_SESSIONS, "save_session prunes past MAX_SESSIONS")
+    assert_ok("prune-%02d" % (pa.MAX_SESSIONS + 4) in pa.sessions_map(),
+              "the newest session survives pruning")
+    for i in range(pa.MAX_SESSIONS + 5):
+        pa.delete_session("prune-%02d" % i)
 
     # ---------- auto-compression (injected summarizer, no network) ----------
     big = [{"role": "user" if i % 2 == 0 else "assistant", "content": "m" * 4000}
@@ -461,6 +501,206 @@ try:
                   "tool_call falls back to a stable synthetic id")
     finally:
         pa.urllib.request.urlopen = _orig_urlopen
+
+    # ---------- resilience: retry/backoff on transient API failures ----------
+    _orig_sleep = pa._sleep_retry
+    pa._sleep_retry = lambda a: None
+    class _Resp:
+        def __init__(self, code, data):
+            self._code, self._data = code, data
+        def getcode(self):
+            return self._code
+        def read(self):
+            return self._data
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    _attempts = [0]
+    _good = json.dumps({"choices": [{"message": {"role": "assistant", "content": "retried-ok"}}]}).encode("utf-8")
+    def _flaky(req, timeout=180):
+        _attempts[0] += 1
+        if _attempts[0] <= 2:
+            raise pa.urllib.error.URLError("transient outage")
+        return _Resp(200, _good)
+    pa.urllib.request.urlopen = _flaky
+    try:
+        _d = pa.chat_completion([{"role": "user", "content": "hi"}],
+                                {"base_url": "http://x/v1", "api_key": "k", "model": "m", "temperature": 0.5})
+        assert_ok(_attempts[0] == 3 and _d["choices"][0]["message"]["content"] == "retried-ok",
+                  "chat_completion retries transient failures (3 attempts)")
+    finally:
+        pa.urllib.request.urlopen = _orig_urlopen
+    _attempts[0] = 0
+    def _perm(req, timeout=180):
+        _attempts[0] += 1
+        return _Resp(400, json.dumps({"error": {"message": "nope"}}).encode("utf-8"))
+    pa.urllib.request.urlopen = _perm
+    try:
+        try:
+            pa.chat_completion([{"role": "user", "content": "hi"}],
+                               {"base_url": "http://x/v1", "api_key": "k", "model": "m", "temperature": 0.5})
+            _raised = False
+        except RuntimeError:
+            _raised = True
+        assert_ok(_raised and _attempts[0] == 1,
+                  "chat_completion does not retry permanent 4xx errors")
+    finally:
+        pa.urllib.request.urlopen = _orig_urlopen
+        pa._sleep_retry = _orig_sleep
+    # ---------- UX: agent reply renders code cleanly ----------
+    import contextlib as _ctx, io as _iom
+    _wbuf = _iom.StringIO()
+    with _ctx.redirect_stdout(_wbuf):
+        _w = pa.AgentWriter(pa.SKINS["midnight"], pa.SKINS["midnight"]["agent"])
+        _w.feed("Here:\n\n```python\na = 1\n```\n\n```\necho hi\n```\nok\n")
+        _w.close()
+    _raw = _wbuf.getvalue()
+    assert_ok("```" not in _raw, "agent reply shows no literal code fences")
+    assert_ok("─ python" in _raw and "─ code" in _raw,
+              "agent reply marks code blocks with a small language tag")
+    assert_ok(all(ch not in _raw for ch in "╭╮╰╯"),
+              "agent reply has no full-width box")
+    assert_ok("▍ " in _raw, "agent reply uses a thin left accent bar")
+    assert_ok("  a = 1" in _raw, "code lines are indented under the bar")
+
+    # ---------- UX: Hermes XML function calling is hidden & executed ----------
+    _xml = ("<tool_call>\n<function=calculator>\n<parameter=expression>6*7</parameter>\n"
+            "</function>\n</tool_call>")
+    _parsed = pa._parse_xml_tool_calls("Let me compute:\n" + _xml)
+    assert_ok(_parsed == [("calculator", {"expression": "6*7"})],
+              "_parse_xml_tool_calls parses the Hermes <tool_call> format")
+    assert_ok(pa._parse_xml_tool_calls("no calls here") == [], "no tool_calls -> empty list")
+    _stripped = pa._strip_xml("hi <think>secret</think> bye " + _xml + " end")
+    assert_ok("think" not in _stripped and "secret" not in _stripped and "6*7" not in _stripped
+              and "hi" in _stripped and "end" in _stripped, "_strip_xml drops think + tool_call blocks")
+    _stray = pa._strip_xml("The user asks...\n</think>\n" + _xml + "\nnext")
+    assert_ok("</think>" not in _stray and "tool_call" not in _stray and "The user asks..." in _stray
+              and "next" in _stray, "_strip_xml drops stray </think> and tool_call blocks")
+    _wbuf3 = _iom.StringIO()
+    with _ctx.redirect_stdout(_wbuf3):
+        _w3 = pa.AgentWriter(pa.SKINS["midnight"], pa.SKINS["midnight"]["agent"])
+        for _chunk in ["Let me compute:\n<tool_ca", "ll>\n<function=calculator>\n<parameter=expression>6*7</parameter>\n"
+                       "</function>\n</tool_call>\n", "<think>\nhmm\n</think>\n", "42 ok\n"]:
+            _w3.feed(_chunk)
+        _w3.close()
+    _raw3 = _wbuf3.getvalue()
+    assert_ok("<tool_call>" not in _raw3 and "<function" not in _raw3 and "6*7" not in _raw3
+              and "<think>" not in _raw3 and "hmm" not in _raw3,
+              "agent reply hides XML blocks even when they split across chunks")
+    assert_ok("Let me compute:" in _raw3 and "42 ok" in _raw3,
+              "visible text around hidden XML blocks survives")
+    # stray </think> with no opening tag (reasoning models) must not render
+    _wbuf4 = _iom.StringIO()
+    with _ctx.redirect_stdout(_wbuf4):
+        _w4 = pa.AgentWriter(pa.SKINS["midnight"], pa.SKINS["midnight"]["agent"])
+        for _chunk4 in ["Reasoning about it.\n", "</think>\n", "<tool_call>\n<function=calculator>\n",
+                        "<parameter=expression>2+2</parameter>\n</function>\n</tool_call>\n", "ok\n"]:
+            _w4.feed(_chunk4)
+        _w4.close()
+    _raw4 = _wbuf4.getvalue()
+    assert_ok("</think>" not in _raw4 and "<tool_call>" not in _raw4 and "2+2" not in _raw4,
+              "agent reply hides stray </think> and split tool_call blocks")
+    assert_ok("Reasoning about it." in _raw4 and "ok" in _raw4, "visible text survives stray tags")
+
+    # ---------- UX: markdown formatting renders to ANSI styles ----------
+    _old_color = pa.COLOR
+    try:
+        pa.COLOR = True
+        _sk5 = pa.SKINS["midnight"]
+        _rend, _ = pa._md_line("**bold** *italic* _it_ __also__ ~~gone~~", _sk5)
+        assert_ok("\x1b[1m" in _rend and "\x1b[3m" in _rend and "\x1b[9m" in _rend
+                  and "*" not in _rend and "_" not in _rend and "~" not in _rend,
+                  "style_inline maps **bold**, *italic*, _italic_, __bold__, ~~strike~~")
+        _rend2, _ = pa._md_line("nested **bold *italic* rest** end", _sk5)
+        assert_ok("\x1b[1m" in _rend2 and "\x1b[1;3m" in _rend2 and "**" not in _rend2
+                  and "*italic*" not in _rend2,
+                  "nested emphasis keeps both styles with no stray markers")
+        _rend3, _ = pa._md_line("use `cmd -x` here", _sk5)
+        assert_ok("cmd -x" in _rend3 and "`" not in _rend3 and _sk5["code"] in _rend3,
+                  "inline `code` is colored and backticks are hidden")
+        _rend4, _ = pa._md_line("a * b * c", _sk5)
+        assert_ok(_rend4 == "a * b * c", "space-flanked asterisks stay literal")
+        _rend5, _ = pa._md_line("***both***", _sk5)
+        assert_ok("\x1b[1;3m" in _rend5, "***both*** renders bold + italic")
+    finally:
+        pa.COLOR = _old_color
+    assert_ok(pa._md_line("**raw**", pa.SKINS["midnight"])[0] == "**raw**",
+              "style_inline passes markdown through untouched when colors are off")
+
+    _old_color2 = pa.COLOR
+    try:
+        pa.COLOR = True
+        _sk6 = pa.SKINS["midnight"]
+        _r1, _p1 = pa._md_line("Some **bo", _sk6)
+        _r2, _p2 = pa._md_line(_p1 + "ld** text", _sk6)
+        assert_ok(_p1 == "**bo" and _r1 == "Some " and _p2 == "" and "\x1b[1m" in _r2
+                  and "**" not in _r2 and "**bo" not in _r2,
+                  "marker split across chunks is parked and merged into one bold span")
+        _wbuf5 = _iom.StringIO()
+        with _ctx.redirect_stdout(_wbuf5):
+            _w5 = pa.AgentWriter(_sk6, _sk6["agent"])
+            for _chunk5 in ["Result **4", "2**.\n", "## Head\n", "- [x] done *it*\n",
+                            "- [ ] todo\n", "- plain\n", "> quote\n", "---\n"]:
+                _w5.feed(_chunk5)
+            _w5.close()
+        _raw5 = _wbuf5.getvalue()
+        assert_ok("\x1b[1m42\x1b[0m" in _raw5 and "**" not in _raw5,
+                  "streamed bold split across feeds renders as one span")
+        assert_ok("\x1b[38;5;81mHead" in _raw5 and "## " not in _raw5,
+                  "## heading renders as a bold accent line")
+        assert_ok("\x1b[38;5;114m✓ " in _raw5 and "\x1b[38;5;244m☐ " in _raw5,
+                  "- [x]/- [ ] checkboxes render ✓ / ☐")
+        assert_ok("\x1b[38;5;45m• " in _raw5, "- bullet renders with an accent marker")
+        assert_ok("\x1b[38;5;240m│ " in _raw5, "> quote renders with a border bar")
+        assert_ok("─" * 8 in _raw5 and "---" not in _raw5, "--- renders as a dim rule")
+        assert_ok("*it*" not in _raw5 and "\x1b[3m" in _raw5,
+                  "italic inside a checkbox item is styled")
+    finally:
+        pa.COLOR = _old_color2
+
+    # end-to-end: XML tool_call gets executed and the result fed back
+    _xml_sse = (
+        'data: {"choices":[{"delta":{"content":"Let me compute:\\n<tool_call>\\n<function=calculator>\\n'
+        '<parameter=expression>6*7</parameter>\\n</function>\\n</tool_call>\\n"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    )
+    _ans_sse = (
+        'data: {"choices":[{"delta":{"content":"The answer is 42."}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    )
+    _xml_attempt = [0]
+    def _fake_xml_urlopen(req, timeout=180):
+        _xml_attempt[0] += 1
+        return _FakeResp(_xml_sse if _xml_attempt[0] == 1 else _ans_sse)
+    pa.urllib.request.urlopen = _fake_xml_urlopen
+    try:
+        _evs = list(pa.run_agent_stream([{"role": "user", "content": "calc"}], cfg_s))
+        _ts = [e for k, e in _evs if k == "tool_start"]
+        _te = [e for k, e in _evs if k == "tool_end"]
+        _dn = [e for k, e in _evs if k == "done"][0]
+        assert_ok(len(_ts) == 1 and _ts[0]["name"] == "calculator"
+                  and _ts[0]["args"] == {"expression": "6*7"},
+                  "XML tool_call dispatches run_agent_stream tool_start")
+        assert_ok(len(_te) == 1 and _te[0]["status"] == "done"
+                  and _te[0]["result"].get("result") == 42,
+                  "XML tool_call executes and returns its result")
+        assert_ok(_dn["content"] == "The answer is 42." and "tool_call" not in _dn["content"],
+                  "XML tool_call loop finishes with the model's clean follow-up")
+    finally:
+        pa.urllib.request.urlopen = _orig_urlopen
+
+    # spinner can be permanently disabled once streaming starts
+    _sp = pa.Spinner("thinking")
+    _sp.start()
+    _sp.disable()
+    assert_ok(_sp._dead is True, "spinner.disable() permanently silences frames")
+    _sp.stop()
+    _sp2 = pa.Spinner("thinking")
+    _sp2.start()
+    _sp2.disable()
+    _sp2.stop()
+    assert_ok(_sp2._dead is True, "spinner.disable() stays dead across stop()")
     # ---------- UX: command history persists across restarts ----------
     import readline as _rl
     _htmp = os.path.join(DATA, "_hist_probe.txt")

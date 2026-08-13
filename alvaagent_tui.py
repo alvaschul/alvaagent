@@ -45,12 +45,15 @@
 import ast
 import codecs
 import datetime
+import fnmatch
+import html
 import json
 import math
 import os
 import re
 import readline
 import secrets
+import select
 import shutil
 import signal
 import subprocess
@@ -342,6 +345,7 @@ IMPROVEMENT_KEY = "alvaagent.improvements"
 HISTORY_KEY = "alvaagent.history"
 SESSION_KEY = "alvaagent.sessions"
 ACTIVE_SESSION_KEY = "alvaagent.active_session"
+MAX_SESSIONS = 30  # oldest sessions are pruned past this many (keeps store.json small)
 
 # ---------------- autonomy: permissions ----------------
 # The agent can run shell commands, edit files and manage skills. Everything
@@ -554,6 +558,45 @@ def tool_file_list(path="."):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
+def tool_file_search(pattern, path=None, max_depth=3):
+    """Find files by glob pattern (e.g. '*.py', 'test*') under a directory.
+
+    Depth-limited, read-only walk (hidden dirs skipped, results capped) so it
+    stays cheap even on big folders like /sdcard.
+    """
+    pattern = str(pattern or "").strip()
+    if not pattern:
+        return {"ok": False, "error": "empty pattern"}
+    base = str(path or PROJECT_DIR).strip() or PROJECT_DIR
+    base = os.path.abspath(os.path.expanduser(base))
+    if not os.path.isdir(base):
+        return {"ok": False, "error": "not a directory: %s" % base}
+    try:
+        max_depth = max(0, int(max_depth))
+    except (TypeError, ValueError):
+        max_depth = 3
+    matches = []
+    start_depth = base.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(base):
+        depth = root.rstrip(os.sep).count(os.sep) - start_depth
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if depth >= max_depth:
+            dirs[:] = []
+        for f in files:
+            if fnmatch.fnmatch(f, pattern) or fnmatch.fnmatch(os.path.join(root, f), pattern):
+                p = os.path.join(root, f)
+                matches.append({"path": p,
+                                "size": os.path.getsize(p) if os.path.isfile(p) else 0})
+                if len(matches) >= 100:
+                    return {"ok": True, "pattern": pattern, "base": base,
+                            "count": len(matches), "matches": matches,
+                            "truncated": True}
+        if len(matches) >= 100:
+            break
+    return {"ok": True, "pattern": pattern, "base": base,
+            "count": len(matches), "matches": matches}
+
+
 # ---------------- skills: Hermes-style frontmatter + categorized storage ----------------
 # Skills mirror Hermes: each skill file is a Markdown doc with an optional YAML
 # frontmatter block between `---` fences. The frontmatter carries `name`,
@@ -591,8 +634,14 @@ _VALID_FM_KEYS = frozenset(("name", "description", "version", "author", "tags", 
 
 
 def _mini_scalar(v):
-    """Coerce a bare frontmatter scalar to a Python value (strips quotes)."""
+    """Coerce a bare frontmatter scalar to a Python value (strips quotes,
+    parses inline '[a, b]' arrays so tags: [x, y] works without PyYAML)."""
     s = v.strip()
+    if s.startswith("[") and s.endswith("]"):
+        inner = s[1:-1].strip()
+        if not inner:
+            return []
+        return [_mini_scalar(x.strip()) for x in inner.split(",")]
     if s.lower() == "true":
         return True
     if s.lower() == "false":
@@ -604,16 +653,42 @@ def _mini_scalar(v):
     return s
 
 
+def _finish_block(kind, lines, chomp):
+    """Render collected block-scalar lines: '>' folds to a single space, '|'
+    preserves newlines. Chomping: '-' strips the trailing newline, '+' keeps
+    it, default (clip) yields a single trailing newline."""
+    if kind == ">":
+        text = " ".join(x for x in lines if x)
+    else:
+        text = "\n".join(lines)
+    text = text.rstrip()
+    if chomp == "+":
+        text += "\n"
+    return text
+
+
 def _mini_yaml(text):
     """Tiny YAML-subset parser for the frontmatter format the harness writes:
-    'key: scalar' lines and 'key:' followed by '  - item' list entries.
+    'key: scalar' lines, 'key:' followed by '  - item' list entries, and
+    block scalars ('key: >' / 'key: |' with indented continuation lines).
     Used only when PyYAML isn't installed."""
     out = {}
     current_list = None
+    block_kind = None
+    block_key = None
+    block_chomp = ""
+    block_lines = []
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
         if not line.strip() or line.lstrip().startswith("#"):
             continue
+        if (line.startswith(" ") or line.startswith("\t")) and block_kind is not None:
+            block_lines.append(line.strip())
+            continue
+        if block_kind is not None:
+            out[block_key] = _finish_block(block_kind, block_lines, block_chomp)
+            block_kind = None
+            block_lines = []
         if line.strip().startswith("- "):
             item = line.split("- ", 1)[1].strip()
             if current_list is not None:
@@ -626,12 +701,20 @@ def _mini_yaml(text):
         if not key or key.startswith(" "):
             continue
         val = val.strip()
+        if val in (">", "|", ">-", "|-", ">+", "|+"):
+            block_kind = val[0]
+            block_chomp = val[1:]
+            block_key = key
+            block_lines = []
+            continue
         if val == "":
             out[key] = []
             current_list = out[key]
         else:
             out[key] = _mini_scalar(val)
             current_list = None
+    if block_kind is not None:
+        out[block_key] = _finish_block(block_kind, block_lines, block_chomp)
     return out
 
 
@@ -778,19 +861,6 @@ def _scan_skill_files():
                 sub_full = os.path.join(full, sub)
                 if os.path.isfile(sub_full) and sub.endswith(".md"):
                     yield cat, sub[:-3], sub_full
-
-
-def _normalize_skill_list(raw_list):
-    """Accept either the new list-of-dicts or the legacy list-of-strings and
-    return a list of dicts (legacy entries get category=None, description=None)."""
-    if not raw_list:
-        return []
-    if isinstance(raw_list, list) and raw_list and isinstance(raw_list[0], dict):
-        return raw_list
-    # legacy: plain strings (flat skill names)
-    return [{"name": str(s), "category": None, "file": None,
-             "description": None, "tags": [], "related_skills": []}
-            for s in raw_list]
 
 
 def _skill_list_all():
@@ -977,6 +1047,28 @@ def tool_memory_recall(key):
     if v is None:
         return {"ok": False, "key": key, "found": False}
     return {"ok": True, "key": key, "found": True, "value": v}
+
+
+def tool_memory_list():
+    """List every saved memory fact (key + value)."""
+    facts = [{"key": k[len(MEM_PREFIX):], "value": v}
+             for k, v in _store.items() if k.startswith(MEM_PREFIX)]
+    return {"ok": True, "count": len(facts), "facts": facts}
+
+
+def tool_memory_search(query=""):
+    """Search saved memory facts by key or value (case-insensitive substring).
+    An empty query returns everything (same as memory_list)."""
+    q = str(query or "").strip().lower()
+    facts = []
+    for k, v in _store.items():
+        if not k.startswith(MEM_PREFIX):
+            continue
+        key = k[len(MEM_PREFIX):]
+        val = v.get("value", v) if isinstance(v, dict) else v
+        if not q or q in key.lower() or q in str(val).lower():
+            facts.append({"key": key, "value": val})
+    return {"ok": True, "query": q, "count": len(facts), "facts": facts}
 
 
 def tool_get_time():
@@ -1238,6 +1330,16 @@ TOOLS = [
             "key": {"type": "string", "description": "The label of the fact to recall"}},
             "required": ["key"]}}},
     {"type": "function", "function": {
+        "name": "memory_search",
+        "description": "Search on-device memory by key or value (case-insensitive substring). Use this when you need a fact but are unsure of its exact key.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Substring to match against keys or values (empty returns all facts)"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "memory_list",
+        "description": "List every saved memory fact (key + value).",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "todo_add",
         "description": "Add a new task to the user's to-do list.",
         "parameters": {"type": "object", "properties": {
@@ -1292,6 +1394,14 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Directory path (default: current dir)"}},
             "required": []}}},
+    {"type": "function", "function": {
+        "name": "file_search",
+        "description": "Find files by glob pattern (e.g. '*.py', 'test*') under a directory. Depth-limited and read-only - use this before file_read/file_edit when the exact path is unknown.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Glob pattern to match file names"},
+            "path": {"type": "string", "description": "Directory to search (default: the project folder)"},
+            "max_depth": {"type": "integer", "description": "How many subdirectory levels to descend (default 3)"}},
+            "required": ["pattern"]}}},
     {"type": "function", "function": {
         "name": "feedback",
         "description": "Record user feedback on the agent's last response (good/bad/neutral + optional notes). Call this when the user expresses satisfaction or frustration so the agent can learn what to repeat or avoid.",
@@ -1356,6 +1466,8 @@ TOOL_IMPL = {
     "get_time": lambda a: tool_get_time(),
     "memory_save": lambda a: tool_memory_save(a.get("key"), a.get("value")),
     "memory_recall": lambda a: tool_memory_recall(a.get("key")),
+    "memory_search": lambda a: tool_memory_search(a.get("query")),
+    "memory_list": lambda a: tool_memory_list(),
     "todo_add": lambda a: tool_todo_add(a.get("text")),
     "todo_list": lambda a: tool_todo_list(),
     "todo_toggle": lambda a: tool_todo_toggle(a.get("index")),
@@ -1365,6 +1477,7 @@ TOOL_IMPL = {
     "file_write": lambda a: tool_file_write(a.get("path"), a.get("content")),
     "file_edit": lambda a: tool_file_edit(a.get("path"), a.get("old"), a.get("new")),
     "file_list": lambda a: tool_file_list(a.get("path")),
+    "file_search": lambda a: tool_file_search(a.get("pattern"), a.get("path"), a.get("max_depth")),
     "feedback": lambda a: tool_feedback(a.get("rating"), a.get("notes")),
     "improvement_set": lambda a: tool_improvement_set(a.get("area"), a.get("action")),
     "improvement_list": lambda a: tool_improvement_list(),
@@ -1395,11 +1508,13 @@ SYSTEM_PROMPT = """You are alvaagent, a helpful AI agent running on the user's A
 You can call tools to do real work. Guidelines:
 1. Use the calculator tool for ANY arithmetic - never guess math.
 2. Use web_fetch to read a webpage when the user asks about online content.
-3. Use memory_save / memory_recall to remember facts the user asks you to remember.
+3. Use memory_save / memory_recall to remember facts the user asks you to
+   remember; memory_search / memory_list find facts when the exact key is unknown.
 4. Use todo_add / todo_list / todo_toggle / todo_remove to manage the user's to-do list.
 5. Use get_time when the user needs the current date or time.
 6. You have real device access: run_command runs shell commands (Termux), and
-   file_read / file_write / file_edit / file_list work on the device's files.
+   file_read / file_write / file_edit / file_list / file_search work on the
+   device's files.
    Read-only commands and in-project file edits run freely; mutating/unknown
    commands or out-of-project writes ask the user first - if denied, do not
    retry, and explain what was blocked and why.
@@ -1424,6 +1539,10 @@ You can call tools to do real work. Guidelines:
    improvements, and improvement_set(area, action) when a pattern emerges.
    Mark improvements done with improvement_done(area) after you verify the fix.
    Treat repeated "bad" feedback on the same thing as a real bug to fix.
+10. Format your answers with light markdown for readability: **bold** for key
+    terms, *italic* for emphasis, `code` for commands and file paths, ## headings
+    for structure, and - bullets for lists. Keep it light - never wrap tool
+    outputs or file contents in emphasis; real code belongs in ``` fences.
 Only call a tool when it genuinely helps. If no tool is needed, answer directly.
 Respond in the same language the user writes in. Be concise, friendly, and precise."""
 
@@ -1464,6 +1583,25 @@ def _readable_error(status, text):
     return msg.strip()[:300]
 
 
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = (0.5, 1.5, 4.0)  # seconds between retries
+_STREAM_IDLE_LIMIT = 90.0         # seconds with no bytes before a stream is treated as stalled
+_STREAM_POLL = 0.25               # cancel-check interval while waiting on a stream socket
+
+
+def _retryable_status(code):
+    """Status codes worth retrying (rate limits + transient server errors)."""
+    return code in (408, 409, 429) or code >= 500
+
+
+def _sleep_retry(attempt):
+    time.sleep(_RETRY_BACKOFF[min(attempt - 1, len(_RETRY_BACKOFF) - 1)])
+
+
+class _Cancelled(Exception):
+    """Raised when the user cancels mid-stream (propagates to the caller as a stop)."""
+
+
 def chat_completion(messages, config, tools=None):
     base = (config.get("base_url") or "").rstrip("/")
     url = base + "/chat/completions"
@@ -1486,26 +1624,44 @@ def chat_completion(messages, config, tools=None):
             "Authorization": "Bearer " + (config.get("api_key") or ""),
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            status = int(r.getcode())
-            text = r.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        status = int(e.code)
-        text = e.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        raise RuntimeError("LLM API unreachable: %s" % e.reason)
-    except Exception as e:
-        raise RuntimeError("LLM request failed: %s" % e)
-    try:
-        data = json.loads(text)
-    except Exception:
-        raise RuntimeError("API returned non-JSON (HTTP %s): %s" % (status, _readable_error(status, text)))
-    if status >= 400 or "error" in data:
-        raise RuntimeError("LLM API error %s: %s" % (status, _readable_error(status, text)))
-    if not data.get("choices"):
-        raise RuntimeError("LLM API returned no choices")
-    return data
+    last_err = None
+    for attempt in range(_MAX_RETRIES + 1):
+        if attempt:
+            _sleep_retry(attempt)
+        if _cancel_flag[0]:
+            raise RuntimeError("LLM request cancelled by user")
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                status = int(r.getcode())
+                text = r.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            status = int(e.code)
+            text = e.read().decode("utf-8", errors="replace")
+            if _retryable_status(status):
+                last_err = "HTTP %s" % status
+                continue
+        except urllib.error.URLError as e:
+            last_err = "LLM API unreachable: %s" % e.reason
+            continue
+        except Exception as e:
+            last_err = "LLM request failed: %s" % e
+            continue
+        try:
+            data = json.loads(text)
+        except Exception:
+            if status >= 500:
+                last_err = "API returned non-JSON (HTTP %s)" % status
+                continue
+            raise RuntimeError("API returned non-JSON (HTTP %s): %s" % (status, _readable_error(status, text)))
+        if status >= 400 or "error" in data:
+            if _retryable_status(status):
+                last_err = "LLM API error %s" % status
+                continue
+            raise RuntimeError("LLM API error %s: %s" % (status, _readable_error(status, text)))
+        if not data.get("choices"):
+            raise RuntimeError("LLM API returned no choices")
+        return data
+    raise RuntimeError("LLM request failed after %d attempts: %s" % (_MAX_RETRIES + 1, last_err))
 
 
 def chat_completion_stream(messages, config, tools=None):
@@ -1531,24 +1687,59 @@ def chat_completion_stream(messages, config, tools=None):
             "Authorization": "Bearer " + (config.get("api_key") or ""),
         },
     )
+    resp = None
+    for attempt in range(_MAX_RETRIES + 1):
+        if attempt:
+            _sleep_retry(attempt)
+        if _cancel_flag[0]:
+            raise _Cancelled()
+        try:
+            resp = urllib.request.urlopen(req, timeout=60)
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if _retryable_status(e.code) and attempt < _MAX_RETRIES:
+                continue
+            raise RuntimeError("LLM API error %s: %s" % (e.code, _readable_error(e.code, body)))
+        except urllib.error.URLError as e:
+            if attempt < _MAX_RETRIES:
+                continue
+            raise RuntimeError("LLM API unreachable: %s" % e.reason)
+        except Exception as e:
+            if attempt < _MAX_RETRIES:
+                continue
+            raise RuntimeError("LLM request failed: %s" % e)
     try:
-        resp = urllib.request.urlopen(req, timeout=180)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError("LLM API error %s: %s" % (e.code, _readable_error(e.code, body)))
-    except urllib.error.URLError as e:
-        raise RuntimeError("LLM API unreachable: %s" % e.reason)
-    except Exception as e:
-        raise RuntimeError("LLM request failed: %s" % e)
+        sock = resp.fileno()
+    except Exception:
+        sock = None  # non-socket response (tests/fakes): fall back to blocking reads
     buffer = ""
     tool_calls_acc = {}
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    last_byte_at = time.monotonic()
     while True:
-        # Read in chunks (1-byte reads = one syscall per byte, painfully slow
-        # on flaky mobile links). 1024 is plenty for SSE deltas.
+        # Poll the socket so Ctrl+C (cancel) is honored within ~_STREAM_POLL
+        # even when the server stalls, and fail a dead link after
+        # _STREAM_IDLE_LIMIT seconds of silence instead of hanging for the
+        # full socket timeout.
+        if sock is not None:
+            while True:
+                if _cancel_flag[0]:
+                    resp.close()
+                    raise _Cancelled()
+                rlist, _, _ = select.select([sock], [], [], _STREAM_POLL)
+                if rlist:
+                    break
+                if time.monotonic() - last_byte_at > _STREAM_IDLE_LIMIT:
+                    resp.close()
+                    raise RuntimeError("LLM stream stalled (no data for %ds)" % _STREAM_IDLE_LIMIT)
+        elif _cancel_flag[0]:
+            resp.close()
+            raise _Cancelled()
         chunk = resp.read(1024)
         if not chunk:
             break
+        last_byte_at = time.monotonic()
         buffer += decoder.decode(chunk)
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
@@ -1604,7 +1795,10 @@ def chat_completion_stream(messages, config, tools=None):
                     return
     # Fallback: some gateways/proxies ignore "stream": true and answer with a
     # plain JSON completion instead of SSE lines. If nothing SSE-ish arrived,
-    # parse the raw body directly so responses still render.
+    # parse the raw body directly so responses still render. Flush the
+    # incremental decoder so a trailing partial multi-byte sequence is decoded
+    # (errors="replace" turns it into U+FFFD rather than dropping it).
+    buffer += decoder.decode("", final=True)
     body = buffer.strip()
     if body and not tool_calls_acc:
         try:
@@ -1632,10 +1826,30 @@ def fetch_models(base_url, api_key, timeout=20):
     req = urllib.request.Request(
         base + "/models",
         headers={"Authorization": "Bearer " + (api_key or ""), "Accept-Encoding": "identity"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode("utf-8", errors="replace"))
-    return [str(m["id"]) for m in (data.get("data") or [])
-            if isinstance(m, dict) and m.get("id")]
+    last_err = None
+    for attempt in range(_MAX_RETRIES + 1):
+        if attempt:
+            _sleep_retry(attempt)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace"))
+            return [str(m["id"]) for m in (data.get("data") or [])
+                    if isinstance(m, dict) and m.get("id")]
+        except urllib.error.HTTPError as e:
+            if _retryable_status(e.code) and attempt < _MAX_RETRIES:
+                last_err = "HTTP %s" % e.code
+                continue
+            raise RuntimeError("models endpoint: HTTP %s" % e.code)
+        except urllib.error.URLError as e:
+            last_err = "unreachable: %s" % e.reason
+            if attempt >= _MAX_RETRIES:
+                raise RuntimeError("models endpoint %s" % last_err)
+        except Exception as e:
+            last_err = str(e)
+            if attempt >= _MAX_RETRIES:
+                raise RuntimeError("models endpoint failed: %s" % e)
+    raise RuntimeError("models endpoint failed after %d attempts: %s"
+                       % (_MAX_RETRIES + 1, last_err))
 
 
 # ---------------- agent loop ----------------
@@ -1745,6 +1959,96 @@ def run_agent(history_json, config_json):
     return json.dumps({"content": "(reached the maximum number of tool steps)", "history": messages, "cancelled": False})
 
 
+# Hermes-style XML function calling: some models can't use native OpenAI
+# tool_calls and instead emit <think>...</think> reasoning plus
+#   <tool_call>
+#     <function=name>
+#       <parameter=key>value</parameter>
+#     </function>
+#   </tool_call>
+# blocks inside the content stream. We hide those blocks from the live
+# display (AgentWriter) and, when a turn contains them, execute them like
+# real tools and feed the results back (run_agent_stream).
+_XML_THINK_RE = re.compile(r"<(?:think|reasoning)\b.*?</(?:think|reasoning)\s*>", re.DOTALL)
+_XML_CALL_RE = re.compile(r"<tool_call\b.*?</tool_call\s*>", re.DOTALL)
+_XML_BLOCK_RE = re.compile(r"<(?:think|reasoning|tool_call)\b.*?</(?:think|reasoning|tool_call)\s*>", re.DOTALL)
+_XML_FUNC_RE = re.compile(r"<function\s*=\s*([^\s>]+)>")
+_XML_PARAM_RE = re.compile(r"<parameter\s*=\s*([^\s>]+)>(.*?)</parameter\s*>", re.DOTALL)
+# Some reasoning models emit a bare closing </think> with no opening tag in the
+# stream (the opener is consumed by the provider's reasoning pipeline). Strip
+# those strays too, with their trailing newline, so no raw tags ever render.
+_XML_STRAY_CLOSE_RE = re.compile(r"</(?:think|reasoning|tool_call)\s*>[\r\n]*")
+_XML_OPEN_TAGS = ("<think", "<reasoning", "<tool_call")
+
+
+def _clean_segment(s):
+    """Remove stray closing tags (</think> etc.) from a plain-text segment."""
+    return _XML_STRAY_CLOSE_RE.sub("", s)
+
+
+def _strip_xml_blocks(text):
+    """Remove complete think/reasoning/tool_call blocks from text, returning
+    (clean_text, pending_tail). pending_tail parks a block whose opening tag
+    may be truncated at the end of the buffer; the next feed() completes it.
+    Stray closing tags with no opener are removed too.
+    """
+    out = []
+    pos = 0
+    while True:
+        m = _XML_BLOCK_RE.search(text, pos)
+        if m:
+            out.append(_clean_segment(text[pos:m.start()]))
+            pos = m.end()
+            continue
+        sm = _XML_STRAY_CLOSE_RE.search(text, pos)
+        if sm:
+            out.append(text[pos:sm.start()])
+            pos = sm.end()
+            continue
+        tail = text[pos:]
+        # park from the last unclosed opener in the tail (may be truncated)
+        best = -1
+        for tag in _XML_OPEN_TAGS:
+            i = tail.rfind(tag)
+            if i > best:
+                best = i
+        if best >= 0:
+            out.append(_clean_segment(tail[:best]))
+            return "".join(out), tail[best:]
+        lt = tail.rfind("<")
+        if lt >= 0:
+            frag = tail[lt:]
+            if any(tag.startswith(frag) for tag in _XML_OPEN_TAGS):
+                out.append(_clean_segment(tail[:lt]))
+                return "".join(out), tail[lt:]
+        out.append(_clean_segment(tail))
+        return "".join(out), ""
+
+
+def _parse_xml_tool_calls(text):
+    """Extract (name, args) pairs from <tool_call> blocks in text."""
+    calls = []
+    for block in _XML_CALL_RE.findall(text):
+        m = _XML_FUNC_RE.search(block)
+        if not m:
+            continue
+        args = {}
+        for pm in _XML_PARAM_RE.finditer(block):
+            args[pm.group(1).strip()] = html.unescape(pm.group(2)).strip()
+        calls.append((m.group(1).strip(), args))
+    return calls
+
+
+def _strip_xml(text):
+    """Full-content version: drop all think/tool_call blocks and stray closing
+    tags, then tidy spacing."""
+    t = _XML_THINK_RE.sub("", text)
+    t = _XML_CALL_RE.sub("", t)
+    t = _XML_STRAY_CLOSE_RE.sub("", t)
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
 def run_agent_stream(history, config):
     """Generator that yields ('text', chunk) or ('tool', tool_info) or ('done', final_dict)."""
     _cancel_flag[0] = False
@@ -1777,12 +2081,17 @@ def run_agent_stream(history, config):
                     yield "text", chunk
                 if tcs:
                     tool_calls_result = tcs
+        except _Cancelled:
+            yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
+            return
         except RuntimeError as e:
             yield "done", {"content": "error: %s" % e, "history": messages, "cancelled": False}
             return
 
         full_content = "".join(content_parts)
-        msg = {"role": "assistant", "content": full_content}
+        has_xml = bool(_XML_CALL_RE.search(full_content) or _XML_THINK_RE.search(full_content))
+        msg = {"role": "assistant",
+               "content": _strip_xml(full_content) if has_xml else full_content}
 
         if tool_calls_result:
             msg["tool_calls"] = tool_calls_result
@@ -1805,9 +2114,21 @@ def run_agent_stream(history, config):
                 status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
                 yield "tool_end", {"name": name, "args": args, "result": result, "status": status}
                 messages.append({"role": "tool", "tool_call_id": tool_id, "content": json.dumps(result)})
+        elif has_xml:
+            xml_calls = _parse_xml_tool_calls(full_content)
+            messages.append(msg)
+            for i, (name, args) in enumerate(xml_calls):
+                if _cancel_flag[0]:
+                    yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
+                    return
+                yield "tool_start", {"name": name, "args": args}
+                result = dispatch_tool(name, args)
+                status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
+                yield "tool_end", {"name": name, "args": args, "result": result, "status": status}
+                messages.append({"role": "tool", "tool_call_id": "xml_%d" % i, "content": json.dumps(result)})
         else:
             messages.append(msg)
-            yield "done", {"content": full_content, "history": messages, "cancelled": False}
+            yield "done", {"content": msg["content"], "history": messages, "cancelled": False}
             return
 
     yield "done", {"content": "(reached the maximum number of tool steps)", "history": messages, "cancelled": False}
@@ -2025,12 +2346,18 @@ def load_session(name):
 
 
 def save_session(name, messages):
-    """Persist a session's messages and mark it active."""
+    """Persist a session's messages and mark it active. Prunes the oldest
+    sessions past MAX_SESSIONS so store.json can't grow without bound."""
     sess = sessions_map()
     rec = sess.get(name) or {"name": name, "created": now_iso(), "messages": []}
     rec["messages"] = list(messages)
     rec["updated"] = now_iso()
     sess[name] = rec
+    if len(sess) > MAX_SESSIONS:
+        others = sorted(((n, sess[n].get("updated") or "") for n in sess if n != name),
+                        key=lambda x: x[1])
+        for old_name, _ in others[:len(sess) - MAX_SESSIONS]:
+            sess.pop(old_name, None)
     _store_set(SESSION_KEY, sess)
     _store_set(ACTIVE_SESSION_KEY, name)
 
@@ -2201,6 +2528,8 @@ class C:
     RESET = "\x1b[0m"
     BOLD = "\x1b[1m"
     DIM = "\x1b[2m"
+    ITALIC = "\x1b[3m"
+    STRIKE = "\x1b[9m"
     CYAN = "\x1b[36m"
     GREEN = "\x1b[32m"
     YELLOW = "\x1b[33m"
@@ -2264,10 +2593,6 @@ def p_info(s):
     print(col(CUR_SKIN["dim"], s))
 
 
-def p_agent(s):
-    print(col(C.BOLD + CUR_SKIN["agent"], "agent") + "  " + s)
-
-
 def p_err(s):
     print(col(C.BOLD + CUR_SKIN["err"], "error") + "  " + s)
 
@@ -2280,13 +2605,12 @@ def p_warn(s):
     print(col(C.YELLOW, "  [!]") + "  " + s)
 
 
-# ---------------- blocks & width-aware layout ----------------
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _vlen(s):
-    """Visible length of a string (ANSI escapes stripped)."""
-    return len(_ANSI_RE.sub("", s))
+# ---------------- Hermes-style display (clean minimal chat) ----------------
+# User turns are a compact gold '●' bullet; tool calls are small indented dim
+# lines ('  ▸ name (args)' / '  ✓ name → summary'); agent replies stream with a
+# thin bronze left accent bar ('▍ ') and NO box. The only full-width Rich Panel
+# left is the startup banner. Hermes' palette is fixed (gold bullet, bronze bar,
+# cream text) so the chat reads the same regardless of the /skin palette.
 
 
 def _term_width():
@@ -2296,47 +2620,6 @@ def _term_width():
         return 80
 
 
-def _content_w():
-    return max(20, _term_width() - 6)
-
-
-def _wrap_text(text, w):
-    """Wrap plain text to width w; returns a list of lines."""
-    out = []
-    for para in text.split("\n"):
-        if not para.strip():
-            out.append("")
-            continue
-        if _vlen(para) <= w:
-            out.append(para)
-            continue
-        cur = ""
-        for word in para.split(" "):
-            while _vlen(word) > w:  # break over-long words
-                if cur:
-                    out.append(cur)
-                    cur = ""
-                out.append(word[:w])
-                word = word[w:]
-            cand = (cur + " " + word).strip() if cur else word
-            if _vlen(cand) <= w:
-                cur = cand
-            else:
-                if cur:
-                    out.append(cur)
-                cur = word
-        if cur:
-            out.append(cur)
-    return out
-
-
-# ---------------- Hermes-style display (full panels) ----------------
-# Mirrors the Hermes agent TUI: Rich `Panel(box=HORIZONTALS)` for static
-# blocks (banner, buffered agent reply) and matching raw-ANSI HORIZONTALS
-# borders for live streaming. Hermes' palette is fixed (gold user bullet,
-# bronze agent border) so the UI reads as Hermes regardless of the /skin
-# palette. The live reply block is a full bordered panel (╭─ ╮ / │ / ╰─ ╯)
-# identical in shape to the startup banner.
 HERMES_ACCENT = "#FFD700"   # gold   - user bullet / banner title
 HERMES_BORDER = "#CD7F32"   # bronze - agent reply border (Hermes response_border)
 HERMES_TEXT   = "#FFF8DC"   # cream  - agent text
@@ -2362,50 +2645,14 @@ def _rsth():
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def _vislen(s):
-    """Visible character width of s (ANSI escapes are invisible)."""
-    return len(_ANSI_RE.sub("", s))
-
-
-def _panel_top(title, hexcol, width=None):
-    """Top of a full Hermes HORIZONTALS panel: '╭─ title ──────╮'."""
-    w = width or _term_width()
-    inner = (" " + title + " ") if title else ""
-    dashes = "─" * max(w - len(inner) - 3, 1)
-    sys.stdout.write(_fgh(hexcol) + "╭─" + inner + dashes + "╮" + _rsth() + "\n")
-
-
-def _panel_bottom(hexcol, width=None):
-    """Bottom of a full Hermes HORIZONTALS panel: '╰────────────╯'."""
-    w = width or _term_width()
-    sys.stdout.write(_fgh(hexcol) + "╰" + "─" * max(w - 2, 1) + "╯" + _rsth() + "\n")
-
-
-def _rule_h(top_title, hexcol, width=None):
-    """Top border of a Hermes HORIZONTALS panel: '─ title ─────'."""
-    w = width or _term_width()
-    inner = (" " + top_title + " ") if top_title else ""
-    dashes = "─" * max(w - len(inner) - 1, 1)
-    print(_fgh(hexcol) + "─" + inner + dashes + _rsth())
-
-
-def _rule_bottom(hexcol, width=None):
-    """Bottom border of a Hermes HORIZONTALS panel: '──────────'."""
-    w = width or _term_width()
-    print(_fgh(hexcol) + "─" * w + _rsth())
-
-
-def _rule_dim(label):
-    """A dim tool-call divider: '─ ▸ label ───────'."""
-    w = _term_width()
-    inner = " " + label + " "
-    dashes = "─" * max(w - len(inner) - 1, 1)
-    print(_fgh(HERMES_DIM) + "─" + inner + dashes + _rsth())
+def _tool_line(label, color):
+    """Compact indented tool line: '  ▸ name (args)' or '  ✓ name → summary'."""
+    print(_fgh(color) + "  " + label + _rsth())
 
 
 def print_user_turn(text, show_ts=False):
-    """Hermes user scrollback: gold rule + '●' bullet + bold text."""
-    print(_fgh(HERMES_ACCENT) + "─" * 40 + _rsth())
+    """Compact user scrollback: gold '●' bullet + bold text, no rule."""
+    print()
     ts = (" " + datetime.datetime.now().strftime("%H:%M")) if show_ts else ""
     for i, line in enumerate(text.split("\n")):
         if i == 0:
@@ -2416,99 +2663,252 @@ def print_user_turn(text, show_ts=False):
 
 
 def render_agent_panel(text, skin=None):
-    """Buffered agent reply as a Rich HORIZONTALS panel (Hermes style)."""
-    _CON.print(Panel(
-        style_inline(text, skin or CUR_SKIN),
-        title="[bold %s]⚕ alvaagent[/]" % HERMES_BORDER,
-        title_align="left",
-        border_style=HERMES_BORDER,
-        box=HORIZONTALS,
-        padding=(1, 0),
-        width=_term_width(),
-    ))
+    """Buffered agent reply rendered with the same thin left bar as streaming."""
+    sk = skin or CUR_SKIN
+    w = AgentWriter(sk, sk["agent"])
+    w.feed(text)
+    w.close()
 
 
-def banner_panel(lines, title, border_hex=HERMES_BORDER, title_hex=HERMES_ACCENT):
-    """Full-bordered Rich Panel for the startup banner (Hermes banner.py)."""
-    _CON.print(Panel(
-        "\n".join(lines),
-        title="[bold %s]%s[/]" % (title_hex, title),
-        border_style=border_hex,
-        padding=(0, 2),
-        width=_term_width(),
-    ))
+_MD_STYLE = {"**": "b", "__": "b", "*": "i", "_": "i", "~~": "s"}
+
+
+def _md_attr_sgr(stack):
+    """Combined SGR attributes for an emphasis style stack (b=bold, i=italic,
+    s=strike). Emitting one code like '\\x1b[1;3m' keeps nested styles intact
+    instead of a mid-span RESET clobbering the outer style."""
+    codes = []
+    if "b" in stack:
+        codes.append("1")
+    if "i" in stack:
+        codes.append("3")
+    if "s" in stack:
+        codes.append("9")
+    return "\x1b[" + ";".join(codes) + "m" if codes else ""
+
+
+def _has_ansi(parts):
+    return any("\x1b[" in p for p in parts)
+
+
+def _md_line(text, skin):
+    """Style one inline line of markdown into ANSI (CommonMark emphasis).
+
+    **x** / __x__ -> bold, *x* / _x_ -> italic, ~~x~~ -> strikethrough,
+    `x` -> inline code in the skin's code color, \\* escapes a literal marker.
+    Emphasis can nest (e.g. **bold *italic* bold**) and the combined SGR is
+    emitted so the outer style survives inner resets.
+
+    Returns (rendered, parked). parked is non-empty when the line ends inside
+    an unclosed emphasis/code span or on a bare opener; the caller carries it
+    into the next feed() so markers split across streamed chunks still render
+    as one styled span. When COLOR is off the line is returned untouched, so
+    piped output keeps its original markdown characters.
+    """
+    if not COLOR:
+        return text, ""
+    n = len(text)
+    out = []
+    stack = []
+    buf = []
+    last_open = -1
+    i = 0
+
+    def flush():
+        if not buf:
+            return
+        s = "".join(buf)
+        if stack:
+            out.append(_md_prefix(stack) + s)
+        elif _has_ansi(out):
+            out.append(C.RESET + s)
+        else:
+            out.append(s)
+        del buf[:]
+
+    def can_open(pos, width):
+        nxt = text[pos + width] if pos + width < n else None
+        prv = text[pos - 1] if pos > 0 else None
+        if nxt is None:
+            return True   # end of line - park; the next chunk may continue it
+        if nxt in (" ", "\t"):
+            return False
+        if prv is not None and prv.isalnum():
+            return False  # intraword: 6*7, snake_case stay literal
+        return True
+
+    def can_close(pos, width):
+        prv = text[pos - 1] if pos > 0 else None
+        nxt = text[pos + width] if pos + width < n else None
+        if prv is None or prv in (" ", "\t"):
+            return False
+        if nxt is not None and nxt.isalnum():
+            return False
+        return True
+
+    def park_from(pos):
+        tail = "".join(out)
+        if _has_ansi(out):
+            tail += C.RESET
+        return tail, text[pos:]
+
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in "*_~`\\":
+            buf.append(text[i + 1])
+            i += 2
+            continue
+        if ch == "`":
+            j = text.find("`", i + 1)
+            if j == -1:
+                flush()
+                return park_from(i)
+            flush()
+            out.append(C.RESET + skin["code"] + _md_attr_sgr(stack) + text[i + 1:j])
+            out.append(C.RESET)
+            i = j + 1
+            continue
+        if text[i:i + 3] in ("***", "___"):
+            if "b" in stack and "i" in stack:
+                flush()
+                stack[:] = [k for k in stack if k not in ("b", "i")]
+            else:
+                flush()
+                stack.append("b")
+                stack.append("i")
+                last_open = i
+            i += 3
+            continue
+        two = text[i:i + 2]
+        if two in _MD_STYLE:
+            kind = _MD_STYLE[two]
+            if kind in stack and can_close(i, 2):
+                flush()
+                while stack and stack[-1] != kind:
+                    stack.pop()
+                if stack:
+                    stack.pop()
+                i += 2
+                continue
+            if can_open(i, 2):
+                flush()
+                stack.append(kind)
+                last_open = i
+                i += 2
+                continue
+            buf.append(two)
+            i += 2
+            continue
+        if ch in "*_":
+            if "i" in stack and can_close(i, 1):
+                flush()
+                while stack and stack[-1] != "i":
+                    stack.pop()
+                if stack:
+                    stack.pop()
+                i += 1
+                continue
+            if can_open(i, 1):
+                flush()
+                stack.append("i")
+                last_open = i
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+
+    if stack:
+        return park_from(last_open)
+    flush()
+    if _has_ansi(out):
+        out.append(C.RESET)
+    return "".join(out), ""
+
+
+def _md_prefix(stack):
+    """Full SGR prefix (RESET + combined attrs) for a style stack."""
+    return C.RESET + _md_attr_sgr(stack)
 
 
 def style_inline(text, skin):
-    """Inline markdown -> ANSI: `code`, **bold**, *italic*.
+    """Inline markdown -> ANSI: `code`, **bold**, *italic* / _italic_, ~~strike~~.
 
-    Returns text untouched when colors are off, so piped/NO_COLOR output keeps
-    its original markdown characters.
+    Applies per line (multi-line input is split and re-joined). Returns text
+    untouched when colors are off, so piped/NO_COLOR output keeps its original
+    markdown characters. The streaming AgentWriter uses _md_line directly so
+    markers split across chunks can be parked and merged.
     """
-    if not COLOR:
-        return text
-    t = re.sub(r'`([^`]+)`', lambda m: col(skin["code"], m.group(1)), text)
-    t = re.sub(r'\*\*(.+?)\*\*', lambda m: col(C.BOLD, m.group(1)), t)
-    t = re.sub(r'__(.+?)__', lambda m: col(C.BOLD, m.group(1)), t)
-    t = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', lambda m: col(C.DIM, m.group(1)), t)
-    t = re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', lambda m: col(C.DIM, m.group(1)), t)
-    return t
+    if "\n" in text:
+        return "\n".join(_md_line(ln, skin)[0] for ln in text.split("\n"))
+    return _md_line(text, skin)[0]
 
 
 class AgentWriter:
-    """Streams an agent response inside a bordered box with live markdown.
+    """Streams an agent response with a thin left accent bar ('▍ '), no box.
 
-    Text flows immediately, line by line, with a '  │ ' gutter. Code fences
-    (```) switch to a dim code gutter with a '─ code ─' marker; the language
-    name after the opening fence is captured and shown in the marker.
+    Text flows immediately, line by line. Code fences (```) switch to dim,
+    indented code with a small '─ lang' marker; the language name after the
+    opening fence is captured and shown in the marker.
     """
 
     def __init__(self, skin, color):
         self.skin = skin
-        self.color = color  # kept for API compat; border is Hermes bronze
+        self.color = color  # kept for API compat
         self.in_code = False
         self._code_label = None   # not None while waiting for the code-fence language
+        self._pending = ""        # cross-chunk buffer for <think>/<tool_call> blocks
+        self._md_pending = ""     # cross-chunk buffer for an unclosed inline marker
         self.started = False
         self.closed = False
         self.at_line_start = True
-        self._width = _term_width()
-        self._linebuf = ""
+
+    def _filter_xml(self, chunk):
+        """Hide <think>/<reasoning>/<tool_call> blocks (they're executed by
+        run_agent_stream and reported as tool lines, not shown as raw text)."""
+        self._pending += chunk
+        clean, self._pending = _strip_xml_blocks(self._pending)
+        return clean
 
     # ---- low-level output ----
     def _write(self, s):
         if self.at_line_start:
             self.at_line_start = False
-            sys.stdout.write("│ ")   # Hermes HORIZONTALS left gutter
-            self._linebuf = ""
+            sys.stdout.write(_fgh(HERMES_BORDER) + "▍ " + _rsth())   # left accent bar
         sys.stdout.write(s)
-        self._linebuf += s
 
     def _nl(self):
-        pad = max(self._width - 3 - _vislen(self._linebuf), 0)
-        sys.stdout.write(" " * pad + "│\n")   # Hermes HORIZONTALS right gutter
-        self._linebuf = ""
+        sys.stdout.write("\n")
         self.at_line_start = True
 
-    def _emit_plain(self, styled):
+    def _code_marker(self, lang):
+        """Small dim marker opening a code block: '▍ ─ python'."""
         if not self.at_line_start:
             self._nl()
-        self._write(styled)
+        self._write(col(self.skin["dim"], "─ " + (lang or "code").strip()))
         self._nl()
 
     # ---- public API ----
     def feed(self, chunk):
         if not self.started:
             self.started = True
-            _panel_top("⚕ alvaagent", HERMES_BORDER, self._width)  # reply panel top
+        chunk = self._filter_xml(chunk)
+        if not chunk:
+            return
         parts = chunk.split("```")
         for i, part in enumerate(parts):
             if i > 0:
                 self.in_code = not self.in_code
                 if self.in_code:
+                    if self._md_pending:
+                        # emphasis can't span a code fence - flush as plain text
+                        self._write(self._md_pending)
+                        self._md_pending = ""
                     self._code_label = ""   # collect the language until the newline
                 else:
-                    self._flush_code_label()
-                    self._emit_plain("```")
+                    self._flush_code_label()   # closing fence: no literal marker
             if part:
                 if self.in_code:
                     self._write_code(part)
@@ -2519,26 +2919,28 @@ class AgentWriter:
         if self.closed:
             return
         self.closed = True
+        self._pending = ""   # drop a trailing unclosed XML block
         if not self.started:
             return
+        if self._md_pending:
+            self._write(self._md_pending)   # flush an unclosed inline marker as text
+            self._md_pending = ""
         if self.in_code:
             self.in_code = False
             self._flush_code_label()
-            self._emit_plain("```")
         if not self.at_line_start:
             self._nl()
-        _panel_bottom(HERMES_BORDER, self._width)   # reply panel bottom
 
     def _flush_code_label(self):
         """Code buffered while waiting for a language newline is real code -
         never drop it (single-line blocks have no newline at all). Emits a
-        clean ```lang fence (Hermes renders fenced code as-is, no labels)."""
+        clean dim '─ lang ─' marker instead of a literal ``` fence."""
         if self._code_label is None or not self._code_label.strip():
             self._code_label = None
             return
         lang = self._code_label.strip()
         self._code_label = None
-        self._emit_plain("```" + lang)
+        self._code_marker(lang)
         # content follows in the next feed() part
 
     # ---- content writers ----
@@ -2549,7 +2951,7 @@ class AgentWriter:
                 return
             label, rest = self._code_label.split("\n", 1)
             self._code_label = None
-            self._emit_plain("```" + label.strip())
+            self._code_marker(label.strip())
             part = rest
         raw = part.split("\n")
         if raw and raw[0] == "" and len(raw) > 1:
@@ -2565,10 +2967,37 @@ class AgentWriter:
             if idx > 0:
                 self._nl()
             if piece:
-                self._write(col(self.skin["code"], piece))
+                self._write(col(self.skin["code"], "  " + piece))   # indent code
                 wrote = True
         if end_nl and wrote:
             self._nl()
+
+    def _decorate(self, piece):
+        """Line-level markdown: headings, horizontal rules, task checkboxes,
+        bullets and blockquotes.
+
+        Returns (styled_prefix_or_None, remainder_to_style). With colors off
+        the line is returned untouched so raw markdown survives piped output.
+        """
+        if not COLOR:
+            return None, piece
+        s = self.skin
+        hm = re.match(r"^#{1,6}\s+(.*)$", piece)
+        if hm:  # '## Heading' -> bold accent heading
+            return col(C.BOLD + s["agent"], hm.group(1)), ""
+        if re.match(r"^\s*[-*_][-*_\s]{2,}$", piece):  # '---' / '***' / '___'
+            return col(s["dim"], "─" * 20), ""
+        cm = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.*)$", piece)
+        if cm:  # '- [x] done' / '- [ ] todo'
+            mark = col(s["ok"], "✓ ") if cm.group(1) in ("x", "X") else col(s["dim"], "☐ ")
+            return mark, cm.group(2)
+        bm = re.match(r"^\s*[-*]\s+(.*)$", piece)
+        if bm:  # '- item' -> accent bullet
+            return col(s["accent"], "• "), bm.group(1)
+        qm = re.match(r"^\s*>\s?(.*)$", piece)
+        if qm:  # '> quote' -> bordered bar
+            return col(s["border"], "│ "), qm.group(1)
+        return None, piece
 
     def _write_inline(self, part):
         raw = part.split("\n")
@@ -2584,27 +3013,22 @@ class AgentWriter:
         for idx, piece in enumerate(raw):
             if idx > 0:
                 self._nl()
+            if self._md_pending:
+                piece = self._md_pending + piece   # finish the parked inline span
+                self._md_pending = ""
             if piece:
-                if self.at_line_start:
-                    hm = re.match(r"^#{1,6}\s+(.*)$", piece)
-                    if hm:  # '## Heading' -> bold accent heading
-                        piece = col(C.BOLD + self.skin["agent"], hm.group(1))
-                self._write(style_inline(piece, self.skin))
-                wrote = True
+                prefix, rest = self._decorate(piece)
+                if prefix is not None:
+                    self._write(prefix)
+                rendered, parked = _md_line(rest, self.skin)
+                if parked:
+                    self._md_pending = parked
+                if rendered:
+                    self._write(rendered)
+                if prefix is not None or rendered:
+                    wrote = True
         if end_nl and wrote:
             self._nl()
-
-
-def render_markdown(text):
-    """Render a full text with inline markdown + fenced code blocks (no streaming)."""
-    out = []
-    in_code = False
-    for line in text.split("\n"):
-        if line.strip().startswith("```"):
-            in_code = not in_code
-            continue
-        out.append(col(CUR_SKIN["code"], line) if in_code else style_inline(line, CUR_SKIN))
-    return "\n".join(out)
 
 
 def fmt_args(args):
@@ -2644,12 +3068,17 @@ class Spinner:
     """Tiny animated indicator; safe to start()/stop() repeatedly.
 
     The verb (message) can change live - 'thinking', 'streaming', 'running
-    tools' - like the Hermes TUI's customizable busy verbs.
+    tools' - like the Hermes TUI's customizable busy verbs. stop() wakes the
+    thread immediately (Event) so it can be called between every streamed
+    chunk without stuttering, and disable() permanently silences it once real
+    output starts streaming (otherwise the \r frames collide with the text).
     """
 
     def __init__(self, msg="thinking"):
         self.msg = msg
         self._stop = True
+        self._dead = False
+        self._wake = threading.Event()
         self._t = None
         self._lock = threading.Lock()
 
@@ -2662,47 +3091,62 @@ class Spinner:
         i = 0
         while True:
             with self._lock:
-                if self._stop:
+                if self._dead or self._stop:
                     return
                 msg = self.msg
             sys.stderr.write("\r" + msg + " " + frames[i % 4])
             i += 1
-            time.sleep(0.12)
+            self._wake.wait(0.12)
+            self._wake.clear()
 
     def start(self):
         with self._lock:
-            if not self._stop:
+            if self._dead or not self._stop:
                 return
             self._stop = False
-        self._t = threading.Thread(target=self._run, daemon=True)
-        self._t.start()
+        self._wake.set()
+        if self._t is None or not self._t.is_alive():
+            self._t = threading.Thread(target=self._run, daemon=True)
+            self._t.start()
 
     def stop(self):
         with self._lock:
             self._stop = True
+        self._wake.set()
         if self._t is not None:
             self._t.join(timeout=0.5)
-        sys.stderr.write("\r" + " " * 30 + "\r")
-        sys.stderr.flush()
+        if not self._dead:
+            sys.stderr.write("\r" + " " * 30 + "\r")
+            sys.stderr.flush()
+
+    def disable(self):
+        """Permanently stop drawing frames and clear the line (called once
+        real output starts streaming, so \r frames can't collide with text)."""
+        self.stop()          # clears the line while still "alive"
+        with self._lock:
+            self._dead = True
 
 
 _UI = {"spinner": None}
 
 
 def tool_open(name, args):
-    """Hermes-style tool divider: '─ ▸ name (args) ─────'. Dim, rule-only."""
+    """Compact tool line: '  ▸ name (args)' - dim, no full-width rule."""
     a = fmt_args(args)
     label = "▸ " + name + ((" (" + a + ")") if a else "")
-    _rule_dim(label)
+    _tool_line(label, HERMES_DIM)
 
 
 def tool_close(name, status, result):
-    """Close line of a tool block: '─ ✓ name -> summary ──────'."""
+    """Close line of a tool block: '  ✓ name → summary'."""
     mark = ("✓ " if status == "done" else "✗ ")
     label = mark + name
     if result is not None:
-        label += "  " + tool_summary(result)
-    _rule_dim(label)
+        s = tool_summary(result).replace("\n", " ").replace("\r", " ").strip()
+        s = " ".join(s.split())   # collapse runs of whitespace onto one line
+        if s:
+            label += " → " + s
+    _tool_line(label, HERMES_OK if status == "done" else HERMES_ERR)
 
 
 def on_tool(tool_id, name, args, result, status):
@@ -2736,11 +3180,11 @@ def run_agent_tui(history, cfg):
     try:
         for evt_type, evt_data in run_agent_stream(history, cfg):
             if evt_type == "text":
-                sp.set_msg("streaming")
+                sp.disable()   # kill the spinner BEFORE text lands (no \r collision)
                 content_parts.append(evt_data)
                 writer.feed(evt_data)
             elif evt_type == "tool_start":
-                sp.set_msg("running tools")
+                sp.disable()
                 tool_count += 1
                 tool_open(evt_data["name"], evt_data["args"])
             elif evt_type == "tool_end":
@@ -2889,7 +3333,7 @@ _SLASH_COMMANDS = [
     "/sessions", "/session", "/new", "/clear", "/context", "/compress",
     "/tools", "/todos", "/todo", "/memory", "/skills", "/skill",
     "/install_skill", "/feedback", "/reflect", "/self-test", "/improve",
-    "/multi", "/export", "/stop", "/exit", "/quit",
+    "/multi", "/export", "/redo", "/stop", "/exit", "/quit",
 ]
 
 
@@ -3119,6 +3563,7 @@ def cmd_help():
     print("    /compress              summarize older messages to free context now")
     print("    /multi                 multi-line input ('.' on its own line submits)")
     print("    /export                save the conversation as a text file")
+    print("    /redo                  re-run the last request (regenerates the answer)")
     print("    /provider [name]       list / add / switch provider profiles")
     print("    /provider rm <name>    delete a provider")
     print("    /config                edit the ACTIVE provider (base url, key, model, temp)")
@@ -3656,9 +4101,9 @@ ALVA_WORDMARK = (
 # Toolset grouping for the banner grid (mirrors Hermes' per-category tool panel).
 TOOLSETS = {
     "shell":   ["run_command"],
-    "files":   ["file_read", "file_write", "file_edit", "file_list"],
+    "files":   ["file_read", "file_write", "file_edit", "file_list", "file_search"],
     "skills":  ["skill_list", "skill_read", "skill_save"],
-    "memory":  ["memory_save", "memory_recall"],
+    "memory":  ["memory_save", "memory_recall", "memory_search", "memory_list"],
     "todos":   ["todo_add", "todo_list", "todo_toggle", "todo_remove"],
     "web":     ["web_fetch"],
     "system":  ["calculator", "get_time"],
@@ -3795,8 +4240,6 @@ def render_status_bar(state, session, elapsed, tools, history):
     # Hermes-style footer: dim '│' prefix + space-separated chips.
     print(col(C.DIM, "  " + "│".join([""] + parts)))
 
-def status_footer(state, session, elapsed, tools, history):
-    render_status_bar(state, session, elapsed, tools, history)
 
 def send_message(text, history, state, session):
     """Render the 'you' bubble, run the agent, manage context + sessions.
@@ -3848,7 +4291,7 @@ def send_message(text, history, state, session):
     if cfg.get("auto_compress", True):
         compressed = compress_now(history, cfg)
     tokens, window = context_usage(history, cfg)
-    status_footer(state, session, res.get("elapsed", 0.0), res.get("tools", 0), history)
+    render_status_bar(state, session, res.get("elapsed", 0.0), res.get("tools", 0), history)
     pct = tokens * 100 // window if window else 0
     if not compressed and window and pct >= 85:
         p_warn("context at %d%% of %s - /new starts a fresh session | /compress summarizes older messages"
@@ -3863,6 +4306,9 @@ def repl():
     # resume the last active session (conversations persist across restarts)
     session = _store_get(ACTIVE_SESSION_KEY) or "default"
     history = load_session(session)
+    # last completed turn, for /redo (session-scoped so it can't leak across
+    # a /session switch)
+    _last_turn = {"session": None, "text": None, "pre": None}
     while True:
         try:
             prompt = col(CUR_SKIN["accent"], "> ") if COLOR else "> "
@@ -3987,12 +4433,22 @@ def repl():
             elif c == "/stop":
                 cancel_agent()
                 p_info("stopping...")
+            elif c == "/redo":
+                if _last_turn.get("session") != session or _last_turn.get("text") is None:
+                    p_err("nothing to redo - send a message first (in this session)")
+                    continue
+                history[:] = _last_turn["pre"]
+                p_info("(re-running: %s)" % _last_turn["text"][:80])
+                session = send_message(_last_turn["text"], history, state, session)
             elif c in ("/exit", "/quit", "/q"):
                 break
             else:
                 p_err("unknown command: " + c + "   (/help for the list)")
             continue
 
+        _last_turn["session"] = session
+        _last_turn["text"] = line
+        _last_turn["pre"] = list(history)
         session = send_message(line, history, state, session)
         save_completion_history()  # persist input history after each turn
     save_session(session, history)
