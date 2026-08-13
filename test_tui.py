@@ -59,7 +59,7 @@ try:
     print("[mock server ready]")
 
     # ---------- tools registered ----------
-    assert_ok(len(pa.TOOLS) == 27, "27 tools registered")
+    assert_ok(len(pa.TOOLS) == 28, "28 tools registered")
 
     # ---------- calculator ----------
     assert_ok(pa.tool_calculator("6*7")["result"] == 42, "calculator: 6*7 = 42")
@@ -803,6 +803,175 @@ try:
     pa.setup_completion()
     assert_ok(_rl.get_current_history_length() == 3, "re-calling setup_completion does not duplicate history")
     os.remove(_htmp)
+
+    # ---------- resilience: tool error recovery hints ----------
+    # dispatch_tool must attach an actionable hint to failed tool results so
+    # the agent can switch strategy instead of blindly retrying.
+    _hint_ftp = pa.dispatch_tool("web_fetch", {"url": "ftp://x"})
+    assert_ok(_hint_ftp.get("error") and "http" in _hint_ftp.get("error", "")
+              and "hint" in _hint_ftp,
+              "web_fetch error result carries a recovery hint")
+    _hint_todo = pa.dispatch_tool("todo_toggle", {"index": 999})
+    assert_ok(_hint_todo.get("ok") is False and "hint" in _hint_todo,
+              "tool error dicts from the tool body get a hint too")
+    _hint_calc = pa.dispatch_tool("calculator", {"expression": "1/0"})
+    assert_ok(_hint_calc.get("error") and "hint" in _hint_calc,
+              "tool exceptions are wrapped with a hint")
+    _hint_unknown = pa.dispatch_tool("nope", {})
+    assert_ok(_hint_unknown.get("error") and "unknown tool" in _hint_unknown.get("error", ""),
+              "unknown tools still error cleanly (no hint needed)")
+
+    # ---------- observability: trace log ----------
+    # run_agent (used by the full-loop test above) should have written
+    # turn_start / tool / turn_end JSON lines to trace.log.
+    assert_ok(os.path.exists(pa.TRACE_PATH), "trace.log exists after agent turns")
+    _trace_lines = pa._read_trace(500)
+    _trace_all = "".join(_trace_lines)
+    assert_ok(len(_trace_lines) > 0 and '"ts"' in _trace_all,
+              "trace entries are JSON lines with a timestamp")
+    assert_ok('"event": "turn_start"' in _trace_all, "trace records turn_start")
+    assert_ok('"event": "tool"' in _trace_all, "trace records per-tool events")
+    assert_ok('"event": "turn_end"' in _trace_all, "trace records turn_end")
+    assert_ok(pa._trace_count() >= len(_trace_lines), "_trace_count agrees with _read_trace")
+
+    # ---------- resilience: circuit breaker + turn timeout (run_agent) ----------
+    # A tool that fails every time must stop the loop early instead of burning
+    # MAX_STEPS API calls on a strategy that is not working.
+    _orig_dispatch = pa.dispatch_tool
+    _orig_chat = pa.chat_completion
+    _orig_timeout = pa._TURN_TIMEOUT
+    _chat_calls = []
+
+    def _fail_dispatch(name, args):
+        return {"error": "boom"}
+
+    def _tool_chat(messages, config, tools=None):
+        _chat_calls.append(1)
+        return {"choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "t%d" % len(_chat_calls), "type": "function",
+             "function": {"name": "get_time", "arguments": "{}"}}]}}]}
+
+    pa.dispatch_tool = _fail_dispatch
+    pa.chat_completion = _tool_chat
+    try:
+        _breaker = json.loads(pa.run_agent(
+            json.dumps([{"role": "user", "content": "retry forever"}]), json.dumps(cfg)))
+        assert_ok("stopped early" in str(_breaker.get("content", "")),
+                  "circuit breaker stops after repeated tool failures")
+        assert_ok(len(_chat_calls) == pa._MAX_CONSEC_TOOL_FAILURES,
+                  "breaker fires at %d consecutive failures (not MAX_STEPS)"
+                  % pa._MAX_CONSEC_TOOL_FAILURES)
+    finally:
+        pa.dispatch_tool = _orig_dispatch
+        pa.chat_completion = _orig_chat
+        pa._TURN_TIMEOUT = _orig_timeout
+
+    # A turn that runs past the wall-clock budget must stop without another
+    # API call (no runaway 25-step x long-timeout turn).
+    pa._TURN_TIMEOUT = 0
+    pa.dispatch_tool = _orig_dispatch
+    pa.chat_completion = _tool_chat
+    _chat_calls[:] = []
+    try:
+        _timed = json.loads(pa.run_agent(
+            json.dumps([{"role": "user", "content": "slow"}]), json.dumps(cfg)))
+        assert_ok("time budget" in str(_timed.get("content", "")),
+                  "turn timeout stops a running turn")
+        assert_ok(len(_chat_calls) == 0, "timeout fires before the first API call")
+    finally:
+        pa.chat_completion = _orig_chat
+        pa._TURN_TIMEOUT = _orig_timeout
+
+    # ---------- resilience: circuit breaker + timeout (run_agent_stream) ----------
+    # Same guarantees on the streaming path used by the real TUI.
+    _fail_sse = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_fail",'
+        '"function":{"name":"calculator","arguments":"{\\"expression\\":\\"1\\"}"}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    )
+    _sse_calls = []
+
+    def _fail_urlopen(req, timeout=180):
+        _sse_calls.append(1)
+        return _FakeResp(_fail_sse)
+
+    pa.dispatch_tool = _fail_dispatch
+    pa.urllib.request.urlopen = _fail_urlopen
+    try:
+        _evs = list(pa.run_agent_stream([{"role": "user", "content": "loop"}], cfg_s))
+        _dn = [e for k, e in _evs if k == "done"][0]
+        assert_ok("stopped early" in str(_dn.get("content", "")),
+                  "streaming loop stops early on repeated tool failures")
+        assert_ok(len(_sse_calls) == pa._MAX_CONSEC_TOOL_FAILURES,
+                  "streaming breaker fires at %d requests, not MAX_STEPS"
+                  % pa._MAX_CONSEC_TOOL_FAILURES)
+    finally:
+        pa.dispatch_tool = _orig_dispatch
+        pa.urllib.request.urlopen = _orig_urlopen
+
+    pa._TURN_TIMEOUT = 0
+    pa.urllib.request.urlopen = _fail_urlopen
+    _sse_calls[:] = []
+    try:
+        _evs = list(pa.run_agent_stream([{"role": "user", "content": "slow"}], cfg_s))
+        _dn = [e for k, e in _evs if k == "done"][0]
+        assert_ok("time budget" in str(_dn.get("content", "")),
+                  "streaming turn respects the wall-clock timeout")
+        assert_ok(len(_sse_calls) == 0, "streaming timeout fires before any request")
+    finally:
+        pa.urllib.request.urlopen = _orig_urlopen
+        pa._TURN_TIMEOUT = _orig_timeout
+
+    # trace.log also carries the breaker/timeout events above
+    _tail = pa._read_trace(50)
+    assert_ok(any("circuit_breaker" in ln for ln in _tail),
+              "trace logs the circuit-breaker stop reason")
+    assert_ok(any("timeout" in ln for ln in _tail),
+              "trace logs the timeout stop reason")
+
+    # ---------- run_python: sandboxed subprocess tool ----------
+    # The tool is registered (it was advertised to the model but not
+    # dispatched - a real bug) and executes in a child process with a timeout,
+    # an output cap, and the permission gate.
+    _rp = pa.dispatch_tool("run_python", {"code": "print(6*7)"})
+    assert_ok(_rp.get("ok") is True and "42" in _rp.get("output", ""),
+              "run_python is dispatched and executes (regression: was unregistered)")
+    _rp2 = pa.dispatch_tool("run_python", {"code": "import os; print(os.getcwd())"})
+    assert_ok(_rp2.get("ok") is False and "permission" in _rp2.get("error", ""),
+              "run_python asks permission for device-touching code (headless denies)")
+    assert_ok(pa.classify_python("x = [i*i for i in range(10)]") == "allow",
+              "classify_python allows pure computation")
+    assert_ok(pa.classify_python("import shutil; shutil.rmtree('/x')") == "ask",
+              "classify_python flags shutil/rmtree")
+    assert_ok(pa.classify_python("open('/sdcard/x', 'w')") == "ask",
+              "classify_python flags filesystem access")
+    assert_ok(pa.classify_python("print(eval('2+2'))") == "ask",
+              "classify_python flags eval")
+    # infinite loop: killed by the timeout (not a hung agent)
+    _orig_py_to = pa._PY_RUN_TIMEOUT
+    pa._PY_RUN_TIMEOUT = 1
+    try:
+        _t0 = time.monotonic()
+        _rp3 = pa.dispatch_tool("run_python", {"code": "while True: pass"})
+        _dt3 = time.monotonic() - _t0
+        assert_ok(_rp3.get("ok") is False and "timed out" in _rp3.get("error", "")
+                  and _dt3 < 15,
+                  "run_python kills runaway loops via the timeout (%.1fs)" % _dt3)
+    finally:
+        pa._PY_RUN_TIMEOUT = _orig_py_to
+    # output flood: killed by the byte cap, truncated before it hits the agent
+    _orig_py_max = pa._PY_MAX_BYTES
+    pa._PY_MAX_BYTES = 1024
+    try:
+        _rp4 = pa.dispatch_tool("run_python", {"code": "print('x' * 100000)"})
+        assert_ok(_rp4.get("ok") is False and "cap" in _rp4.get("error", ""),
+                  "run_python caps runaway output")
+    finally:
+        pa._PY_MAX_BYTES = _orig_py_max
+    # stdout truncation for sane-but-large outputs
+    _rp5 = pa.dispatch_tool("run_python", {"code": "print('a' * 9000)"})
+    assert_ok(_rp5.get("ok") is True and "... (truncated)" in _rp5.get("output", ""),
+              "run_python truncates large outputs to _PY_MAX_CHARS")
 
     print("\nALL TESTS PASSED ✓" if failures == 0 else "\n%d TEST(S) FAILED ✗" % failures)
     sys.exit(0 if failures == 0 else 1)

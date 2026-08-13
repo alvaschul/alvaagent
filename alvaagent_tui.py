@@ -130,6 +130,7 @@ _LEGACY_DIRS = [
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 STORE_PATH = os.path.join(DATA_DIR, "store.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "cmd_history.txt")
+TRACE_PATH = os.path.join(DATA_DIR, "trace.log")
 
 PROVIDERS = {
     "openai":     {"label": "OpenAI",                   "base": "https://api.openai.com/v1",                      "model": "gpt-4o-mini"},
@@ -1349,6 +1350,100 @@ def tool_calculator(expression):
     return {"ok": True, "expression": expression, "result": result}
 
 
+_PY_RUN_TIMEOUT = 120     # wall-clock seconds for the python child (like run_command)
+_PY_MAX_BYTES = 200_000   # hard cap on bytes read from the child before we kill it
+_PY_MAX_CHARS = 5000      # chars of output returned to the agent
+
+
+def classify_python(code):
+    """allow / ask for Python code (best-effort risk scan).
+
+    Code that only computes (math, strings, pure data) runs freely; code that
+    can touch the device - imports of os/subprocess/shutil/sys, filesystem
+    access, exec/eval/__import__, path strings outside /tmp - asks the user
+    first, mirroring classify_command's deny-by-default stance.
+    """
+    import re as _re
+    low = _re.sub(r"#[^\n]*", "", str(code))
+    patterns = (
+        r"\b(import|from)\s+(os|sys|subprocess|shutil|pathlib|builtins)\b",
+        r"\b__import__\s*\(|\beval\s*\(|\bexec\s*\(|\bglobals\s*\(|\blocals\s*\(|\bvars\s*\(",
+        r"\bopen\s*\(",
+        r"\bos\.\s*(system|popen|remove|unlink|rmdir|removedirs|rename|replace|chmod|chown|"
+        r"listdir|scandir|walk|makedirs|mkdir|symlink|kill)\b",
+        r"\bshutil\.\s*(rmtree|move|copy|copy2|copyfile|copytree|chown)\b",
+        r"\bsubprocess\.\s*[A-Za-z_]+|\bPopen\b|\bcheck_output\b|\bcheck_call\b|\bgetoutput\b",
+        r"[\"']/(?:sdcard|data|etc|root|bin|system)|[\"']\.\./|[\"']/tmp/",
+    )
+    for p in patterns:
+        if _re.search(p, low):
+            return "ask"
+    return "allow"
+
+
+def tool_run_python(code):
+    """Execute Python code in a child process and return the output.
+
+    The code runs under `python -c` in a separate process with a wall-clock
+    timeout and a hard output cap, so runaway loops or huge prints can't hang
+    the agent. Code that touches the device asks the user first (same as
+    run_command). Pure computation runs freely.
+    """
+    code = str(code).strip()
+    if not code:
+        return {"ok": False, "error": "empty code"}
+    if len(code) > 10000:
+        return {"ok": False, "error": "code too long (>10000 chars)"}
+    if classify_python(code) == "ask" and not _permission("run python: %s" % code[:160]):
+        return {"ok": False, "error": "permission denied by user"}
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    out = []
+    total = 0
+    deadline = time.monotonic() + _PY_RUN_TIMEOUT
+    reason = None
+    try:
+        while proc.poll() is None:
+            if _cancel_flag[0]:
+                proc.kill()
+                reason = "cancelled by user"
+                break
+            if time.monotonic() > deadline:
+                proc.kill()
+                reason = "timed out after %ds" % _PY_RUN_TIMEOUT
+                break
+            rlist, _, _ = select.select([proc.stdout], [], [], _STREAM_POLL)
+            if rlist:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                out.append(chunk.decode("utf-8", errors="replace"))
+                if total > _PY_MAX_BYTES:
+                    proc.kill()
+                    reason = "output exceeded the %d-byte cap" % _PY_MAX_BYTES
+                    break
+        proc.wait(timeout=5)
+        tail = proc.stdout.read()
+        if tail:
+            total += len(tail)
+            out.append(tail.decode("utf-8", errors="replace"))
+    except Exception as e:
+        reason = "%s: %s" % (type(e).__name__, e)
+    rc = proc.returncode
+    output = "".join(out)
+    if len(output) > _PY_MAX_CHARS:
+        output = output[:_PY_MAX_CHARS] + "\n... (truncated)"
+    if reason:
+        return {"ok": False, "error": reason, "exit": rc, "output": output[:5000]}
+    return {"ok": rc == 0, "exit": rc, "output": (output or "(no output)"), "chars": len(output)}
+
+
+
 TOOLS = [
     {"type": "function", "function": {
         "name": "calculator",
@@ -1356,6 +1451,12 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "expression": {"type": "string", "description": "Math expression to evaluate, e.g. 'sqrt(2**10) + 3*4'"}},
             "required": ["expression"]}}},
+    {"type": "function", "function": {
+        "name": "run_python",
+        "description": "Execute Python code in a sandboxed child process and return stdout/stderr. Use for calculations, data processing, or any pure-Python task. Runs with a 120s timeout and output cap. Code that imports os/subprocess/shutil/sys, touches the filesystem, or uses exec/eval asks the user for permission first (like run_command).",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Python code to execute"}},
+            "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "web_fetch",
         "description": "Fetch and read the text content of a URL (http/https only). Returns status code and a text snippet.",
@@ -1523,6 +1624,7 @@ TOOL_IMPL = {
     "todo_toggle": lambda a: tool_todo_toggle(a.get("index")),
     "todo_remove": lambda a: tool_todo_remove(a.get("index")),
     "run_command": lambda a: tool_run_command(a.get("command")),
+    "run_python": lambda a: tool_run_python(a.get("code")),
     "file_read": lambda a: tool_file_read(a.get("path")),
     "file_write": lambda a: tool_file_write(a.get("path"), a.get("content")),
     "file_edit": lambda a: tool_file_edit(a.get("path"), a.get("old"), a.get("new")),
@@ -1543,14 +1645,26 @@ TOOL_IMPL = {
 }
 
 
+
+_TOOL_ERROR_HINTS = {
+    "web_fetch": "hint: the URL is unreachable or the site blocks bots; try a different/mobile URL, or run_command('curl -sL <url>') as a fallback",
+    "run_command": "hint: the command was blocked or failed; retry a read-only variant, or ask the user to approve/run it themselves",
+    "file_read": "hint: check the absolute path exists and is readable (file_search finds the right path)",
+    "file_write": "hint: the path may be outside the project or unwritable; try a path inside the project folder",
+}
+
 def dispatch_tool(name, args):
     fn = TOOL_IMPL.get(name)
     if fn is None:
         return {"error": "unknown tool: %s" % name}
     try:
-        return fn(args)
+        result = fn(args)
+        if isinstance(result, dict) and not result.get("ok", True) and "hint" not in result:
+            result["hint"] = _TOOL_ERROR_HINTS.get(name, "")
+        return result
     except Exception as e:
-        return {"error": "%s: %s" % (type(e).__name__, e)}
+        return {"error": "%s: %s" % (type(e).__name__, e),
+                "hint": _TOOL_ERROR_HINTS.get(name, "check the tool arguments and try again")}
 
 
 # ---------------- LLM client (OpenAI-compatible) ----------------
@@ -1910,6 +2024,8 @@ def fetch_models(base_url, api_key, timeout=20):
 
 # ---------------- agent loop ----------------
 MAX_STEPS = 25
+_TURN_TIMEOUT = 180
+_MAX_CONSEC_TOOL_FAILURES = 4
 _cancel_flag = [False]
 ON_TOOL = None  # optional hook: ON_TOOL(tool_id, name, args, result, status)
 
@@ -1964,6 +2080,51 @@ def _repair_tool_pairs(history):
     return out
 
 
+
+_TRACE_MAX_LINES = 2000      # cap for trace.log
+_TRACE_MAX_BYTES = 1_000_000  # cap before trace.log is trimmed back
+
+
+def _trace(entry):
+    """Append one JSON line to trace.log.
+
+    Best-effort and never raises; the log is capped (line + byte limits) so it
+    can't grow without bound on a phone.
+    """
+    try:
+        import datetime as _dt
+        rec = dict(entry)
+        rec.setdefault("ts", _dt.datetime.now().isoformat(timespec="seconds"))
+        line = json.dumps(rec, ensure_ascii=False)
+        with open(TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        if os.path.getsize(TRACE_PATH) > _TRACE_MAX_BYTES:
+            with open(TRACE_PATH, encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(TRACE_PATH, "w", encoding="utf-8") as f:
+                f.writelines(lines[-_TRACE_MAX_LINES:])
+    except Exception:
+        pass
+
+
+def _read_trace(limit=15):
+    """Return the last `limit` non-empty trace.log lines, oldest first."""
+    try:
+        with open(TRACE_PATH, encoding="utf-8") as f:
+            lines = [ln for ln in f if ln.strip()]
+    except Exception:
+        return []
+    return lines[-limit:]
+
+
+def _trace_count():
+    """Count total lines in trace.log."""
+    try:
+        with open(TRACE_PATH, encoding="utf-8") as f:
+            return sum(1 for ln in f if ln.strip())
+    except Exception:
+        return 0
+
 def _report_tool(tool_id, name, args, result, status):
     if ON_TOOL is not None:
         try:
@@ -1987,9 +2148,18 @@ def run_agent(history_json, config_json):
             continue
         messages.append(dict(m))
 
+    consec_failures = 0
+    _t0 = time.monotonic()
+    _trace({"event": "turn_start", "steps": 0})
     for step in range(MAX_STEPS):
         if _cancel_flag[0]:
+            _trace({"event": "turn_end", "reason": "cancelled", "steps": step})
             return json.dumps({"content": "(stopped by user)", "history": messages, "cancelled": True})
+        if _TURN_TIMEOUT <= 0 or time.monotonic() - _t0 > _TURN_TIMEOUT:
+            note = "(stopped: the turn exceeded the %d-second time budget)" % int(_TURN_TIMEOUT)
+            messages.append({"role": "assistant", "content": note})
+            _trace({"event": "turn_end", "reason": "timeout", "steps": step})
+            return json.dumps({"content": note, "history": messages, "cancelled": False})
         data = chat_completion(messages, config, tools=TOOLS)
         msg = data["choices"][0]["message"]
         if msg.get("content") is None:
@@ -1998,10 +2168,12 @@ def run_agent(history_json, config_json):
 
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
+            _trace({"event": "turn_end", "reason": "answer", "steps": step + 1})
             return json.dumps({"content": msg.get("content") or "", "history": messages, "cancelled": False})
 
         for tc in tool_calls:
             if _cancel_flag[0]:
+                _trace({"event": "turn_end", "reason": "cancelled", "steps": step + 1})
                 return json.dumps({"content": "(stopped by user)", "history": messages, "cancelled": True})
             fn = tc.get("function", {})
             name = fn.get("name", "?")
@@ -2013,11 +2185,25 @@ def run_agent(history_json, config_json):
                 args = {}
             tool_id = tc.get("id", "?")
             _report_tool(tool_id, name, args, None, "running")
+            _trace({"event": "tool", "name": name, "args": args})
             result = dispatch_tool(name, args)
             status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
+            if status == "error":
+                consec_failures += 1
+            else:
+                consec_failures = 0
+            _trace({"event": "tool", "name": name, "status": status})
             _report_tool(tool_id, name, args, result, status)
             messages.append({"role": "tool", "tool_call_id": tool_id, "content": json.dumps(result)})
 
+        if consec_failures >= _MAX_CONSEC_TOOL_FAILURES:
+            _trace({"event": "turn_end", "reason": "circuit_breaker", "steps": step + 1,
+                    "consec_failures": consec_failures})
+            note = "(stopped early: %d tools in a row failed - the current approach is not working)" % consec_failures
+            messages.append({"role": "assistant", "content": note})
+            return json.dumps({"content": note, "history": messages, "cancelled": False})
+
+    _trace({"event": "turn_end", "reason": "max_steps", "steps": MAX_STEPS})
     return json.dumps({"content": "(reached the maximum number of tool steps)", "history": messages, "cancelled": False})
 
 
@@ -2125,9 +2311,19 @@ def run_agent_stream(history, config):
             continue
         messages.append(dict(m))
 
+    consec_failures = 0
+    _t0 = time.monotonic()
+    _trace({"event": "turn_start", "steps": 0})
     for step in range(MAX_STEPS):
         if _cancel_flag[0]:
+            _trace({"event": "turn_end", "reason": "cancelled", "steps": step})
             yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
+            return
+        if _TURN_TIMEOUT <= 0 or time.monotonic() - _t0 > _TURN_TIMEOUT:
+            note = "(stopped: the turn exceeded the %d-second time budget)" % int(_TURN_TIMEOUT)
+            messages.append({"role": "assistant", "content": note})
+            _trace({"event": "turn_end", "reason": "timeout", "steps": step})
+            yield "done", {"content": note, "history": messages, "cancelled": False}
             return
 
         # Use streaming to detect tool calls and collect text
@@ -2172,8 +2368,14 @@ def run_agent_stream(history, config):
                     args = {}
                 tool_id = tc.get("id", "?")
                 yield "tool_start", {"name": name, "args": args}
+                _trace({"event": "tool", "name": name, "args": args})
                 result = dispatch_tool(name, args)
                 status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
+                if status == "error":
+                    consec_failures += 1
+                else:
+                    consec_failures = 0
+                _trace({"event": "tool", "name": name, "status": status})
                 yield "tool_end", {"name": name, "args": args, "result": result, "status": status}
                 messages.append({"role": "tool", "tool_call_id": tool_id, "content": json.dumps(result)})
         elif has_xml:
@@ -2184,15 +2386,30 @@ def run_agent_stream(history, config):
                     yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
                     return
                 yield "tool_start", {"name": name, "args": args}
+                _trace({"event": "tool", "name": name, "args": args})
                 result = dispatch_tool(name, args)
                 status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
+                if status == "error":
+                    consec_failures += 1
+                else:
+                    consec_failures = 0
+                _trace({"event": "tool", "name": name, "status": status})
                 yield "tool_end", {"name": name, "args": args, "result": result, "status": status}
                 messages.append({"role": "tool", "tool_call_id": "xml_%d" % i, "content": json.dumps(result)})
         else:
             messages.append(msg)
+            _trace({"event": "turn_end", "reason": "answer", "steps": step + 1})
             yield "done", {"content": msg["content"], "history": messages, "cancelled": False}
             return
 
+        if consec_failures >= _MAX_CONSEC_TOOL_FAILURES:
+            note = "(stopped early: %d tools in a row failed - the current approach is not working)" % consec_failures
+            messages.append({"role": "assistant", "content": note})
+            _trace({"event": "turn_end", "reason": "circuit_breaker", "steps": step + 1, "consec_failures": consec_failures})
+            yield "done", {"content": note, "history": messages, "cancelled": False}
+            return
+
+    _trace({"event": "turn_end", "reason": "max_steps", "steps": MAX_STEPS})
     yield "done", {"content": "(reached the maximum number of tool steps)", "history": messages, "cancelled": False}
 
 
@@ -2215,6 +2432,13 @@ def self_test():
         tool_todo_remove(r["index"])
     checks.append(("memory", tool_memory_recall("__no_such_key__")["found"] is False))
     checks.append(("clock", isinstance(tool_get_time(), dict) and "iso" in tool_get_time()))
+
+    # run_python: dispatched, sandboxed, permission-gated
+    try:
+        checks.append(("run_python_dispatch", tool_run_python("print(2+2)").get("output") == "4\n"))
+    except Exception:
+        checks.append(("run_python_dispatch", False))
+    checks.append(("run_python_gate", classify_python("import os") == "ask"))
 
     # skills: list should work
     try:
@@ -4178,7 +4402,7 @@ ALVA_WORDMARK = (
 
 # Toolset grouping for the banner grid (mirrors Hermes' per-category tool panel).
 TOOLSETS = {
-    "shell":   ["run_command"],
+    "shell":   ["run_command", "run_python"],
     "files":   ["file_read", "file_write", "file_edit", "file_list", "file_search"],
     "skills":  ["skill_list", "skill_read", "skill_save"],
     "memory":  ["memory_save", "memory_recall", "memory_search", "memory_list"],

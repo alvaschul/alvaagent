@@ -17,7 +17,13 @@ Built for Termux, runs offline-friendly, and survives flaky mobile connections.
   feedback/improvement/reflect, self_test.
 - **Resilient by default**: automatic retry with backoff on flaky mobile
   connections (transient HTTP 408/409/429/5xx, timeouts, dropped links), a
-  stall watchdog for streams, and a `/redo` command to replay the last turn.
+  stall watchdog for streams, a `/redo` command to replay the last turn, a
+  15-minute per-turn budget, and a circuit breaker that stops the agent after
+  repeated tool failures instead of burning through the whole step budget.
+- **Observable**: every agent turn and tool call (name, status, latency) is
+  logged to `.alvaagent/trace.log` (JSON-lines, auto-capped) — view it with
+  `/trace [n]` or `cat .alvaagent/trace.log`. Failed tools also return a
+  recovery hint to the agent so it can switch strategy.
 - **Provider profiles**: point at any OpenAI-compatible endpoint. Each
   `/provider` is a saved named profile, switchable anytime.
 - **Sessions** persist to `store.json` (auto-pruned to the newest 30);
@@ -83,7 +89,8 @@ you> /sessions     # list saved conversations
 
 Slash commands: `/help /config /provider /models /test /tools /todos /todo
 /memory /skin /sessions /session /new /clear /context /compress /multi /export
-/stop /exit`. `Ctrl+C` cancels a running request; Tab completes slash commands.
+/stop /trace /exit`. `Ctrl+C` cancels a running request; Tab completes slash
+commands.
 **Command history persists across restarts** (up-arrow recalls previous inputs) —
 stored in `.alvaagent/cmd_history.txt`.
 
@@ -109,6 +116,7 @@ tests for the command classifier and atomic store writes).
 - `test_tui.py` — headless test suite (run it to verify your build)
 - `start.sh` — `bash start.sh tui` launches the terminal client
 - `.alvaagent/` — runtime config + store (gitignored, regenerated on first run)
+- `.alvaagent/trace.log` — agent trace (JSON-lines, auto-capped, gitignored via `*.log`)
 
 ## Updating
 ```bash
