@@ -4367,17 +4367,33 @@ def send_message(text, history, state, session):
         p_info("(request stopped)")
         save_session(session, history)
         return session
-    if not res.get("streamed"):
-        content = (res.get("content") or "").strip()
-        if content:
+    streamed = bool(res.get("streamed"))
+    tools = res.get("tools", 0)
+    content = (res.get("content") or "").strip()
+    if not streamed and not tools:
+        # Dead turn: no text streamed and no tool calls. This is either a
+        # failed request (run_agent_stream caught a RuntimeError and yielded
+        # content="error: ...") or a gateway that answered with empty content.
+        # Remove the unanswered user message (and any trailing empty assistant
+        # ghost) so failed/empty turns don't pile up as consecutive duplicates
+        # in the session - retrying via Up+Enter previously stacked one ghost
+        # per attempt, which looked like the message was being duplicated.
+        while history and history[-1].get("role") == "assistant":
+            if history[-1].get("content") or history[-1].get("tool_calls"):
+                break
+            history.pop()
+        if history and history[-1].get("role") == "user":
+            history.pop()
+        save_session(session, history)
+        if content.startswith("error:"):
             render_agent_panel(content)
-        elif not res.get("tools"):
-            # no streamed text AND no tool calls = a dead turn (empty/ignored
-            # response, or a gateway that didn't answer). Say so loudly instead
-            # of leaving the user staring at a blank line (which used to prompt
-            # resending the same message, piling duplicates into the session).
+            p_warn("the turn failed - your message was not saved (retry when the endpoint is back)")
+        else:
             p_warn("the model returned an empty response - is the endpoint/streaming working?"
-                   "  (your message was kept in the session)")
+                   "  (your message was not saved - retry)")
+        return session
+    if content and not streamed:
+        render_agent_panel(content)
     # post-turn: auto-compress if the response pushed us past the threshold
     compressed = False
     if cfg.get("auto_compress", True):

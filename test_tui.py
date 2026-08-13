@@ -524,6 +524,69 @@ try:
         finally:
             pa.urllib.request.urlopen = _orig_urlopen
 
+    # ---------- UX: dead turns (failed/empty) must not persist ghost messages ----------
+    # A failed request or empty response previously left the unanswered user
+    # message in the session; retrying the same message then stacked consecutive
+    # duplicates. send_message must drop the user message (and any empty
+    # assistant ghost) on such turns.
+    _save_calls = []
+    _orig_send_deps = {
+        "active_cfg": pa.active_cfg,
+        "run_agent_tui": pa.run_agent_tui,
+        "compress_now": pa.compress_now,
+        "render_agent_panel": pa.render_agent_panel,
+        "render_status_bar": pa.render_status_bar,
+        "print_user_turn": pa.print_user_turn,
+        "context_usage": pa.context_usage,
+        "save_session": pa.save_session,
+    }
+    pa.active_cfg = lambda st: {"auto_compress": False, "temperature": 0.7,
+                                "base_url": "http://x/v1", "api_key": "k", "model": "m"}
+    pa.compress_now = lambda *a, **k: False
+    pa.render_agent_panel = lambda *a, **k: None
+    pa.render_status_bar = lambda *a, **k: None
+    pa.print_user_turn = lambda *a, **k: None
+    pa.context_usage = lambda *a, **k: (0, 128000)
+    pa.save_session = lambda name, msgs: _save_calls.append((name, [dict(m) for m in msgs]))
+
+    def _fake_run(res):
+        pa.run_agent_tui = lambda history, cfg: res
+
+    _state = {"active": "p", "profiles": {"p": {}}}
+    _session = "default"
+
+    _sess_hist = [{"role": "user", "content": "helo"}]
+    _failed_res = {"content": "error: LLM API unreachable: boom", "history": [{"role": "system", "content": "s"}] + _sess_hist,
+                   "cancelled": False, "streamed": False, "tools": 0}
+    _fake_run(_failed_res)
+    _save_calls[:] = []
+    pa.send_message("helo", _sess_hist, _state, _session)
+    assert_ok(all(m.get("role") != "user" for m in _sess_hist),
+              "failed turn drops the unanswered user message (no ghost duplicate)")
+
+    _empty_hist = [{"role": "user", "content": "helo"},
+                   {"role": "assistant", "content": ""}]
+    _empty_res = {"content": "", "history": [{"role": "system", "content": "s"}] + _empty_hist,
+                  "cancelled": False, "streamed": False, "tools": 0}
+    _fake_run(_empty_res)
+    _sess_hist = [{"role": "user", "content": "helo"},
+                  {"role": "assistant", "content": ""}]
+    pa.send_message("helo", _sess_hist, _state, _session)
+    assert_ok(_sess_hist == [],
+              "empty response drops both the user message and the empty assistant ghost")
+
+    _good_hist = [{"role": "user", "content": "helo"}]
+    _good_res = {"content": "Hey!", "history": [{"role": "system", "content": "s"}] + _good_hist +
+                 [{"role": "assistant", "content": "Hey!"}],
+                 "cancelled": False, "streamed": False, "tools": 0}
+    _fake_run(_good_res)
+    pa.send_message("helo", _good_hist, _state, _session)
+    assert_ok(len(_good_hist) == 2 and _good_hist[0]["role"] == "user" and _good_hist[1]["content"] == "Hey!",
+              "successful turn keeps user + assistant messages")
+
+    for _k, _v in _orig_send_deps.items():
+        setattr(pa, _k, _v)
+
     # ---------- resilience: retry/backoff on transient API failures ----------
     _orig_sleep = pa._sleep_retry
     pa._sleep_retry = lambda a: None
