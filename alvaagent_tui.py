@@ -821,6 +821,45 @@ def _skill_filepath(category, name):
     return os.path.join(SKILLS_DIR, name + ".md")
 
 
+def _inside_skills(path):
+    """True when `path` (realpath) lives inside SKILLS_DIR. Guards every
+    skill-path operation against `..` traversal writing/reading/deleting
+    files elsewhere on the device."""
+    real = os.path.realpath(path)
+    base = os.path.realpath(SKILLS_DIR)
+    return real == base or real.startswith(base + os.sep)
+
+
+def _resolve_skill_path(name):
+    """Map a skill name to a real .md file inside SKILLS_DIR.
+
+    Accepts flat ("frontend-design"), category/name ("brainstorming/x"), and
+    the frontmatter name of a categorized skill ("brainstorming", which lives
+    at skills/brainstorming/SKILL.md). Returns the resolved absolute path, or
+    None when nothing matches / the path escapes SKILLS_DIR.
+    """
+    category, skill_name = _detect_category(str(name))
+    if skill_name:
+        direct = os.path.realpath(_skill_filepath(category, skill_name))
+        if os.path.isfile(direct) and _inside_skills(direct):
+            return direct
+    # Fallback: scan the index and match by frontmatter name (+ category when
+    # the caller qualified it). This is how categorized files whose filename
+    # differs from their `name:` (e.g. category/SKILL.md) stay reachable.
+    want = str(name).strip().lower()
+    for info in _skill_list_all():
+        nm = str(info.get("name") or "").lower()
+        if nm != want:
+            continue
+        cat = str(info.get("category") or "").lower()
+        if category and cat != category.lower():
+            continue
+        p = os.path.realpath(os.path.join(SKILLS_DIR, info["file"]))
+        if _inside_skills(p):
+            return p
+    return None
+
+
 def _skill_read(path):
     """Parse a skill .md file into its metadata dict plus the body the agent
     applies. Returns None when the file is missing or unreadable. This backs
@@ -833,8 +872,11 @@ def _skill_read(path):
     except Exception:
         return None
     fm, body = _parse_frontmatter(text)
+    # Skills without a `name:` frontmatter key still deserve a usable name:
+    # fall back to the filename so the banner and /skills can't crash on None.
+    name = fm.get("name") or os.path.splitext(os.path.basename(path))[0]
     return {
-        "name": fm.get("name"),
+        "name": name,
         "description": fm.get("description"),
         "version": fm.get("version"),
         "author": fm.get("author"),
@@ -904,13 +946,15 @@ def tool_skill_read(name):
     name = str(name).strip()
     if not name:
         return {"ok": False, "error": "empty name"}
-    category, skill_name = _detect_category(name)
-    path = _skill_filepath(category, skill_name)
+    path = _resolve_skill_path(name)
+    if path is None:
+        return {"ok": False, "error": "no such skill: %s" % name}
     info = _skill_read(path)
     if info is None:
         return {"ok": False, "error": "no such skill: %s" % name}
-    info["category"] = category
-    info["file"] = os.path.relpath(path, SKILLS_DIR)
+    rel = os.path.relpath(path, SKILLS_DIR)
+    info["category"] = os.path.dirname(rel) if "/" in rel else None
+    info["file"] = rel
     return {"ok": True, **info}
 
 
@@ -922,13 +966,14 @@ def tool_skill_remove(name):
     name = str(name).strip()
     if not name:
         return {"ok": False, "error": "empty name"}
-    category, skill_name = _detect_category(name)
-    path = _skill_filepath(category, skill_name)
-    if not os.path.isfile(path):
+    path = _resolve_skill_path(name)
+    if path is None or not _inside_skills(path):
         return {"ok": False, "error": "no such skill: %s" % name}
     try:
         os.remove(path)
-        return {"ok": True, "name": skill_name, "category": category}
+        return {"ok": True, "name": os.path.splitext(os.path.basename(path))[0],
+                "category": os.path.dirname(os.path.relpath(path, SKILLS_DIR))
+                if "/" in os.path.relpath(path, SKILLS_DIR) else None}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -968,7 +1013,8 @@ def tool_skill_save(name, content, category=None):
         return {"ok": False, "error": "invalid skill name: %r (use category kwarg for folders)" % name}
     if category:
         cat = str(category).strip()
-        if "/" in cat or "\\" in cat or not cat:
+        # `..` and absolute paths must not escape SKILLS_DIR
+        if "/" in cat or "\\" in cat or not cat or ".." in cat.split(os.sep) or cat.startswith("/"):
             return {"ok": False, "error": "invalid category: %r" % category}
     else:
         cat = None
@@ -1286,6 +1332,10 @@ def tool_calculator(expression):
         raise ValueError("expression too long")
     tree = ast.parse(expression, mode="eval")
     result = _fmt_num(_calc_eval(tree))
+    # complex results (e.g. (-8)**0.5) aren't JSON-serializable and would
+    # crash the request when the tool result is placed in the chat history.
+    if isinstance(result, complex):
+        raise ValueError("result is complex - not supported")
     if isinstance(result, (int, float)) and not isinstance(result, bool):
         try:
             if isinstance(result, float) and not math.isfinite(result):
@@ -1296,7 +1346,7 @@ def tool_calculator(expression):
                 raise ValueError("result too large to display")
         except (OverflowError, ValueError) as e:
             raise ValueError(str(e))
-    return {"expression": expression, "result": result}
+    return {"ok": True, "expression": expression, "result": result}
 
 
 TOOLS = [
@@ -3101,6 +3151,7 @@ class Spinner:
                     return
                 msg = self.msg
             sys.stderr.write("\r" + msg + " " + frames[i % 4])
+            sys.stderr.flush()  # \r frames must land now, not sit in the buffer
             i += 1
             self._wake.wait(0.12)
             self._wake.clear()
@@ -3391,7 +3442,7 @@ def cmd_context(state, rest, history):
             return
         try:
             w = int(float(val))
-        except ValueError:
+        except (ValueError, OverflowError):
             p_err("usage: /context window <tokens>  (0 = auto-detect from the model)")
             return
         cfg["context_window"] = w
@@ -3434,11 +3485,11 @@ def cmd_self_test():
     Tests calculator, sandbox, todo, memory, skills, command classification,
     file tools, and the feedback/improvement/reflect tools.
     """
-    import json
     tests = [
         ("calculator basic", lambda: _check(tool_calculator("2+2")["ok"])),
         ("calculator sqrt", lambda: _check(tool_calculator("sqrt(144)")["ok"])),
-        ("sandbox rejects div0", lambda: _check(tool_calculator("1/0")["ok"] is False)),
+        ("sandbox rejects div0", lambda: _check(_raises(lambda: tool_calculator("1/0")))),
+        ("sandbox rejects complex", lambda: _check(_raises(lambda: tool_calculator("(-8)**0.5")))),
         ("todo add+list+remove", lambda: _check(_todo_check())),
         ("memory save+recall", lambda: _check(_mem_check())),
         ("skills list+read", lambda: _check(_skill_check())),
@@ -3476,6 +3527,16 @@ def _check(cond):
     return bool(cond)
 
 
+def _raises(fn):
+    """True when calling fn() raises an exception (used by self-test entries
+    that assert a tool rejects bad input)."""
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
 def _todo_check():
     r = tool_todo_add("self-test-todo")
     if not r.get("ok"):
@@ -3505,8 +3566,9 @@ def _skill_check():
 
 
 def _file_write_check():
-    import tempfile
-    tmp = os.path.join(tempfile.gettempdir(), ".alva_sst_write.txt")
+    # stay inside PROJECT_DIR: /tmp is out-of-project and would trigger a
+    # permission prompt (or a headless deny), which a self-test shouldn't do
+    tmp = os.path.join(PROJECT_DIR, ".alva_sst_write.txt")
     r = tool_file_write(tmp, "test")
     if not r.get("ok"):
         return False
@@ -3519,8 +3581,7 @@ def _file_write_check():
 
 
 def _file_edit_check():
-    import tempfile
-    tmp = os.path.join(tempfile.gettempdir(), ".alva_sst_edit.txt")
+    tmp = os.path.join(PROJECT_DIR, ".alva_sst_edit.txt")
     tool_file_write(tmp, "hello world")
     r = tool_file_edit(tmp, "hello", "goodbye")
     if not r.get("ok"):
@@ -3618,7 +3679,7 @@ def cmd_config(state):
         pass
     try:
         cfg["context_window"] = int(float(ask("context window (tokens, 0=auto)", str(cfg.get("context_window") or 0))))
-    except ValueError:
+    except (ValueError, OverflowError):
         pass
     ac = ask("auto-compress near the context limit (y/n)",
              "y" if cfg.get("auto_compress", True) else "n").strip().lower()
@@ -4067,6 +4128,11 @@ def setup_completion():
         if os.path.exists(HISTORY_PATH):
             readline.read_history_file(HISTORY_PATH)
         readline.set_history_length(2000)  # keep last 2000 entries
+        # '/' is a completer delimiter by default, so typing /he<Tab> hands the
+        # completer 'he' and _slash_complete's startswith("/") check never
+        # fires. Remove it so slash commands actually complete.
+        delims = readline.get_completer_delims().replace("/", "")
+        readline.set_completer_delims(delims)
         readline.set_completer(_slash_complete)
         readline.parse_and_bind("tab: complete")
     except Exception as e:
@@ -4116,6 +4182,13 @@ TOOLSETS = {
 }
 
 
+def _markup_safe(s):
+    """Strip Rich markup tag characters from user-controlled strings before
+    they're interpolated into banner cells (a `[` in a provider/model/skill
+    name would otherwise crash Rich's markup parser)."""
+    return str(s).replace("[", "").replace("]", "")
+
+
 def _banner_tools_lines():
     """Hermes-style 'Available Tools' grid: 'toolset: tool, tool, ...' rows.
 
@@ -4145,7 +4218,7 @@ def _banner_skills_lines():
         by_cat.setdefault(cat, []).append(s)
     disp_name = lambda c: "flat" if c == "(flat)" else c
     for cat in sorted(by_cat):
-        names = [s["name"] for s in by_cat[cat]]
+        names = [_markup_safe(s["name"]) for s in by_cat[cat]]
         lines.append("[dim %s]%s:[/] [bold %s]%s[/]"
                      % (HERMES_DIM, disp_name(cat), HERMES_TEXT, ", ".join(names)))
     return lines
@@ -4181,7 +4254,7 @@ def banner(state):
         print("ALVAAGENT")
     print()
 
-    model_short = (cfg.get("model") or "?")
+    model_short = _markup_safe(cfg.get("model") or "?")
     if "/" in model_short:
         model_short = model_short.split("/")[-1]
     ctx = _fmt_k(context_window_for(cfg))
@@ -4191,8 +4264,8 @@ def banner(state):
         "[bold %s]%s[/]  [dim %s]·[/] [dim %s]%s context[/]"
         % (HERMES_ACCENT, model_short, HERMES_DIM, HERMES_DIM, ctx),
         "[dim %s]skin[/] %s" % (HERMES_DIM, state.get("skin") or DEFAULT_SKIN),
-        "[dim %s]provider[/] %s" % (HERMES_DIM, state["active"]),
-        "[dim %s]config/store:[/] %s" % (HERMES_DIM, DATA_DIR),
+        "[dim %s]provider[/] %s" % (HERMES_DIM, _markup_safe(state["active"])),
+        "[dim %s]config/store:[/] %s" % (HERMES_DIM, _markup_safe(DATA_DIR)),
     ]
     right_lines = _banner_tools_lines() + _banner_skills_lines()
     right_lines.append("")
