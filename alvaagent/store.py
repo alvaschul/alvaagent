@@ -4,30 +4,29 @@ leaf module (imports config + util only). Extracted from alvaagent_tui.py
 import json
 import os
 
-from alvaagent.config import STORE_PATH, CONFIG_PATH, DATA_DIR, _LEGACY_DIRS
-from alvaagent.context import default_rt
+from alvaagent.config import _LEGACY_DIRS
 from alvaagent.util import _env
 
 # ---------------- persistence (JSON file instead of localStorage) ----------------
 # No module-global `_store` anymore: the store lives on the Runtime (`rt.store`).
-# The flat `_store_get`/`_store_set`/`_load_store`/`_save_store` bridges below
-# route through `default_rt().store` (Ruling 14/15) for the flat Phase-A
-# consumers (sessions) until they thread rt.
+# All reads/writes go through rt (the file path derives from `rt.data_dir`), so
+# per-test runtimes are fully isolated.
 
 
-def _migrate_legacy_dir():
+def _migrate_legacy_dir(data_dir):
     """One-time copy of data from the old .pocket_agent folders (if any)."""
     if _env("ALVA_DATA_DIR", "POCKET_DATA_DIR"):
         return  # explicit override: don't second-guess
-    if os.path.exists(STORE_PATH) or os.path.exists(CONFIG_PATH):
+    if os.path.exists(os.path.join(data_dir, "store.json")) or \
+            os.path.exists(os.path.join(data_dir, "config.json")):
         return  # new-brand data already present
     for old in _LEGACY_DIRS:
         if os.path.isdir(old) and any(
                 os.path.exists(os.path.join(old, f)) for f in ("store.json", "config.json")):
             try:
-                os.makedirs(DATA_DIR, exist_ok=True)
+                os.makedirs(data_dir, exist_ok=True)
                 for name in os.listdir(old):
-                    src, dst = os.path.join(old, name), os.path.join(DATA_DIR, name)
+                    src, dst = os.path.join(old, name), os.path.join(data_dir, name)
                     if os.path.isfile(src) and not os.path.exists(dst):
                         with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
                             fdst.write(fsrc.read())
@@ -37,11 +36,10 @@ def _migrate_legacy_dir():
 
 
 def load(rt):
-    """Load store.json into rt.store (mutates in place so the flat `_store`
-    live view and the facade's `pa._store` property stay in sync)."""
-    _migrate_legacy_dir()
+    """Load store.json into rt.store (mutates rt.store in place)."""
+    _migrate_legacy_dir(rt.data_dir)
     try:
-        with open(STORE_PATH) as f:
+        with open(os.path.join(rt.data_dir, "store.json")) as f:
             data = json.load(f)
     except Exception:
         data = {}
@@ -61,14 +59,14 @@ def save(rt):
     place. A kill/crash mid-write can never leave a truncated store.json."""
     try:
         import tempfile
-        os.makedirs(DATA_DIR, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".store.", suffix=".tmp")
+        os.makedirs(rt.data_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=rt.data_dir, prefix=".store.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(rt.store, f, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, STORE_PATH)  # atomic on POSIX
+            os.replace(tmp, os.path.join(rt.data_dir, "store.json"))  # atomic on POSIX
         finally:
             if os.path.exists(tmp):
                 try:
@@ -86,23 +84,6 @@ def get(rt, key, default=None):
 def set(rt, key, value):
     rt.store[key] = value
     save(rt)
-
-
-# ---- flat Phase-A bridges (Ruling 14/15): route through the default rt ----
-def _load_store():
-    return load(default_rt())
-
-
-def _save_store():
-    save(default_rt())
-
-
-def _store_get(key, default=None):
-    return get(default_rt(), key, default)
-
-
-def _store_set(key, value):
-    set(default_rt(), key, value)
 
 
 TODO_KEY = "alvaagent.todos"

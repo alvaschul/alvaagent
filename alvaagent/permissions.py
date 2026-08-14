@@ -1,7 +1,6 @@
 import os
 
 from alvaagent.config import DATA_DIR
-from alvaagent.context import default_rt
 
 # ---------------- autonomy: permissions ----------------
 # The agent can run shell commands, edit files and manage skills. Everything
@@ -151,8 +150,3 @@ def request_permission(rt, desc):
             rt.approved.add(desc)  # remember for the rest of this session
         return ok
     return False  # headless default: deny
-
-
-def _permission(desc):
-    """Flat Phase-A bridge: route the legacy name through the default rt."""
-    return request_permission(default_rt(), desc)

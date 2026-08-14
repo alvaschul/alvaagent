@@ -13,19 +13,18 @@ import urllib.request
 
 from alvaagent.client import _STREAM_POLL
 from alvaagent.config import DATA_DIR, TOOL_MODES, save_state
-from alvaagent.context import Runtime, default_rt
 from alvaagent.permissions import (
     PROJECT_DIR, classify_command, classify_file_action, request_permission,
 )
 from alvaagent.skills import (
-    tool_skill_install, tool_skill_list, tool_skill_read, tool_skill_remove,
-    tool_skill_save, tool_skill_sync_repo,
+    skill_install, skill_list, skill_read, skill_remove,
+    skill_save, skill_sync_repo,
 )
 from alvaagent.store import (
     FEEDBACK_KEY, IMPROVEMENT_KEY, MEM_PREFIX, TODO_KEY,
     get as store_get, set as store_set,
 )
-from alvaagent.trace import _trace
+from alvaagent.trace import trace as _trace
 from alvaagent.util import _atomic_write
 
 # ---------------- autonomy: shell + files + skills ----------------
@@ -773,7 +772,7 @@ def maybe_enable_full(rt, name):
     the user runs /tools core). Returns True when the mode was just switched."""
     if rt.tool_mode != "full" and name in _ADVANCED_TOOL_NAMES:
         rt.tool_mode = "full"
-        _trace({"event": "tool_mode", "mode": "full", "tool": name,
+        _trace(rt, {"event": "tool_mode", "mode": "full", "tool": name,
                 "reason": "advanced tool requested by the model"})
         return True
     return False
@@ -794,30 +793,8 @@ def set_mode(rt, mode):
         save_state(rt)
     except Exception:
         pass
-    _trace({"event": "tool_mode", "mode": mode, "reason": "user /tools"})
+    _trace(rt, {"event": "tool_mode", "mode": mode, "reason": "user /tools"})
 
-
-def active_tools():
-    """Flat Phase-A bridge: the default rt's advertised tool set."""
-    return visible(default_rt())
-
-
-def _sync_tool_mode(state):
-    """Flat Phase-A bridge: mirror the caller's config dict onto the default
-    rt, then sync its tool_mode from the persisted value."""
-    rt = default_rt()
-    if isinstance(state, dict):
-        rt.cfg = state
-    sync_tool_mode(rt)
-
-
-def _set_tool_mode(state, mode):
-    """Flat Phase-A bridge: mirror the caller's config dict onto the default
-    rt, then switch (and persist) the tool mode on it."""
-    rt = default_rt()
-    if isinstance(state, dict):
-        rt.cfg = state
-    set_mode(rt, mode)
 
 class Tools:
     """Every tool as a method keyed by its TOOLS schema name.
@@ -898,29 +875,29 @@ class Tools:
         return tool_improvement_done(self.rt, args.get("area"))
 
     def self_test(self, args):
-        return tool_self_test()
+        return tool_self_test(self.rt)
 
     def reflect(self, args):
         return tool_reflect(self.rt)
 
     def skill_list(self, args):
-        return tool_skill_list(self.rt)
+        return skill_list(self.rt)
 
     def skill_read(self, args):
-        return tool_skill_read(self.rt, args.get("name"))
+        return skill_read(self.rt, args.get("name"))
 
     def skill_save(self, args):
-        return tool_skill_save(
+        return skill_save(
             self.rt, args.get("name"), args.get("content"), category=args.get("category"))
 
     def skill_remove(self, args):
-        return tool_skill_remove(self.rt, args.get("name"))
+        return skill_remove(self.rt, args.get("name"))
 
     def skill_install(self, args):
-        return tool_skill_install(self.rt, args.get("source"), args.get("category"))
+        return skill_install(self.rt, args.get("source"), args.get("category"))
 
     def skill_sync_repo(self, args):
-        return tool_skill_sync_repo(self.rt, args.get("repo"), args.get("subdir"))
+        return skill_sync_repo(self.rt, args.get("repo"), args.get("subdir"))
 
 
 
@@ -931,25 +908,15 @@ _TOOL_ERROR_HINTS = {
     "file_write": "hint: the path may be outside the project or unwritable; try a path inside the project folder",
 }
 
-def dispatch_tool(*args, **kwargs):
-    """Dual-dispatch (Phase A): rt-first `(rt, name, args)` from the facade
-    and the Tools class; flat `(name, args)` from the agent's run loop (falls
-    back to default_rt, which is the same runtime on every Phase A entry
-    path). Dispatch is the single funnel for tool-mode auto-enable, error
+def dispatch_tool(rt, name, args):
+    """rt-first dispatch: the single funnel for tool-mode auto-enable, error
     hints, and exception wrapping."""
-    if len(args) == 3 and isinstance(args[0], Runtime):
-        rt, name, tool_args = args
-    elif len(args) == 2:
-        name, tool_args = args
-        rt = default_rt()
-    else:
-        raise TypeError("dispatch_tool expects (rt, name, args) or (name, args)")
     tool = getattr(Tools(rt), name, None)
     if tool is None:
         return {"error": "unknown tool: %s" % name}
     switched = maybe_enable_full(rt, name)
     try:
-        result = tool(tool_args)
+        result = tool(args)
         if isinstance(result, dict) and not result.get("ok", True) and "hint" not in result:
             result["hint"] = _TOOL_ERROR_HINTS.get(name, "")
         if switched and isinstance(result, dict):
@@ -1002,7 +969,7 @@ def self_test(rt):
 
     # skills: list should work
     try:
-        skills = tool_skill_list(rt)
+        skills = skill_list(rt)
         checks.append(("skills_list", skills.get("ok") is True))
     except Exception:
         checks.append(("skills_list", False))
@@ -1061,7 +1028,7 @@ def self_test(rt):
     return json.dumps({k: v for k, v in checks})
 
 
-def tool_self_test():
+def tool_self_test(rt):
     """Run the full self-test suite via `test_tui.py` and return results.
 
     This is the tool the agent calls to validate itself after editing its own
@@ -1106,7 +1073,7 @@ def tool_self_test():
 
     # Run built-in self_test checks
     try:
-        builtin_json = self_test(default_rt())
+        builtin_json = self_test(rt)
         builtin_checks = json.loads(builtin_json) if isinstance(builtin_json, str) else builtin_json
         builtin_ok = all(v for v in builtin_checks.values())
         result["tests"].append({

@@ -5,16 +5,16 @@ import sys
 import threading
 
 from alvaagent.config import HISTORY_PATH, TOOL_MODES, active_cfg
-from alvaagent.context import default_rt
+from alvaagent.context import build_runtime
 from alvaagent.store import get as store_get, ACTIVE_SESSION_KEY
 from alvaagent.client import cancel_agent
 from alvaagent.sessions import (
-    auto_title, context_usage, delete_session, _find_session, load_session,
-    new_session_name, _rename_session_in_store, save_session, trim_history,
-    _unique_session_name,
+    context_usage, delete_session, find_session, load_session,
+    new_session_name, rename_session, save_session, trim_history,
+    unique_session_name,
 )
 from alvaagent.tools import (
-    set_mode, sync_tool_mode, visible, tool_skill_remove,
+    set_mode, sync_tool_mode, visible, skill_remove,
 )
 from alvaagent.tui import (
     C, COLOR, banner, col, compress_now, on_tool, p_err, p_info, p_ok, p_warn,
@@ -72,7 +72,7 @@ def _slash_complete(text, state):
     return None
 
 
-def _send_message_rt(rt, text):
+def send_message(rt, text):
     """Render the 'you' bubble, run the agent, manage context + sessions.
 
     Returns the (possibly auto-renamed) session name.
@@ -82,9 +82,9 @@ def _send_message_rt(rt, text):
     cfg = active_cfg(rt)
     # auto-title a fresh placeholder session from the first user message
     if session.startswith("sess-"):
-        new_name = _unique_session_name(auto_title(text))
+        new_name = unique_session_name(rt, text)
         if new_name != session:
-            _rename_session_in_store(session, new_name)
+            rename_session(rt, session, new_name)
             session = new_name
     print()
     print_user_turn(text)
@@ -101,19 +101,19 @@ def _send_message_rt(rt, text):
         p_info("cancelled")
         if history:
             history.pop()  # drop the unanswered message
-        save_session(session, history)
+        save_session(rt, session, history)
         return session
     except Exception as e:
         p_err("agent error: %s" % e)
         if history:
             history.pop()
-        save_session(session, history)
+        save_session(rt, session, history)
         return session
     # drop the internal system prompt that run_agent_stream prepends
     history[:] = [m for m in res["history"] if m.get("role") != "system"]
     if res.get("cancelled"):
         p_info("(request stopped)")
-        save_session(session, history)
+        save_session(rt, session, history)
         return session
     streamed = bool(res.get("streamed"))
     tools = res.get("tools", 0)
@@ -132,7 +132,7 @@ def _send_message_rt(rt, text):
             history.pop()
         if history and history[-1].get("role") == "user":
             history.pop()
-        save_session(session, history)
+        save_session(rt, session, history)
         if content.startswith("error:"):
             render_agent_panel(content)
             p_warn("the turn failed - your message was not saved (retry when the endpoint is back)")
@@ -146,23 +146,14 @@ def _send_message_rt(rt, text):
     compressed = False
     if cfg.get("auto_compress", True):
         compressed = compress_now(rt, history)
-    tokens, window = context_usage(history, cfg)
-    render_status_bar(rt.cfg, session, res.get("elapsed", 0.0), res.get("tools", 0), history)
+    tokens, window = context_usage(rt, history)
+    render_status_bar(rt, session, res.get("elapsed", 0.0), res.get("tools", 0), history)
     pct = tokens * 100 // window if window else 0
     if not compressed and window and pct >= 85:
         p_warn("context at %d%% of %s - /new starts a fresh session | /compress summarizes older messages"
                % (pct, _fmt_k(window)))
-    save_session(session, history)
+    save_session(rt, session, history)
     return session
-
-
-def send_message(text, history, state, session):
-    """Public flat bridge: build a runtime from the args and delegate."""
-    rt = default_rt()
-    rt.history = history
-    rt.cfg = state
-    rt.session = session
-    return _send_message_rt(rt, text)
 
 
 def repl(rt):
@@ -170,7 +161,7 @@ def repl(rt):
     set_active_skin(rt)
     # resume the last active session (conversations persist across restarts)
     session = store_get(rt, ACTIVE_SESSION_KEY) or "default"
-    history = load_session(session)
+    history = load_session(rt, session)
     rt.history = history
     rt.session = session
     # last completed turn, for /redo (session-scoped so it can't leak across
@@ -226,7 +217,7 @@ def repl(rt):
                 if not arg or arg in ("ls", "list", "show"):
                     cmd_sessions(rt)
                 elif arg in ("rm", "remove", "del", "delete"):
-                    target = _find_session(sub)
+                    target = find_session(rt, sub)
                     if not sub:
                         p_err("usage: /session rm <name>")
                     elif target is None:
@@ -234,51 +225,51 @@ def repl(rt):
                     elif target.lower() == session.lower():
                         p_err("that's the active session - switch first (/session <name>)")
                     else:
-                        delete_session(target)
+                        delete_session(rt, target)
                         p_ok("deleted session '%s' [OK]" % target)
                 elif arg in ("rename", "mv"):
                     old, _, new = sub.partition(" ")
                     old, new = old.strip(), new.strip()
-                    target = _find_session(old)
+                    target = find_session(rt, old)
                     if not old or not new:
                         p_err("usage: /session rename <old> <new>")
                     elif target is None:
                         p_err("no session named '%s'" % old)
-                    elif _find_session(new):
+                    elif find_session(rt, new):
                         p_err("a session named '%s' already exists" % new)
                     else:
-                        _rename_session_in_store(target, new)
+                        rename_session(rt, target, new)
                         if session.lower() == target.lower():
                             session = new
                         p_ok("renamed '%s' -> '%s' [OK]" % (target, new))
                 else:
-                    save_session(session, history)  # persist the outgoing session
-                    target = _find_session(arg)
+                    save_session(rt, session, history)  # persist the outgoing session
+                    target = find_session(rt, arg)
                     if target is None:
                         target = arg
                         p_info("(new session '%s')" % target)
-                    history[:] = load_session(target)
+                    history[:] = load_session(rt, target)
                     session = target
                     rt.session = session
-                    save_session(session, history)  # mark active + refresh timestamp
+                    save_session(rt, session, history)  # mark active + refresh timestamp
                     p_ok("switched to session '%s' | %d messages" % (session, len(history)))
             elif c == "/context":
                 cmd_context(rt, rest, history)
             elif c == "/compress":
                 cmd_compress(rt, history, session)
             elif c == "/new":
-                save_session(session, history)
+                save_session(rt, session, history)
                 cmd_clear(rt, history)
                 session = new_session_name()
                 rt.session = session
-                save_session(session, history)
+                save_session(rt, session, history)
                 p_ok("new session: " + session)
             elif c == "/clear":
                 cmd_clear(rt, history)
             elif c == "/multi":
                 text = cmd_multi()
                 if text and text.strip():
-                    session = _send_message_rt(rt, text.strip())
+                    session = send_message(rt, text.strip())
                     rt.session = session
             elif c == "/install_skill":
                 cmd_install_skill(rt, rest)
@@ -295,7 +286,7 @@ def repl(rt):
                     if not arg:
                         p_err("usage: /skill rm <name>")
                         continue
-                    r = tool_skill_remove(rt, arg)
+                    r = skill_remove(rt, arg)
                     if r.get("ok"):
                         p_ok("removed skill '%s' (category: %s) [OK]"
                              % (r.get("name", "?"), r.get("category") or "(flat)"))
@@ -319,7 +310,7 @@ def repl(rt):
                     continue
                 history[:] = rt.last_turn["pre"]
                 p_info("(re-running: %s)" % rt.last_turn["text"][:80])
-                session = _send_message_rt(rt, rt.last_turn["text"])
+                session = send_message(rt, rt.last_turn["text"])
                 rt.session = session
             elif c in ("/exit", "/quit", "/q"):
                 break
@@ -330,20 +321,19 @@ def repl(rt):
         rt.last_turn["session"] = session
         rt.last_turn["text"] = line
         rt.last_turn["pre"] = list(history)
-        session = _send_message_rt(rt, line)
+        session = send_message(rt, line)
         rt.session = session
         save_completion_history()  # persist input history after each turn
-    save_session(session, history)
+    save_session(rt, session, history)
     save_completion_history()  # flush readline history to disk on exit
     print(col(C.DIM, "bye"))
 
 
 def main():
-    rt = default_rt()
+    rt = build_runtime()
     rt.on_permission = lambda desc: ask_permission(rt, desc)  # interactive y/N for risky actions
-    rt.on_tool = on_tool        # live tool-progress blocks
+    rt.on_tool = lambda t_id, n, a, r, s: on_tool(rt, t_id, n, a, r, s)  # live tool-progress blocks
     setup_completion()
-    set_active_skin(rt)
 
     # Guarantee screen restoration even on SIGTERM / OOM kill / crash.
     # SIGTERM and SIGINT both route through _cleanup so the alternate-screen
@@ -386,7 +376,7 @@ def main():
     sys.stdout.write("\x1b[?1049h")
     sys.stdout.flush()
     try:
-        banner(rt.cfg)
+        banner(rt)
         repl(rt)
     finally:
         _cleanup()

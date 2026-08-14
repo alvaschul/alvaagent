@@ -18,9 +18,9 @@ from alvaagent.util import (
 #     e.g. skills/productivity/product-price-monitor.md
 #     e.g. skills/research/competitor-news-monitor.md
 # `<category>` is a slash-free folder name; `<name>.md` is the skill filename.
-# `tool_skill_save` writes into SKILLS_DIR/<category>/<name>.md when a category
+# `skill_save` writes into SKILLS_DIR/<category>/<name>.md when a category
 # is supplied, otherwise falls back to the legacy flat layout so old skills keep
-# working. `tool_skill_list` returns [{"name": ..., "category": ..., "file": ...,
+# working. `skill_list` returns [{"name": ..., "category": ..., "file": ...,
 # "description": ..., "tags": ..., "related_skills": ...}, ...] and strips the
 # legacy flat names so callers that only want names still work.
 #
@@ -33,7 +33,7 @@ from alvaagent.util import (
 
 def _skill_body_for_tool(fm, body):
     """Render a skill's frontmatter as a one-line description the agent can
-    scan, then the full body. This is what tool_skill_read returns as 'content'
+    scan, then the full body. This is what skill_read returns as 'content'
     so the agent sees metadata + procedure in one call (Hermes injects the full
     SKILL.md including frontmatter into context)."""
     parts = []
@@ -108,7 +108,7 @@ def _resolve_skill_path(rt, name):
 def _skill_read(path):
     """Parse a skill .md file into its metadata dict plus the body the agent
     applies. Returns None when the file is missing or unreadable. This backs
-    _skill_list_all() and tool_skill_read()."""
+    _skill_list_all() and skill_read()."""
     if not os.path.isfile(path):
         return None
     try:
@@ -169,7 +169,7 @@ def _skill_list_all(rt):
     return skills
 
 
-def tool_skill_list(rt):
+def skill_list(rt):
     """List every skill on the device with metadata (Hermes-style).
 
     Returns {"ok": True, "skills": [dict, ...]} where each dict has:
@@ -182,7 +182,7 @@ def tool_skill_list(rt):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_skill_read(rt, name):
+def skill_read(rt, name):
     """Read a skill by name (flat) or category/name (categorized).
 
     Returns {"ok": True, "name": ..., "category": ..., "file": ...,
@@ -204,7 +204,7 @@ def tool_skill_read(rt, name):
     return {"ok": True, **info}
 
 
-def tool_skill_remove(rt, name):
+def skill_remove(rt, name):
     """Delete a skill by name (flat) or category/name (categorized).
 
     Returns {"ok": True} on success, {"ok": False, "error": ...} otherwise.
@@ -224,7 +224,7 @@ def tool_skill_remove(rt, name):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_skill_save(rt, name, content, category=None):
+def skill_save(rt, name, content, category=None):
     """Save a skill with optional YAML frontmatter.
 
     `name` may be "skill-name" (flat) or "category/skill-name" (categorized);
@@ -269,12 +269,12 @@ def tool_skill_save(rt, name, content, category=None):
 # ---------------- skills: install from URL / git repo ----------------
 
 
-def tool_skill_install(rt, source, category=None):
+def skill_install(rt, source, category=None):
     """Install a skill from a local .md file, a raw .md URL, or a GitHub URL.
 
     GitHub repo/blob URLs are rewritten to raw.githubusercontent.com so the
     full markdown is fetched (not the web_fetch snippet), parsed for
-    frontmatter, and saved into the runtime's skills dir via tool_skill_save.
+    frontmatter, and saved into the runtime's skills dir via skill_save.
     Returns the installed skill's name/category/path.
     """
     source = str(source or "").strip()
@@ -289,7 +289,7 @@ def tool_skill_install(rt, source, category=None):
         name = os.path.basename(source)
         if name.lower().endswith(".md"):
             name = name[:-3]
-        return tool_skill_save(rt, name, content, category)
+        return skill_save(rt, name, content, category)
     if source.startswith(("http://", "https://")):
         url = source
         if "github.com/" in url and "/blob/" in url:
@@ -309,11 +309,11 @@ def tool_skill_install(rt, source, category=None):
             name = str(fm["name"])
         if not name or name in (".", ""):
             return {"ok": False, "error": "cannot determine a skill name from %s" % url}
-        return tool_skill_save(rt, name, content, category)
+        return skill_save(rt, name, content, category)
     return {"ok": False, "error": "source must be a local path or an http(s) URL"}
 
 
-def tool_skill_sync_repo(rt, repo, subdir=None):
+def skill_sync_repo(rt, repo, subdir=None):
     """Clone a git repo of skills and import every .md as a skill.
 
     Categories come from each file's folder (top-level folder only - nested
@@ -366,7 +366,7 @@ def tool_skill_sync_repo(rt, repo, subdir=None):
                 if fm.get("name"):
                     name = str(fm["name"])
                 category = rel.split(os.sep)[0] if rel not in (".", "") else None
-                r = tool_skill_save(rt, name, content, category)
+                r = skill_save(rt, name, content, category)
                 if r.get("ok"):
                     installed.append({"name": r["name"], "category": r.get("category"),
                                       "path": r.get("path")})

@@ -37,20 +37,8 @@ def build_runtime(data_dir=None):
     if data_dir is None:
         data_dir = config.data_dir()
     rt = Runtime(data_dir=data_dir)
-    rt.cfg = config.load_state()
+    rt.cfg = config.load_state(data_dir)
     rt.tool_mode = rt.cfg.get("tool_mode", "core")
     rt.skin = rt.cfg.get("skin", "midnight")
     store.load(rt)
     return rt
-
-
-_DEFAULT_RT = None
-def default_rt():
-    """The single app/test runtime. Flat bridge functions (sessions, trace,
-    facade adapters) route their store/state access through this so the
-    threaded code, the app (`main`), and the unmodified test suite all observe
-    ONE consistent store. Retired in Task 15 (Ruling 15)."""
-    global _DEFAULT_RT
-    if _DEFAULT_RT is None:
-        _DEFAULT_RT = build_runtime()
-    return _DEFAULT_RT

@@ -3,9 +3,9 @@ import json
 import re
 import time
 
-from alvaagent.client import SYSTEM_PROMPT, _Cancelled
-from alvaagent.tools import visible
-from alvaagent.trace import _trace
+from alvaagent.client import SYSTEM_PROMPT, _Cancelled, chat_completion, chat_completion_stream
+from alvaagent.tools import dispatch_tool, visible
+from alvaagent.trace import trace
 
 # ---------------- agent loop ----------------
 MAX_STEPS = 25
@@ -69,7 +69,6 @@ def _report_tool(rt, tool_id, name, args, result, status):
 
 
 def run_agent(rt, history_json):
-    from alvaagent import chat_completion, dispatch_tool
     history = json.loads(str(history_json))
     config = rt.active_cfg
     rt.cancel.clear()
@@ -86,17 +85,17 @@ def run_agent(rt, history_json):
 
     consec_failures = 0
     _t0 = time.monotonic()
-    _trace({"event": "turn_start", "steps": 0})
+    trace(rt, {"event": "turn_start", "steps": 0})
     for step in range(MAX_STEPS):
         if rt.cancel.is_set():
-            _trace({"event": "turn_end", "reason": "cancelled", "steps": step})
+            trace(rt, {"event": "turn_end", "reason": "cancelled", "steps": step})
             return json.dumps({"content": "(stopped by user)", "history": messages, "cancelled": True})
         if _TURN_TIMEOUT <= 0 or time.monotonic() - _t0 > _TURN_TIMEOUT:
             note = "(stopped: the turn exceeded the %d-second time budget)" % int(_TURN_TIMEOUT)
             messages.append({"role": "assistant", "content": note})
-            _trace({"event": "turn_end", "reason": "timeout", "steps": step})
+            trace(rt, {"event": "turn_end", "reason": "timeout", "steps": step})
             return json.dumps({"content": note, "history": messages, "cancelled": False})
-        data = chat_completion(messages, config, tools=visible(rt))
+        data = chat_completion(rt, messages, config, tools=visible(rt))
         msg = data["choices"][0]["message"]
         if msg.get("content") is None:
             msg["content"] = ""
@@ -104,12 +103,12 @@ def run_agent(rt, history_json):
 
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
-            _trace({"event": "turn_end", "reason": "answer", "steps": step + 1})
+            trace(rt, {"event": "turn_end", "reason": "answer", "steps": step + 1})
             return json.dumps({"content": msg.get("content") or "", "history": messages, "cancelled": False})
 
         for tc in tool_calls:
             if rt.cancel.is_set():
-                _trace({"event": "turn_end", "reason": "cancelled", "steps": step + 1})
+                trace(rt, {"event": "turn_end", "reason": "cancelled", "steps": step + 1})
                 return json.dumps({"content": "(stopped by user)", "history": messages, "cancelled": True})
             fn = tc.get("function", {})
             name = fn.get("name", "?")
@@ -121,25 +120,25 @@ def run_agent(rt, history_json):
                 args = {}
             tool_id = tc.get("id", "?")
             _report_tool(rt, tool_id, name, args, None, "running")
-            _trace({"event": "tool", "name": name, "args": args})
-            result = dispatch_tool(name, args)
+            trace(rt, {"event": "tool", "name": name, "args": args})
+            result = dispatch_tool(rt, name, args)
             status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
             if status == "error":
                 consec_failures += 1
             else:
                 consec_failures = 0
-            _trace({"event": "tool", "name": name, "status": status})
+            trace(rt, {"event": "tool", "name": name, "status": status})
             _report_tool(rt, tool_id, name, args, result, status)
             messages.append({"role": "tool", "tool_call_id": tool_id, "content": json.dumps(result)})
 
         if consec_failures >= _MAX_CONSEC_TOOL_FAILURES:
-            _trace({"event": "turn_end", "reason": "circuit_breaker", "steps": step + 1,
+            trace(rt, {"event": "turn_end", "reason": "circuit_breaker", "steps": step + 1,
                     "consec_failures": consec_failures})
             note = "(stopped early: %d tools in a row failed - the current approach is not working)" % consec_failures
             messages.append({"role": "assistant", "content": note})
             return json.dumps({"content": note, "history": messages, "cancelled": False})
 
-    _trace({"event": "turn_end", "reason": "max_steps", "steps": MAX_STEPS})
+    trace(rt, {"event": "turn_end", "reason": "max_steps", "steps": MAX_STEPS})
     return json.dumps({"content": "(reached the maximum number of tool steps)", "history": messages, "cancelled": False})
 
 
@@ -233,11 +232,9 @@ def _strip_xml(text):
     return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
-def run_agent_stream(rt, history, config=None):
+def run_agent_stream(rt, history):
     """Generator that yields ('text', chunk) or ('tool', tool_info) or ('done', final_dict)."""
-    from alvaagent import chat_completion_stream, dispatch_tool
-    if config is None:
-        config = rt.active_cfg
+    config = rt.active_cfg
     rt.cancel.clear()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     history = _repair_tool_pairs(history)
@@ -252,16 +249,16 @@ def run_agent_stream(rt, history, config=None):
 
     consec_failures = 0
     _t0 = time.monotonic()
-    _trace({"event": "turn_start", "steps": 0})
+    trace(rt, {"event": "turn_start", "steps": 0})
     for step in range(MAX_STEPS):
         if rt.cancel.is_set():
-            _trace({"event": "turn_end", "reason": "cancelled", "steps": step})
+            trace(rt, {"event": "turn_end", "reason": "cancelled", "steps": step})
             yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
             return
         if _TURN_TIMEOUT <= 0 or time.monotonic() - _t0 > _TURN_TIMEOUT:
             note = "(stopped: the turn exceeded the %d-second time budget)" % int(_TURN_TIMEOUT)
             messages.append({"role": "assistant", "content": note})
-            _trace({"event": "turn_end", "reason": "timeout", "steps": step})
+            trace(rt, {"event": "turn_end", "reason": "timeout", "steps": step})
             yield "done", {"content": note, "history": messages, "cancelled": False}
             return
 
@@ -269,7 +266,7 @@ def run_agent_stream(rt, history, config=None):
         content_parts = []
         tool_calls_result = None
         try:
-            for chunk, tcs in chat_completion_stream(messages, config, tools=visible(rt)):
+            for chunk, tcs in chat_completion_stream(rt, messages, config, tools=visible(rt)):
                 if rt.cancel.is_set():
                     yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
                     return
@@ -307,14 +304,14 @@ def run_agent_stream(rt, history, config=None):
                     args = {}
                 tool_id = tc.get("id", "?")
                 yield "tool_start", {"name": name, "args": args}
-                _trace({"event": "tool", "name": name, "args": args})
-                result = dispatch_tool(name, args)
+                trace(rt, {"event": "tool", "name": name, "args": args})
+                result = dispatch_tool(rt, name, args)
                 status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
                 if status == "error":
                     consec_failures += 1
                 else:
                     consec_failures = 0
-                _trace({"event": "tool", "name": name, "status": status})
+                trace(rt, {"event": "tool", "name": name, "status": status})
                 yield "tool_end", {"name": name, "args": args, "result": result, "status": status}
                 messages.append({"role": "tool", "tool_call_id": tool_id, "content": json.dumps(result)})
         elif has_xml:
@@ -325,28 +322,28 @@ def run_agent_stream(rt, history, config=None):
                     yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
                     return
                 yield "tool_start", {"name": name, "args": args}
-                _trace({"event": "tool", "name": name, "args": args})
-                result = dispatch_tool(name, args)
+                trace(rt, {"event": "tool", "name": name, "args": args})
+                result = dispatch_tool(rt, name, args)
                 status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
                 if status == "error":
                     consec_failures += 1
                 else:
                     consec_failures = 0
-                _trace({"event": "tool", "name": name, "status": status})
+                trace(rt, {"event": "tool", "name": name, "status": status})
                 yield "tool_end", {"name": name, "args": args, "result": result, "status": status}
                 messages.append({"role": "tool", "tool_call_id": "xml_%d" % i, "content": json.dumps(result)})
         else:
             messages.append(msg)
-            _trace({"event": "turn_end", "reason": "answer", "steps": step + 1})
+            trace(rt, {"event": "turn_end", "reason": "answer", "steps": step + 1})
             yield "done", {"content": msg["content"], "history": messages, "cancelled": False}
             return
 
         if consec_failures >= _MAX_CONSEC_TOOL_FAILURES:
             note = "(stopped early: %d tools in a row failed - the current approach is not working)" % consec_failures
             messages.append({"role": "assistant", "content": note})
-            _trace({"event": "turn_end", "reason": "circuit_breaker", "steps": step + 1, "consec_failures": consec_failures})
+            trace(rt, {"event": "turn_end", "reason": "circuit_breaker", "steps": step + 1, "consec_failures": consec_failures})
             yield "done", {"content": note, "history": messages, "cancelled": False}
             return
 
-    _trace({"event": "turn_end", "reason": "max_steps", "steps": MAX_STEPS})
+    trace(rt, {"event": "turn_end", "reason": "max_steps", "steps": MAX_STEPS})
     yield "done", {"content": "(reached the maximum number of tool steps)", "history": messages, "cancelled": False}

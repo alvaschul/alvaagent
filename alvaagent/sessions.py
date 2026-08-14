@@ -2,11 +2,10 @@ import re
 import secrets
 
 from alvaagent.client import SYSTEM_PROMPT, chat_completion
-from alvaagent.config import DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT
-from alvaagent.context import default_rt
+from alvaagent.config import DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT, active_cfg
 from alvaagent.store import (
     ACTIVE_SESSION_KEY, MAX_SESSIONS, SESSION_KEY,
-    _store_get, _store_set,
+    get as store_get, set as store_set,
 )
 from alvaagent.util import now_iso
 
@@ -47,28 +46,28 @@ def estimate_message_tokens(m):
     return n + 8  # role + metadata overhead
 
 
-def context_usage(history, cfg):
+def context_usage(rt, history):
     """Estimated (tokens, window) for the whole conversation + system prompt."""
     total = estimate_tokens(SYSTEM_PROMPT)
     for m in history:
         total += estimate_message_tokens(m)
-    return total, context_window_for(cfg)
+    return total, context_window_for(active_cfg(rt))
 
 
 # ---------------- sessions ----------------
-def sessions_map():
-    return _store_get(SESSION_KEY, {})
+def sessions_map(rt):
+    return store_get(rt, SESSION_KEY, {})
 
 
-def load_session(name):
-    msgs = sessions_map().get(name, {}).get("messages")
+def load_session(rt, name):
+    msgs = sessions_map(rt).get(name, {}).get("messages")
     return list(msgs) if isinstance(msgs, list) else []
 
 
-def save_session(name, messages):
+def save_session(rt, name, messages):
     """Persist a session's messages and mark it active. Prunes the oldest
     sessions past MAX_SESSIONS so store.json can't grow without bound."""
-    sess = sessions_map()
+    sess = sessions_map(rt)
     rec = sess.get(name) or {"name": name, "created": now_iso(), "messages": []}
     rec["messages"] = list(messages)
     rec["updated"] = now_iso()
@@ -78,33 +77,33 @@ def save_session(name, messages):
                         key=lambda x: x[1])
         for old_name, _ in others[:len(sess) - MAX_SESSIONS]:
             sess.pop(old_name, None)
-    _store_set(SESSION_KEY, sess)
-    _store_set(ACTIVE_SESSION_KEY, name)
+    store_set(rt, SESSION_KEY, sess)
+    store_set(rt, ACTIVE_SESSION_KEY, name)
 
 
-def delete_session(name):
-    sess = sessions_map()
+def delete_session(rt, name):
+    sess = sessions_map(rt)
     sess.pop(name, None)
-    _store_set(SESSION_KEY, sess)
+    store_set(rt, SESSION_KEY, sess)
 
 
-def _find_session(target):
+def find_session(rt, target):
     """Case-insensitive session-name lookup; returns the canonical name or None."""
     t = target.strip().lower()
-    for name in sessions_map():
+    for name in sessions_map(rt):
         if name.lower() == t:
             return name
     return None
 
 
-def _rename_session_in_store(old, new):
-    sess = sessions_map()
+def rename_session(rt, old, new):
+    sess = sessions_map(rt)
     if old in sess:
         rec = sess.pop(old)
         rec["name"] = new
         sess[new] = rec
-        _store_set(SESSION_KEY, sess)
-    _store_set(ACTIVE_SESSION_KEY, new)
+        store_set(rt, SESSION_KEY, sess)
+    store_set(rt, ACTIVE_SESSION_KEY, new)
 
 
 def auto_title(text):
@@ -113,18 +112,18 @@ def auto_title(text):
     return t[:28] or "conversation"
 
 
-def _unique_session_name(title):
+def unique_session_name(rt, title):
     base = auto_title(title)
     name = base
     i = 2
-    while name in sessions_map():
+    while name in sessions_map(rt):
         name = "%s %d" % (base, i)
         i += 1
     return name
 
 
 # ---------------- auto-compression ----------------
-def summarize_with_llm(messages, cfg, max_words=350):
+def summarize_with_llm(rt, messages, cfg, max_words=350):
     """Condense `messages` into a structured summary for a fresh context window.
 
     Returns a concise multi-section summary string, or None on any failure.
@@ -145,7 +144,7 @@ def summarize_with_llm(messages, cfg, max_words=350):
     msgs = ([{"role": "system", "content": sys_note}]
             + list(messages) + [{"role": "user", "content": prompt}])
     try:
-        data = chat_completion(default_rt(), msgs, cfg)
+        data = chat_completion(rt, msgs, cfg)
         text = (data["choices"][0]["message"].get("content") or "").strip()
         if not text:
             return None
@@ -165,7 +164,7 @@ def _fallback_summary(head):
             "First user message: %s" % (len(head), first[:200] or "(none)"))
 
 
-def compress_history(messages, cfg, summarizer=None, keep_frac=0.4, min_keep=8):
+def compress_history(rt, messages, cfg, summarizer=None, keep_frac=0.4, min_keep=8):
     """Summarize the older messages into one summary message, keeping a recent tail.
 
     Returns (new_history, stats) with stats None when there's nothing to compress.
@@ -192,7 +191,7 @@ def compress_history(messages, cfg, summarizer=None, keep_frac=0.4, min_keep=8):
     if not tail:
         return messages, None
     if summarizer is None:
-        summarizer = summarize_with_llm
+        summarizer = lambda msgs, cfg: summarize_with_llm(rt, msgs, cfg)
     summary = summarizer(head, cfg)
     mode = "llm"
     if not summary:

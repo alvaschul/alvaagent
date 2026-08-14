@@ -14,7 +14,7 @@ from alvaagent.store import (
 )
 from alvaagent.permissions import classify_command, PROJECT_DIR
 from alvaagent.skills import (
-    tool_skill_list, tool_skill_read, tool_skill_install, tool_skill_sync_repo,
+    skill_list, skill_read, skill_install, skill_sync_repo,
 )
 from alvaagent.tools import (
     _ADVANCED_TOOL_NAMES, visible, TOOLS,
@@ -27,10 +27,10 @@ from alvaagent.client import SYSTEM_PROMPT, _readable_error, fetch_models
 from alvaagent.sessions import (
     estimate_tokens, context_usage, sessions_map, save_session,
 )
-from alvaagent.trace import _read_trace
+from alvaagent.trace import read_trace
 from alvaagent.tui import (
     compress_now, SKINS, C, col, p_info, p_err, p_ok, p_warn,
-    set_active_skin, _UI,
+    set_active_skin,
 )
 from alvaagent.util import mask_key, _fmt_k
 import alvaagent.tui as _tui
@@ -71,7 +71,7 @@ def ask_permission(rt, desc):
     y or a approve (and are remembered for this session, so the same action
     won't prompt again); anything else denies.
     """
-    sp = _UI.get("spinner")
+    sp = rt.spinner
     was_running = sp is not None
     if sp:
         sp.stop()
@@ -174,7 +174,7 @@ def cmd_skin(rt, rest):
 
 def cmd_sessions(rt):
     """List saved sessions (name, message count, last updated)."""
-    sess = sessions_map()
+    sess = sessions_map(rt)
     if not sess:
         print("  (no sessions yet - /session <name> starts one)")
         return
@@ -213,7 +213,7 @@ def cmd_context(rt, rest, history):
         save_state(rt)
         p_ok("auto-compress %s [OK]" % ("on" if cfg["auto_compress"] else "off"))
         return
-    tokens, window = context_usage(history, cfg)
+    tokens, window = context_usage(rt, history)
     pct = tokens * 100 // window if window else 0
     print("  context usage:")
     print("    system prompt : ~%s tokens" % _fmt_k(estimate_tokens(SYSTEM_PROMPT)))
@@ -234,7 +234,7 @@ def cmd_compress(rt, history, session):
         p_info("(conversation is short - nothing to compress)")
         return
     if compress_now(rt, history, force=True):
-        save_session(session, history)
+        save_session(rt, session, history)
 
 
 def cmd_self_test(rt):
@@ -315,11 +315,11 @@ def _mem_check(rt):
 
 
 def _skill_check(rt):
-    skills = tool_skill_list(rt).get("skills", [])
+    skills = skill_list(rt).get("skills", [])
     if not skills:
         return True
     name = skills[0]["name"]
-    r = tool_skill_read(rt, name)
+    r = skill_read(rt, name)
     return r.get("ok") and r.get("content")
 
 
@@ -560,7 +560,7 @@ def cmd_trace(rt, rest):
         n = max(1, min(200, int(str(rest or "15").strip())))
     except ValueError:
         n = 15
-    lines = _read_trace(n)
+    lines = read_trace(rt, n)
     if not lines:
         print("  (trace.log is empty - run some turns first)")
         return
@@ -670,7 +670,7 @@ def cmd_skills(rt, rest=""):
             p_err("usage: /skills install <url|path> [category]")
             return
         parts = target.split(None, 1)
-        r = tool_skill_install(rt, parts[0], parts[1].strip() if len(parts) > 1 else None)
+        r = skill_install(rt, parts[0], parts[1].strip() if len(parts) > 1 else None)
         if r.get("ok"):
             p_ok("installed skill '%s' [OK]" % r.get("name"))
             if r.get("category"):
@@ -683,7 +683,7 @@ def cmd_skills(rt, rest=""):
         if not parts:
             p_err("usage: /skills sync <repo-url> [subdir]")
             return
-        r = tool_skill_sync_repo(rt, parts[0], parts[1].strip() if len(parts) > 1 else None)
+        r = skill_sync_repo(rt, parts[0], parts[1].strip() if len(parts) > 1 else None)
         if r.get("ok"):
             p_ok("synced %d skills from repo [OK]" % r.get("count"))
             for s in r.get("installed", []):
@@ -697,7 +697,7 @@ def cmd_skills(rt, rest=""):
     if arg:
         cmd_skill_category(rt, arg)
         return
-    skills = tool_skill_list(rt).get("skills") or []
+    skills = skill_list(rt).get("skills") or []
     if not skills:
         print("  (no skills yet - ask the agent to save one)")
         return
@@ -724,7 +724,7 @@ def cmd_skills(rt, rest=""):
 def cmd_skill_category(rt, rest):
     """List skills in a category, or list all categories."""
     arg = (rest or "").strip().lower()
-    skills = tool_skill_list(rt).get("skills") or []
+    skills = skill_list(rt).get("skills") or []
     if arg in ("ls", "list", "show"):
         # list categories
         cats = {}
@@ -850,8 +850,8 @@ def cmd_improve(rt, rest):
 
 def cmd_install_skill(rt, rest):
     # Install a skill from a local .md file or a URL (delegates to
-    # tool_skill_install so GitHub/blob URLs are auto-rewritten to raw).
-    r = tool_skill_install(rt, rest.strip())
+    # skill_install so GitHub/blob URLs are auto-rewritten to raw).
+    r = skill_install(rt, rest.strip())
     if r.get("ok"):
         p_ok("installed skill '%s' [OK]" % r.get("name"))
         if r.get("category"):

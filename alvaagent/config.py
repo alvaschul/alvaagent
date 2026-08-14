@@ -110,10 +110,14 @@ def _normalize_state(raw):
             "skin": DEFAULT_SKIN, "tool_mode": "core"}
 
 
-def load_state():
-    """Load provider profiles; env vars override the active profile."""
+def load_state(data_dir=None):
+    """Load provider profiles; env vars override the active profile.
+
+    Reads config.json from `data_dir` (or the module DATA_DIR constant when
+    omitted) so per-test runtimes can be fully isolated."""
+    cfg_dir = data_dir or DATA_DIR
     try:
-        with open(CONFIG_PATH) as f:
+        with open(os.path.join(cfg_dir, "config.json")) as f:
             raw = json.load(f)
     except Exception:
         raw = {}
@@ -141,19 +145,20 @@ def load_state():
 def save_state(state):
     """Atomically persist config: temp file + fsync + rename (see store.save).
 
-    Accepts a Runtime (persists rt.cfg) or a plain state dict. Strict rt-first
-    lands in Task 15 once every consumer threads rt."""
+    Accepts a Runtime (persists rt.cfg into rt.data_dir) or a plain state dict
+    (persisted into the module DATA_DIR)."""
     cfg = state.cfg if isinstance(state, Runtime) else state
+    cfg_dir = state.data_dir if isinstance(state, Runtime) else DATA_DIR
     try:
         import tempfile
-        os.makedirs(DATA_DIR, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".config.", suffix=".tmp")
+        os.makedirs(cfg_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=cfg_dir, prefix=".config.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, CONFIG_PATH)
+            os.replace(tmp, os.path.join(cfg_dir, "config.json"))
         finally:
             if os.path.exists(tmp):
                 try:

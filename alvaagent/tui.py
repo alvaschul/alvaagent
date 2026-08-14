@@ -7,14 +7,12 @@ import sys
 import threading
 import time
 
-from alvaagent.config import ALVA_VERSION, DATA_DIR, DEFAULT_SKIN, active_cfg
+from alvaagent.config import ALVA_VERSION, DEFAULT_SKIN, active_cfg
 from alvaagent.agent import _strip_xml_blocks, run_agent_stream
-from alvaagent.context import default_rt
 from alvaagent.sessions import compress_history, context_usage, context_window_for
-from alvaagent.skills import tool_skill_list
-from alvaagent.tools import TOOLS, active_tools
+from alvaagent.skills import skill_list
+from alvaagent.tools import TOOLS, visible
 from alvaagent.util import _fmt_k
-import alvaagent.tools as _tools
 
 # Rich backs the Hermes-style panels (pure-Python, pip-installs on Termux).
 # The Hermes agent TUI renders with Rich `Panel(box=HORIZONTALS)`; we mirror
@@ -656,17 +654,14 @@ class Spinner:
             self._dead = True
 
 
-_UI = {"spinner": None}
-
-
-def tool_open(name, args):
+def tool_open(rt, name, args):
     """Compact tool line: '  ▸ name (args)' - dim, no full-width rule."""
     a = fmt_args(args)
     label = "▸ " + name + ((" (" + a + ")") if a else "")
     _tool_line(label, HERMES_DIM)
 
 
-def tool_close(name, status, result):
+def tool_close(rt, name, status, result):
     """Close line of a tool block: '  ✓ name → summary'."""
     mark = ("✓ " if status == "done" else "✗ ")
     label = mark + name
@@ -678,14 +673,14 @@ def tool_close(name, status, result):
     _tool_line(label, HERMES_OK if status == "done" else HERMES_ERR)
 
 
-def on_tool(tool_id, name, args, result, status):
-    sp = _UI["spinner"]
+def on_tool(rt, tool_id, name, args, result, status):
+    sp = rt.spinner
     if sp:
         sp.stop()
     if status == "running":
-        tool_open(name, args)
+        tool_open(rt, name, args)
     else:
-        tool_close(name, status, result)
+        tool_close(rt, name, status, result)
     if sp:
         sp.start()
 
@@ -700,7 +695,7 @@ def run_agent_tui(rt, history):
                  re-printing the answer, fixing the old double-print)
     """
     sp = Spinner("thinking")
-    _UI["spinner"] = sp
+    rt.spinner = sp
     sp.start()
     content_parts = []
     tool_count = 0
@@ -715,9 +710,9 @@ def run_agent_tui(rt, history):
             elif evt_type == "tool_start":
                 sp.disable()
                 tool_count += 1
-                tool_open(evt_data["name"], evt_data["args"])
+                tool_open(rt, evt_data["name"], evt_data["args"])
             elif evt_type == "tool_end":
-                tool_close(evt_data["name"], evt_data["status"], evt_data["result"])
+                tool_close(rt, evt_data["name"], evt_data["status"], evt_data["result"])
             elif evt_type == "done":
                 writer.close()
                 res = dict(evt_data)
@@ -728,7 +723,7 @@ def run_agent_tui(rt, history):
     finally:
         writer.close()
         sp.stop()
-        _UI["spinner"] = None
+        rt.spinner = None
     return {"content": "".join(content_parts), "history": history, "cancelled": False,
             "tools": tool_count, "elapsed": time.monotonic() - t0,
             "streamed": bool(content_parts)}
@@ -769,13 +764,13 @@ def _markup_safe(s):
     return str(s).replace("[", "").replace("]", "")
 
 
-def _banner_tools_lines():
+def _banner_tools_lines(rt):
     """Hermes-style 'Available Tools' grid: active tools grouped by toolset,
     with a footer noting how many advanced tools are hidden in core mode.
 
     Returns Rich-markup strings (Hermes' own convention inside Panels).
     """
-    active = set(t["function"]["name"] for t in active_tools())
+    active = set(t["function"]["name"] for t in visible(rt))
     lines = ["[bold %s]Available Tools[/]" % HERMES_ACCENT]
     for ts, names in TOOLSETS.items():
         shown = [n for n in names if n in active]
@@ -788,11 +783,11 @@ def _banner_tools_lines():
     return lines
 
 
-def _banner_skills_lines():
+def _banner_skills_lines(rt):
     """Hermes-style 'Available Skills' grid: skills grouped by category."""
     lines = ["", "[bold %s]Available Skills[/]" % HERMES_ACCENT]
     try:
-        skills = tool_skill_list(default_rt()).get("skills") or []
+        skills = skill_list(rt).get("skills") or []
     except Exception:
         skills = []
     if not skills:
@@ -811,7 +806,7 @@ def _banner_skills_lines():
     return lines
 
 
-def banner(state):
+def banner(rt):
     """Hermes-banner style: block wordmark + bronze panel with tools/skills grid.
 
     Mirrors hermes_cli/banner.build_welcome_banner: a large block wordmark on
@@ -824,7 +819,7 @@ def banner(state):
     renders when rich is absent — the module-level fallback shim covers
     Console/Panel only.
     """
-    cfg = active_cfg(state)
+    cfg = active_cfg(rt)
     _CON.print()  # top spacer like Hermes
     # Hermes only prints its big wordmark when the terminal is wide enough; on
     # narrow terminals (phones) it would wrap ugly, so we mirror that gate.
@@ -850,14 +845,14 @@ def banner(state):
         "",
         "[bold %s]%s[/]  [dim %s]·[/] [dim %s]%s context[/]"
         % (HERMES_ACCENT, model_short, HERMES_DIM, HERMES_DIM, ctx),
-        "[dim %s]skin[/] %s" % (HERMES_DIM, state.get("skin") or DEFAULT_SKIN),
-        "[dim %s]provider[/] %s" % (HERMES_DIM, _markup_safe(state["active"])),
-        "[dim %s]config/store:[/] %s" % (HERMES_DIM, _markup_safe(DATA_DIR)),
+        "[dim %s]skin[/] %s" % (HERMES_DIM, rt.skin or DEFAULT_SKIN),
+        "[dim %s]provider[/] %s" % (HERMES_DIM, _markup_safe(rt.cfg.get("active", "local"))),
+        "[dim %s]config/store:[/] %s" % (HERMES_DIM, _markup_safe(rt.data_dir)),
     ]
-    right_lines = _banner_tools_lines() + _banner_skills_lines()
+    right_lines = _banner_tools_lines(rt) + _banner_skills_lines(rt)
     right_lines.append("")
     right_lines.append("[dim %s]%d/%d tools (%s) · v%s · you are here · /help for commands[/]"
-                       % (HERMES_DIM, len(active_tools()), len(TOOLS), _tools.default_rt().tool_mode, ALVA_VERSION))
+                       % (HERMES_DIM, len(visible(rt)), len(TOOLS), rt.tool_mode, ALVA_VERSION))
 
     try:
         from rich.table import Table
@@ -882,23 +877,24 @@ def banner(state):
     print("  " + col(C.DIM, "type a message | /help lists commands | Tab completes /commands"))
     print()
     if not cfg.get("api_key"):
-        p_info("no API key set for '%s' - run /provider %s or /config" % (state["active"], state["active"]))
+        p_info("no API key set for '%s' - run /provider %s or /config"
+               % (rt.cfg.get("active", "local"), rt.cfg.get("active", "local")))
 
 
-def render_status_bar(state, session, elapsed, tools, history):
+def render_status_bar(rt, session, elapsed, tools, history):
     """Render a one-line status footer after each agent turn (Hermes-style).
 
     Uses normal print flow - no raw ANSI cursor jumps, which misalign on
     Termux (no reliable terminal height). Prints a dim, boxed-style line.
     """
-    cfg = active_cfg(state)
+    cfg = active_cfg(rt)
     skin = CUR_SKIN
-    tokens, window = context_usage(history, cfg)
+    tokens, window = context_usage(rt, history)
     pct = tokens * 100 // window if window else 0
     ctx_col = skin["ok"] if pct < 60 else (C.YELLOW if pct < 85 else skin["err"])
     parts = [
         col(skin["dim"], session[:16]),
-        col(skin["dim"], state["active"] + "/" + (cfg.get("model") or "?")),
+        col(skin["dim"], rt.cfg.get("active", "local") + "/" + (cfg.get("model") or "?")),
         col(ctx_col, "ctx %d%%" % pct),
         col(skin["dim"], "%.1fs" % elapsed),
         col(skin["dim"], "%d tool calls" % (tools or 0)),
@@ -911,7 +907,7 @@ def compress_now(rt, history, threshold=0.75, force=False):
     """If usage exceeds the threshold (or force=True), summarize older messages
     in place. Returns True when a compression happened; never raises on failure."""
     cfg = rt.active_cfg
-    tokens, window = context_usage(history, cfg)
+    tokens, window = context_usage(rt, history)
     if window <= 0:
         p_info("(no context window configured)")
         return False
@@ -920,10 +916,10 @@ def compress_now(rt, history, threshold=0.75, force=False):
     p_info("context %d%% of %s - compressing older messages..."
            % (tokens * 100 // window, _fmt_k(window)))
     sp = Spinner("compressing")
-    _UI["spinner"] = sp
+    rt.spinner = sp
     sp.start()
     try:
-        new, stats = compress_history(history, cfg)
+        new, stats = compress_history(rt, history, cfg)
     except KeyboardInterrupt:
         p_info("compression cancelled")
         return False
@@ -932,7 +928,7 @@ def compress_now(rt, history, threshold=0.75, force=False):
         return False
     finally:
         sp.stop()
-        _UI["spinner"] = None
+        rt.spinner = None
     if not stats:
         if tokens > int(window * 0.6):
             p_info("(nothing to compress - a single message dominates the window; consider /new)")
