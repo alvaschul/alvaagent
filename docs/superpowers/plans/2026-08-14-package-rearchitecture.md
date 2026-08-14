@@ -529,7 +529,7 @@ ON_PERMISSION = None  # set by the REPL to an interactive prompt; headless = den
 
 `_permission` keeps reading the module-level `ON_PERMISSION` and `_APPROVED_SET`. `alvaagent_tui.py` must forward its `ON_PERMISSION = ask_permission` assignment onto the permissions module (Step 2). Behavior is identical; the Runtime phase moves the hook onto `rt.on_permission`.
 
-`classify_file_action`/`_in_project` use `DATA_DIR`/project dir — check the bodies: `_in_project` compares against the project folder. In `permissions.py` compute the project root from the package path the same way `config.data_dir()` does (repo root = package parent). Keep the allow/ask semantics byte-identical.
+`classify_file_action`/`_in_project` use `DATA_DIR`/project dir — check the bodies: `_in_project` compares against the project folder. In `permissions.py` compute the project root from the package path the same way `config.data_dir()` does (repo root = package parent) and **export it as `PROJECT_DIR`** (tui still references it at ~379/3600/3613, so the Step 2/3 import lists include `PROJECT_DIR`). `SKILLS_DIR` stays defined in `alvaagent_tui.py` (it belongs to the skills subsystem, Task 6). Keep the allow/ask semantics byte-identical.
 
 - [ ] **Step 2: Patch `alvaagent_tui.py`**
 
@@ -539,8 +539,8 @@ Delete the moved block and add the import:
 # permissions moved to alvaagent/permissions.py (Task 5)
 from alvaagent.permissions import (  # noqa: E402,F401
     _READONLY_PREFIXES, _RISKY_TOKENS, _RISKY_OPERATORS, _tokenize_shell,
-    classify_command, _in_project, classify_file_action, _APPROVED_SET,
-    _permission, ON_PERMISSION,
+    classify_command, PROJECT_DIR, _in_project, classify_file_action,
+    _APPROVED_SET, _permission, ON_PERMISSION,
 )
 ```
 
@@ -567,15 +567,15 @@ with:
     _perms.ON_PERMISSION = ask_permission  # interactive y/N for risky actions
 ```
 
-(The `ON_TOOL` global is still in `alvaagent_tui.py` until Task 11.)
+(The `ON_TOOL` global is still in `alvaagent_tui.py` until Task 11.) Also update the `global ON_TOOL, ON_PERMISSION` line in `main()` to just `global ON_TOOL` (ON_PERMISSION is no longer assigned there).
 
 - [ ] **Step 3: Re-export from the facade**
 
 ```python
 from alvaagent.permissions import (  # noqa: F401
     _READONLY_PREFIXES, _RISKY_TOKENS, _RISKY_OPERATORS, _tokenize_shell,
-    classify_command, _in_project, classify_file_action, _APPROVED_SET,
-    _permission, ON_PERMISSION,
+    classify_command, PROJECT_DIR, _in_project, classify_file_action,
+    _APPROVED_SET, _permission, ON_PERMISSION,
 )
 ```
 
