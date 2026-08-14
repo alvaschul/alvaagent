@@ -50,6 +50,11 @@ from alvaagent.store import (  # noqa: F401
     _store_get, _store_set, TODO_KEY, MEM_PREFIX, FEEDBACK_KEY,
     IMPROVEMENT_KEY, HISTORY_KEY, SESSION_KEY, ACTIVE_SESSION_KEY, MAX_SESSIONS,
 )
+from alvaagent.permissions import (  # noqa: F401
+    _READONLY_PREFIXES, _RISKY_TOKENS, _RISKY_OPERATORS, _tokenize_shell,
+    classify_command, PROJECT_DIR, _in_project, classify_file_action,
+    _APPROVED_SET, _permission, ON_PERMISSION,
+)
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
 # _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
