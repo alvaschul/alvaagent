@@ -9,7 +9,6 @@ import select
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 
 from alvaagent.config import DATA_DIR, TOOL_MODES, save_state
