@@ -166,6 +166,7 @@ def cmd_skin(rt, rest):
         p_err("unknown skin '%s' - see /skin" % arg)
         return
     rt.cfg["skin"] = arg
+    rt.skin = arg
     save_state(rt)
     set_active_skin(rt)
     p_ok("skin set to '%s' [OK]" % arg)
@@ -243,10 +244,10 @@ def cmd_self_test(rt):
     file tools, and the feedback/improvement/reflect tools.
     """
     tests = [
-        ("calculator basic", lambda: _check(tool_calculator(rt, "2+2")["ok"])),
-        ("calculator sqrt", lambda: _check(tool_calculator(rt, "sqrt(144)")["ok"])),
-        ("sandbox rejects div0", lambda: _check(_raises(lambda: tool_calculator(rt, "1/0")))),
-        ("sandbox rejects complex", lambda: _check(_raises(lambda: tool_calculator(rt, "(-8)**0.5")))),
+        ("calculator basic", lambda: _check(tool_calculator("2+2")["ok"])),
+        ("calculator sqrt", lambda: _check(tool_calculator("sqrt(144)")["ok"])),
+        ("sandbox rejects div0", lambda: _check(_raises(lambda: tool_calculator("1/0")))),
+        ("sandbox rejects complex", lambda: _check(_raises(lambda: tool_calculator("(-8)**0.5")))),
         ("todo add+list+remove", lambda: _check(_todo_check(rt))),
         ("memory save+recall", lambda: _check(_mem_check(rt))),
         ("skills list+read", lambda: _check(_skill_check(rt))),

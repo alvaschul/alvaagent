@@ -290,7 +290,7 @@ def set_active_skin(state):
 
 def run_agent_tui(history, cfg):
     rt = _get_rt()
-    rt.cfg = cfg
+    rt.cfg = _normalize_state(cfg)
     return _tui_mod.run_agent_tui(rt, history)
 
 

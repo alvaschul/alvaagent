@@ -3,6 +3,7 @@ import secrets
 
 from alvaagent.client import SYSTEM_PROMPT, chat_completion
 from alvaagent.config import DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT
+from alvaagent.context import default_rt
 from alvaagent.store import (
     ACTIVE_SESSION_KEY, MAX_SESSIONS, SESSION_KEY,
     _store_get, _store_set,
@@ -144,7 +145,7 @@ def summarize_with_llm(messages, cfg, max_words=350):
     msgs = ([{"role": "system", "content": sys_note}]
             + list(messages) + [{"role": "user", "content": prompt}])
     try:
-        data = chat_completion(msgs, cfg)
+        data = chat_completion(default_rt(), msgs, cfg)
         text = (data["choices"][0]["message"].get("content") or "").strip()
         if not text:
             return None
