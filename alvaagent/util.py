@@ -1,9 +1,6 @@
 import datetime
-import html
-import json
 import os
 import re
-import urllib.error
 import urllib.request
 
 try:
