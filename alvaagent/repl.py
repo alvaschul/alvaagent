@@ -4,8 +4,9 @@ import signal
 import sys
 import threading
 
-from alvaagent.config import HISTORY_PATH, TOOL_MODES, active_cfg, load_state
-from alvaagent.store import _load_store, _store_get, ACTIVE_SESSION_KEY
+from alvaagent.config import HISTORY_PATH, TOOL_MODES, active_cfg
+from alvaagent.context import default_rt
+from alvaagent.store import get as store_get, ACTIVE_SESSION_KEY
 from alvaagent.client import cancel_agent
 from alvaagent.sessions import (
     auto_title, context_usage, delete_session, _find_session, load_session,
@@ -13,7 +14,7 @@ from alvaagent.sessions import (
     _unique_session_name,
 )
 from alvaagent.tools import (
-    _set_tool_mode, _sync_tool_mode, active_tools, tool_skill_remove,
+    set_mode, sync_tool_mode, visible, tool_skill_remove,
 )
 from alvaagent.tui import (
     C, COLOR, banner, col, compress_now, on_tool, p_err, p_info, p_ok, p_warn,
@@ -28,7 +29,6 @@ from alvaagent.commands import (
     cmd_skin, cmd_test, cmd_tools, cmd_trace,
 )
 from alvaagent.util import _fmt_k
-import alvaagent.tools as _tools
 import alvaagent.tui as _tui
 # ---------------- REPL ----------------
 
@@ -72,12 +72,14 @@ def _slash_complete(text, state):
     return None
 
 
-def send_message(text, history, state, session):
+def _send_message_rt(rt, text):
     """Render the 'you' bubble, run the agent, manage context + sessions.
 
     Returns the (possibly auto-renamed) session name.
     """
-    cfg = active_cfg(state)
+    history = rt.history
+    session = rt.session
+    cfg = active_cfg(rt)
     # auto-title a fresh placeholder session from the first user message
     if session.startswith("sess-"):
         new_name = _unique_session_name(auto_title(text))
@@ -91,11 +93,11 @@ def send_message(text, history, state, session):
     # pre-turn safety: only act if the window is nearly full (0.9) - the post-turn
     # check (0.75) is the normal compressor, so both rarely fire in one turn
     if cfg.get("auto_compress", True):
-        compress_now(history, cfg, threshold=0.9)
+        compress_now(rt, history, threshold=0.9)
     try:
-        res = run_agent_tui(history, cfg)
+        res = run_agent_tui(rt, history)
     except KeyboardInterrupt:
-        cancel_agent()
+        cancel_agent(rt)
         p_info("cancelled")
         if history:
             history.pop()  # drop the unanswered message
@@ -143,9 +145,9 @@ def send_message(text, history, state, session):
     # post-turn: auto-compress if the response pushed us past the threshold
     compressed = False
     if cfg.get("auto_compress", True):
-        compressed = compress_now(history, cfg)
+        compressed = compress_now(rt, history)
     tokens, window = context_usage(history, cfg)
-    render_status_bar(state, session, res.get("elapsed", 0.0), res.get("tools", 0), history)
+    render_status_bar(rt.cfg, session, res.get("elapsed", 0.0), res.get("tools", 0), history)
     pct = tokens * 100 // window if window else 0
     if not compressed and window and pct >= 85:
         p_warn("context at %d%% of %s - /new starts a fresh session | /compress summarizes older messages"
@@ -154,16 +156,26 @@ def send_message(text, history, state, session):
     return session
 
 
-def repl():
-    state = load_state()
-    _sync_tool_mode(state)
-    set_active_skin(state)
+def send_message(text, history, state, session):
+    """Public flat bridge: build a runtime from the args and delegate."""
+    rt = default_rt()
+    rt.history = history
+    rt.cfg = state
+    rt.session = session
+    return _send_message_rt(rt, text)
+
+
+def repl(rt):
+    sync_tool_mode(rt)
+    set_active_skin(rt)
     # resume the last active session (conversations persist across restarts)
-    session = _store_get(ACTIVE_SESSION_KEY) or "default"
+    session = store_get(rt, ACTIVE_SESSION_KEY) or "default"
     history = load_session(session)
+    rt.history = history
+    rt.session = session
     # last completed turn, for /redo (session-scoped so it can't leak across
     # a /session switch)
-    _last_turn = {"session": None, "text": None, "pre": None}
+    rt.last_turn = {"session": None, "text": None, "pre": None}
     while True:
         try:
             prompt = col(_tui.CUR_SKIN["accent"], "> ") if COLOR else "> "
@@ -186,33 +198,33 @@ def repl():
             if c in ("/help", "/h", "/?"):
                 cmd_help()
             elif c == "/config":
-                cmd_config(state)
+                cmd_config(rt)
             elif c == "/provider":
-                cmd_provider(state, rest)
+                cmd_provider(rt, rest)
             elif c == "/test":
-                cmd_test(state)
+                cmd_test(rt)
             elif c == "/tools":
                 arg = rest.strip().lower()
                 if arg in TOOL_MODES:
-                    _set_tool_mode(state, arg)
+                    set_mode(rt, arg)
                     p_ok("tool mode: %s (%d tools advertised to the model)"
-                         % (_tools._TOOLS_MODE, len(active_tools())))
+                         % (rt.tool_mode, len(visible(rt))))
                 else:
-                    cmd_tools()
+                    cmd_tools(rt)
             elif c == "/trace":
-                cmd_trace(rest)
+                cmd_trace(rt, rest)
             elif c == "/models":
-                cmd_models(state)
+                cmd_models(rt)
             elif c == "/skin":
-                cmd_skin(state, rest)
+                cmd_skin(rt, rest)
             elif c == "/sessions":
-                cmd_sessions()
+                cmd_sessions(rt)
             elif c == "/session":
                 arg, _, sub = rest.strip().partition(" ")
                 arg = arg.strip().lower()
                 sub = sub.strip()
                 if not arg or arg in ("ls", "list", "show"):
-                    cmd_sessions()
+                    cmd_sessions(rt)
                 elif arg in ("rm", "remove", "del", "delete"):
                     target = _find_session(sub)
                     if not sub:
@@ -247,32 +259,35 @@ def repl():
                         p_info("(new session '%s')" % target)
                     history[:] = load_session(target)
                     session = target
+                    rt.session = session
                     save_session(session, history)  # mark active + refresh timestamp
                     p_ok("switched to session '%s' | %d messages" % (session, len(history)))
             elif c == "/context":
-                cmd_context(state, rest, history)
+                cmd_context(rt, rest, history)
             elif c == "/compress":
-                cmd_compress(history, state, session)
+                cmd_compress(rt, history, session)
             elif c == "/new":
                 save_session(session, history)
-                cmd_clear(history)
+                cmd_clear(rt, history)
                 session = new_session_name()
+                rt.session = session
                 save_session(session, history)
                 p_ok("new session: " + session)
             elif c == "/clear":
-                cmd_clear(history)
+                cmd_clear(rt, history)
             elif c == "/multi":
                 text = cmd_multi()
                 if text and text.strip():
-                    session = send_message(text.strip(), history, state, session)
+                    session = _send_message_rt(rt, text.strip())
+                    rt.session = session
             elif c == "/install_skill":
-                cmd_install_skill(rest)
+                cmd_install_skill(rt, rest)
             elif c == "/self-test":
-                cmd_self_test()
+                cmd_self_test(rt)
             elif c == "/improve":
-                cmd_improve(rest)
+                cmd_improve(rt, rest)
             elif c == "/skills":
-                cmd_skills(rest)
+                cmd_skills(rt, rest)
             elif c == "/skill":
                 op, _, arg = rest.strip().partition(" ")
                 op = op.strip().lower()
@@ -280,41 +295,43 @@ def repl():
                     if not arg:
                         p_err("usage: /skill rm <name>")
                         continue
-                    r = tool_skill_remove(arg)
+                    r = tool_skill_remove(rt, arg)
                     if r.get("ok"):
                         p_ok("removed skill '%s' (category: %s) [OK]"
                              % (r.get("name", "?"), r.get("category") or "(flat)"))
                     else:
                         p_err("  " + r.get("error", "?"))
                 elif op in ("cat", "category", "cats", "categories"):
-                    cmd_skill_category(arg)
+                    cmd_skill_category(rt, arg)
                 else:
                     p_err("usage: /skill rm <name>  |  /skill category [name]")
                 continue
             elif c == "/memory":
-                cmd_memory()
+                cmd_memory(rt)
             elif c == "/export":
                 cmd_export(history)
             elif c == "/stop":
-                cancel_agent()
+                cancel_agent(rt)
                 p_info("stopping...")
             elif c == "/redo":
-                if _last_turn.get("session") != session or _last_turn.get("text") is None:
+                if rt.last_turn.get("session") != session or rt.last_turn.get("text") is None:
                     p_err("nothing to redo - send a message first (in this session)")
                     continue
-                history[:] = _last_turn["pre"]
-                p_info("(re-running: %s)" % _last_turn["text"][:80])
-                session = send_message(_last_turn["text"], history, state, session)
+                history[:] = rt.last_turn["pre"]
+                p_info("(re-running: %s)" % rt.last_turn["text"][:80])
+                session = _send_message_rt(rt, rt.last_turn["text"])
+                rt.session = session
             elif c in ("/exit", "/quit", "/q"):
                 break
             else:
                 p_err("unknown command: " + c + "   (/help for the list)")
             continue
 
-        _last_turn["session"] = session
-        _last_turn["text"] = line
-        _last_turn["pre"] = list(history)
-        session = send_message(line, history, state, session)
+        rt.last_turn["session"] = session
+        rt.last_turn["text"] = line
+        rt.last_turn["pre"] = list(history)
+        session = _send_message_rt(rt, line)
+        rt.session = session
         save_completion_history()  # persist input history after each turn
     save_session(session, history)
     save_completion_history()  # flush readline history to disk on exit
@@ -322,15 +339,11 @@ def repl():
 
 
 def main():
-    import alvaagent.agent as _agent
-    _load_store()
+    rt = default_rt()
+    rt.on_permission = lambda desc: ask_permission(rt, desc)  # interactive y/N for risky actions
+    rt.on_tool = on_tool        # live tool-progress blocks
     setup_completion()
-    _agent.ON_TOOL = on_tool        # live tool-progress blocks
-    import alvaagent.permissions as _perms
-    _perms.ON_PERMISSION = ask_permission  # interactive y/N for risky actions
-    state = load_state()
-    _sync_tool_mode(state)
-    set_active_skin(state)
+    set_active_skin(rt)
 
     # Guarantee screen restoration even on SIGTERM / OOM kill / crash.
     # SIGTERM and SIGINT both route through _cleanup so the alternate-screen
@@ -373,7 +386,7 @@ def main():
     sys.stdout.write("\x1b[?1049h")
     sys.stdout.flush()
     try:
-        banner(state)
-        repl()
+        banner(rt.cfg)
+        repl(rt)
     finally:
         _cleanup()

@@ -9,7 +9,7 @@ from alvaagent.config import (
     active_cfg, save_state,
 )
 from alvaagent.store import (
-    _store, _store_get, _store_set, TODO_KEY, MEM_PREFIX, FEEDBACK_KEY,
+    get as store_get, set as store_set, TODO_KEY, MEM_PREFIX, FEEDBACK_KEY,
     IMPROVEMENT_KEY, HISTORY_KEY, ACTIVE_SESSION_KEY,
 )
 from alvaagent.permissions import classify_command, PROJECT_DIR
@@ -17,7 +17,7 @@ from alvaagent.skills import (
     tool_skill_list, tool_skill_read, tool_skill_install, tool_skill_sync_repo,
 )
 from alvaagent.tools import (
-    _ADVANCED_TOOL_NAMES, active_tools, TOOLS,
+    _ADVANCED_TOOL_NAMES, visible, TOOLS,
     tool_file_read, tool_file_write, tool_file_edit, tool_todo_list,
     tool_todo_add, tool_todo_toggle, tool_todo_remove, tool_memory_save,
     tool_memory_recall, tool_feedback, tool_improvement_set,
@@ -33,7 +33,6 @@ from alvaagent.tui import (
     set_active_skin, _UI,
 )
 from alvaagent.util import mask_key, _fmt_k
-import alvaagent.tools as _tools
 import alvaagent.tui as _tui
 
 
@@ -66,8 +65,8 @@ def ask_key(current):
     return parse_key(v, current)
 
 
-def ask_permission(desc):
-    """Interactive y/N/a prompt used as ON_PERMISSION in the REPL.
+def ask_permission(rt, desc):
+    """Interactive y/N/a prompt used as rt.on_permission in the REPL.
 
     y or a approve (and are remembered for this session, so the same action
     won't prompt again); anything else denies.
@@ -89,19 +88,20 @@ def ask_permission(desc):
         sp.start()
     if v in ("y", "yes", "a", "allow", "always"):
         print("    (remembered for this session - restart to reset)")
+        rt.approved.add(desc)
         return True
     return False
 
 
 # ---------------- slash commands ----------------
-def pick_model(base_url, api_key, current, fetch=True):
+def pick_model(rt, base_url, api_key, current, fetch=True):
     """Fetch the models for an endpoint+key and let the user pick one.
 
     With fetch=False (endpoint unchanged), just ask for the model id directly.
     """
     if fetch:
         try:
-            models = fetch_models(base_url, api_key)
+            models = fetch_models(rt, base_url, api_key)
         except Exception as e:
             p_info("  (couldn't fetch models: %s)" % e)
             return ask("model", current)
@@ -133,13 +133,13 @@ def pick_model(base_url, api_key, current, fetch=True):
     return ask("model", current)
 
 
-def cmd_models(state):
-    cfg = active_cfg(state)
+def cmd_models(rt):
+    cfg = active_cfg(rt)
     if not (cfg.get("base_url") or "").rstrip("/"):
-        p_err("no base url configured for '%s' - run /provider %s" % (state["active"], state["active"]))
+        p_err("no base url configured for '%s' - run /provider %s" % (rt.cfg["active"], rt.cfg["active"]))
         return
-    cfg["model"] = pick_model(cfg.get("base_url", ""), cfg.get("api_key", ""), cfg.get("model", ""))
-    save_state(state)
+    cfg["model"] = pick_model(rt, cfg.get("base_url", ""), cfg.get("api_key", ""), cfg.get("model", ""))
+    save_state(rt)
     p_ok("saved [OK]")
 
 
@@ -152,32 +152,32 @@ _SLASH_COMMANDS = [
 ]
 
 
-def cmd_skin(state, rest):
+def cmd_skin(rt, rest):
     """List or switch the UI skin (persisted in config.json)."""
     arg = rest.strip().lower()
     if not arg or arg in ("ls", "list"):
         print("  skins:")
         for name, sk in SKINS.items():
-            mark = "   <- active" if (state.get("skin") or DEFAULT_SKIN) == name else ""
+            mark = "   <- active" if (rt.cfg.get("skin") or DEFAULT_SKIN) == name else ""
             print("    %-10s %s%s" % (name, sk["desc"], mark))
         print("  usage: /skin <name>")
         return
     if arg not in SKINS:
         p_err("unknown skin '%s' - see /skin" % arg)
         return
-    state["skin"] = arg
-    save_state(state)
-    set_active_skin(state)
+    rt.cfg["skin"] = arg
+    save_state(rt)
+    set_active_skin(rt)
     p_ok("skin set to '%s' [OK]" % arg)
 
 
-def cmd_sessions():
+def cmd_sessions(rt):
     """List saved sessions (name, message count, last updated)."""
     sess = sessions_map()
     if not sess:
         print("  (no sessions yet - /session <name> starts one)")
         return
-    active = _store_get(ACTIVE_SESSION_KEY, "default")
+    active = store_get(rt, ACTIVE_SESSION_KEY, "default")
     print("  sessions (%d):" % len(sess))
     for name in sorted(sess, key=lambda n: (sess[n].get("updated") or ""), reverse=True):
         rec = sess[name]
@@ -188,9 +188,9 @@ def cmd_sessions():
     print("  usage: /session <name> | /session rm <name> | /session rename <old> <new>")
 
 
-def cmd_context(state, rest, history):
+def cmd_context(rt, rest, history):
     """Context usage for the active provider + its settings."""
-    cfg = active_cfg(state)
+    cfg = active_cfg(rt)
     parts = rest.strip().split(None, 1)
     sub = parts[0].lower() if parts else ""
     val = parts[1].strip() if len(parts) > 1 else ""
@@ -204,12 +204,12 @@ def cmd_context(state, rest, history):
             p_err("usage: /context window <tokens>  (0 = auto-detect from the model)")
             return
         cfg["context_window"] = w
-        save_state(state)
+        save_state(rt)
         p_ok("context window set to %s [OK]" % (_fmt_k(w) if w else "auto"))
         return
     if sub in ("auto", "autocompress", "auto-compress"):
         cfg["auto_compress"] = not cfg.get("auto_compress", True)
-        save_state(state)
+        save_state(rt)
         p_ok("auto-compress %s [OK]" % ("on" if cfg["auto_compress"] else "off"))
         return
     tokens, window = context_usage(history, cfg)
@@ -219,7 +219,7 @@ def cmd_context(state, rest, history):
     print("    conversation  : %s tokens (%d messages)"
           % (_fmt_k(tokens - estimate_tokens(SYSTEM_PROMPT)), len(history)))
     print("    total         : %s / %s  (%d%%)" % (_fmt_k(tokens), _fmt_k(window), pct))
-    print("  settings ('%s'):" % state["active"])
+    print("  settings ('%s'):" % rt.cfg["active"])
     print("    context window: %s   (/context window <n> to override)" % _fmt_k(window))
     print("    auto-compress : %s  at 75%% of the window   (/context autocompress toggles)"
           % ("on" if cfg.get("auto_compress", True) else "off"))
@@ -227,36 +227,36 @@ def cmd_context(state, rest, history):
         p_warn("context is %d%% full - /new starts a fresh session | /compress summarizes now" % pct)
 
 
-def cmd_compress(history, state, session):
+def cmd_compress(rt, history, session):
     """Manually summarize older messages to free context (persists immediately)."""
     if len(history) < 8:
         p_info("(conversation is short - nothing to compress)")
         return
-    if compress_now(history, active_cfg(state), force=True):
+    if compress_now(rt, history, force=True):
         save_session(session, history)
 
 
-def cmd_self_test():
+def cmd_self_test(rt):
     """Run the harness self-test suite and show results.
 
     Tests calculator, sandbox, todo, memory, skills, command classification,
     file tools, and the feedback/improvement/reflect tools.
     """
     tests = [
-        ("calculator basic", lambda: _check(tool_calculator("2+2")["ok"])),
-        ("calculator sqrt", lambda: _check(tool_calculator("sqrt(144)")["ok"])),
-        ("sandbox rejects div0", lambda: _check(_raises(lambda: tool_calculator("1/0")))),
-        ("sandbox rejects complex", lambda: _check(_raises(lambda: tool_calculator("(-8)**0.5")))),
-        ("todo add+list+remove", lambda: _check(_todo_check())),
-        ("memory save+recall", lambda: _check(_mem_check())),
-        ("skills list+read", lambda: _check(_skill_check())),
+        ("calculator basic", lambda: _check(tool_calculator(rt, "2+2")["ok"])),
+        ("calculator sqrt", lambda: _check(tool_calculator(rt, "sqrt(144)")["ok"])),
+        ("sandbox rejects div0", lambda: _check(_raises(lambda: tool_calculator(rt, "1/0")))),
+        ("sandbox rejects complex", lambda: _check(_raises(lambda: tool_calculator(rt, "(-8)**0.5")))),
+        ("todo add+list+remove", lambda: _check(_todo_check(rt))),
+        ("memory save+recall", lambda: _check(_mem_check(rt))),
+        ("skills list+read", lambda: _check(_skill_check(rt))),
         ("classify allow: ls", lambda: _check(classify_command("ls -la") == "allow")),
         ("classify ask: rm -rf", lambda: _check(classify_command("rm -rf /") == "ask")),
         ("classify ask: subshell", lambda: _check(classify_command("echo $(whoami)") == "ask")),
-        ("file_read in project", lambda: _check(tool_file_read(__file__)["ok"])),
-        ("file_write temp", lambda: _check(_file_write_check())),
-        ("file_edit temp", lambda: _check(_file_edit_check())),
-        ("feedback+improvement+reflect", lambda: _check(_feedback_check())),
+        ("file_read in project", lambda: _check(tool_file_read(rt, __file__)["ok"])),
+        ("file_write temp", lambda: _check(_file_write_check(rt))),
+        ("file_edit temp", lambda: _check(_file_edit_check(rt))),
+        ("feedback+improvement+reflect", lambda: _check(_feedback_check(rt))),
     ]
     total = len(tests)
     passed = 0
@@ -294,42 +294,42 @@ def _raises(fn):
     return False
 
 
-def _todo_check():
-    r = tool_todo_add("self-test-todo")
+def _todo_check(rt):
+    r = tool_todo_add(rt, "self-test-todo")
     if not r.get("ok"):
         return False
-    items = tool_todo_list().get("todos", [])
+    items = tool_todo_list(rt).get("todos", [])
     found = any(t.get("text") == "self-test-todo" and not t.get("done") for t in items)
-    tool_todo_remove(len(items) - 1)
+    tool_todo_remove(rt, len(items) - 1)
     return found
 
 
-def _mem_check():
-    r = tool_memory_save("self-test-mem", "hello")
+def _mem_check(rt):
+    r = tool_memory_save(rt, "self-test-mem", "hello")
     if not r.get("ok"):
         return False
-    v = tool_memory_recall("self-test-mem").get("value")
-    tool_memory_save("self-test-mem", "")
+    v = tool_memory_recall(rt, "self-test-mem").get("value")
+    tool_memory_save(rt, "self-test-mem", "")
     return v == "hello"
 
 
-def _skill_check():
-    skills = tool_skill_list().get("skills", [])
+def _skill_check(rt):
+    skills = tool_skill_list(rt).get("skills", [])
     if not skills:
         return True
     name = skills[0]["name"]
-    r = tool_skill_read(name)
+    r = tool_skill_read(rt, name)
     return r.get("ok") and r.get("content")
 
 
-def _file_write_check():
+def _file_write_check(rt):
     # stay inside PROJECT_DIR: /tmp is out-of-project and would trigger a
     # permission prompt (or a headless deny), which a self-test shouldn't do
     tmp = os.path.join(PROJECT_DIR, ".alva_sst_write.txt")
-    r = tool_file_write(tmp, "test")
+    r = tool_file_write(rt, tmp, "test")
     if not r.get("ok"):
         return False
-    content = tool_file_read(tmp).get("content", "")
+    content = tool_file_read(rt, tmp).get("content", "")
     try:
         os.remove(tmp)
     except OSError:
@@ -337,17 +337,17 @@ def _file_write_check():
     return content == "test"
 
 
-def _file_edit_check():
+def _file_edit_check(rt):
     tmp = os.path.join(PROJECT_DIR, ".alva_sst_edit.txt")
-    tool_file_write(tmp, "hello world")
-    r = tool_file_edit(tmp, "hello", "goodbye")
+    tool_file_write(rt, tmp, "hello world")
+    r = tool_file_edit(rt, tmp, "hello", "goodbye")
     if not r.get("ok"):
         try:
             os.remove(tmp)
         except OSError:
             pass
         return False
-    content = tool_file_read(tmp).get("content", "")
+    content = tool_file_read(rt, tmp).get("content", "")
     try:
         os.remove(tmp)
     except OSError:
@@ -355,23 +355,23 @@ def _file_edit_check():
     return content == "goodbye world"
 
 
-def _feedback_check():
-    r1 = tool_feedback("good", "self-test check")
+def _feedback_check(rt):
+    r1 = tool_feedback(rt, "good", "self-test check")
     if not r1.get("ok"):
         return False
-    fb = _store_get(FEEDBACK_KEY, [])
+    fb = store_get(rt, FEEDBACK_KEY, [])
     if not fb or fb[-1].get("rating") != "good":
         return False
-    r2 = tool_improvement_set("self-test-area", "fix something")
+    r2 = tool_improvement_set(rt, "self-test-area", "fix something")
     if not r2.get("ok"):
         return False
-    imps = _store_get(IMPROVEMENT_KEY, [])
+    imps = store_get(rt, IMPROVEMENT_KEY, [])
     if not imps or imps[-1].get("area") != "self-test-area":
         return False
-    r3 = tool_reflect()
+    r3 = tool_reflect(rt)
     if not r3.get("ok"):
         return False
-    tool_improvement_done("self-test-area")
+    tool_improvement_done(rt, "self-test-area")
     return True
 
 
@@ -418,9 +418,9 @@ def cmd_help():
     print("    Ctrl+C                 while a request runs: cancel it (same as /stop)")
 
 
-def cmd_config(state):
-    cfg = active_cfg(state)
-    print("  provider '%s' settings:" % state["active"])
+def cmd_config(rt):
+    cfg = active_cfg(rt)
+    print("  provider '%s' settings:" % rt.cfg["active"])
     print("    base url    : " + cfg.get("base_url", ""))
     print("    api key     : " + mask_key(cfg.get("api_key", "")))
     print("    model       : " + cfg.get("model", ""))
@@ -432,7 +432,7 @@ def cmd_config(state):
     key = ask_key(cfg.get("api_key", ""))
     unchanged = (base == (cfg.get("base_url") or "") and key == (cfg.get("api_key") or "") and bool(cfg.get("model")))
     cfg["base_url"], cfg["api_key"] = base, key
-    cfg["model"] = pick_model(base, key, cfg.get("model", ""), fetch=not unchanged)
+    cfg["model"] = pick_model(rt, base, key, cfg.get("model", ""), fetch=not unchanged)
     try:
         cfg["temperature"] = float(ask("temperature", str(cfg.get("temperature", 0.7))))
     except ValueError:
@@ -444,18 +444,18 @@ def cmd_config(state):
     ac = ask("auto-compress near the context limit (y/n)",
              "y" if cfg.get("auto_compress", True) else "n").strip().lower()
     cfg["auto_compress"] = ac in ("y", "yes", "on", "1", "true")
-    save_state(state)
+    save_state(rt)
     p_ok("saved [OK]")
 
 
-def _list_providers(state):
-    profiles = state["profiles"]
+def _list_providers(rt):
+    profiles = rt.cfg["profiles"]
     if not profiles:
         print("  (no providers configured)")
         return
     print("  providers:")
     for name, p in profiles.items():
-        mark = "   <- active" if name == state["active"] else ""
+        mark = "   <- active" if name == rt.cfg["active"] else ""
         print("    %-12s %s | model %s | key %s%s"
               % (name, p.get("base_url") or "(no base)",
                  p.get("model") or "-", mask_key(p.get("api_key", "")), mark))
@@ -463,14 +463,14 @@ def _list_providers(state):
     print("  presets: openai | groq | openrouter | gemini | custom   (any other name = custom endpoint)")
 
 
-def cmd_provider(state, rest):
-    profiles = state["profiles"]
+def cmd_provider(rt, rest):
+    profiles = rt.cfg["profiles"]
     arg, _, sub = rest.strip().partition(" ")
     arg = arg.strip().lower()
     sub = sub.strip()
 
     if arg in ("ls", "list"):
-        _list_providers(state)
+        _list_providers(rt)
         return
     if arg in ("rm", "remove", "del", "delete"):
         sub = sub.lower()
@@ -481,21 +481,21 @@ def cmd_provider(state, rest):
             p_err("no provider named '%s'" % sub)
             return
         del profiles[sub]
-        if state["active"] == sub:
-            state["active"] = next(iter(profiles)) if profiles else "openai"
-            if state["active"] not in profiles:
-                profiles[state["active"]] = dict(DEFAULT_CFG)
-        save_state(state)
+        if rt.cfg["active"] == sub:
+            rt.cfg["active"] = next(iter(profiles)) if profiles else "openai"
+            if rt.cfg["active"] not in profiles:
+                profiles[rt.cfg["active"]] = dict(DEFAULT_CFG)
+        save_state(rt)
         p_ok("removed '%s' [OK]" % sub)
         return
     if not arg:
-        _list_providers(state)
+        _list_providers(rt)
         return
 
     # switch to an existing provider
     if arg in profiles:
-        state["active"] = arg
-        save_state(state)
+        rt.cfg["active"] = arg
+        save_state(rt)
         p_ok("switched to '%s' [OK]" % arg)
         return
 
@@ -510,18 +510,18 @@ def cmd_provider(state, rest):
     if arg == "custom" or p is None:
         prof["base_url"] = ask("base url", prof.get("base_url", ""))
     prof["api_key"] = ask_key("")
-    prof["model"] = pick_model(prof.get("base_url", ""), prof.get("api_key", ""), prof.get("model", ""))
+    prof["model"] = pick_model(rt, prof.get("base_url", ""), prof.get("api_key", ""), prof.get("model", ""))
     profiles[arg] = prof
-    state["active"] = arg
-    save_state(state)
+    rt.cfg["active"] = arg
+    save_state(rt)
     p_ok("added '%s' [OK]" % arg)
 
 
-def cmd_test(state):
-    cfg = active_cfg(state)
+def cmd_test(rt):
+    cfg = active_cfg(rt)
     base = (cfg.get("base_url") or "").rstrip("/")
     if not base:
-        p_err("no base url configured for '%s' - run /provider %s" % (state["active"], state["active"]))
+        p_err("no base url configured for '%s' - run /provider %s" % (rt.cfg["active"], rt.cfg["active"]))
         return
     req = urllib.request.Request(
         base + "/models",
@@ -539,11 +539,11 @@ def cmd_test(state):
         p_err("cannot reach API: %s" % e)
 
 
-def cmd_tools():
+def cmd_tools(rt):
     """List the active tool set (only what the model can currently see)."""
-    active = active_tools()
+    active = visible(rt)
     print("  tool mode: %s - %d/%d tools advertised to the model"
-          % (_tools._TOOLS_MODE, len(active), len(TOOLS)))
+          % (rt.tool_mode, len(active), len(TOOLS)))
     for t in active:
         fn = t["function"]
         print("  %-14s %s" % (fn["name"], fn.get("description", "")))
@@ -553,7 +553,7 @@ def cmd_tools():
               % (hidden, ", ".join(sorted(_ADVANCED_TOOL_NAMES))))
 
 
-def cmd_trace(rest):
+def cmd_trace(rt, rest):
     """Print the last n lines of trace.log, oldest first (default 15)."""
     try:
         n = max(1, min(200, int(str(rest or "15").strip())))
@@ -574,8 +574,8 @@ def cmd_trace(rest):
         print("  %s %s" % (ev, json.dumps(rest_rec, ensure_ascii=False)[:220]))
 
 
-def cmd_todos():
-    lst = tool_todo_list().get("todos", [])
+def cmd_todos(rt):
+    lst = tool_todo_list(rt).get("todos", [])
     if not lst:
         print("  (empty)")
         return
@@ -584,15 +584,15 @@ def cmd_todos():
         print("  %d %s %s" % (i, mark, t.get("text", "")))
 
 
-def cmd_todo(rest):
+def cmd_todo(rt, rest):
     parts = rest.split(None, 1)
     op = parts[0].lower() if parts else ""
     arg = parts[1].strip() if len(parts) > 1 else ""
     if not op or op in ("list", "ls", "show"):
-        cmd_todos()
+        cmd_todos(rt)
         return
     if op in ("add", "a"):
-        r = tool_todo_add(arg)
+        r = tool_todo_add(rt, arg)
         if r.get("ok"):
             p_ok("  added #%d: %s" % (r["index"], r["text"]))
         else:
@@ -600,7 +600,7 @@ def cmd_todo(rest):
         return
     if op in ("done", "toggle", "t", "d"):
         try:
-            r = tool_todo_toggle(int(arg))
+            r = tool_todo_toggle(rt, int(arg))
         except ValueError:
             p_err("  need an index, e.g. /todo done 0")
             return
@@ -611,7 +611,7 @@ def cmd_todo(rest):
         return
     if op in ("rm", "remove", "del", "delete"):
         try:
-            r = tool_todo_remove(int(arg))
+            r = tool_todo_remove(rt, int(arg))
         except ValueError:
             p_err("  need an index, e.g. /todo rm 0")
             return
@@ -621,14 +621,14 @@ def cmd_todo(rest):
             p_err("  " + r.get("error", "?"))
         return
     if op == "clear":
-        _store_set(TODO_KEY, [])
+        store_set(rt, TODO_KEY, [])
         p_ok("  list cleared")
         return
     p_err("  usage: /todo <text> | /todo done <i> | /todo rm <i> | /todo clear")
 
 
-def cmd_memory():
-    facts = [(k[len(MEM_PREFIX):], v) for k, v in _store.items() if k.startswith(MEM_PREFIX)]
+def cmd_memory(rt):
+    facts = [(k[len(MEM_PREFIX):], v) for k, v in rt.store.items() if k.startswith(MEM_PREFIX)]
     if not facts:
         print("  (no saved facts)")
         return
@@ -640,7 +640,7 @@ def cmd_memory():
         print("  %-16s %-20s %s" % (k, tags, val))
 
 
-def cmd_feedback(rest):
+def cmd_feedback(rt, rest):
     """Record feedback on the agent's last response.
 
     Usage: /feedback good | /feedback bad <notes> | /feedback neutral
@@ -654,14 +654,14 @@ def cmd_feedback(rest):
         p_err("rating must be good, bad, or neutral")
         return
     notes = parts[1] if len(parts) > 1 else ""
-    r = tool_feedback(rating, notes or None)
+    r = tool_feedback(rt, rating, notes or None)
     if r.get("ok"):
         p_ok("feedback recorded: %s%s" % (rating, " - " + notes if notes else ""))
     else:
         p_err("  " + r.get("error", "?"))
 
 
-def cmd_skills(rest=""):
+def cmd_skills(rt, rest=""):
     arg = (rest or "").strip()
     if arg.startswith("install "):
         target = arg[len("install "):].strip()
@@ -669,7 +669,7 @@ def cmd_skills(rest=""):
             p_err("usage: /skills install <url|path> [category]")
             return
         parts = target.split(None, 1)
-        r = tool_skill_install(parts[0], parts[1].strip() if len(parts) > 1 else None)
+        r = tool_skill_install(rt, parts[0], parts[1].strip() if len(parts) > 1 else None)
         if r.get("ok"):
             p_ok("installed skill '%s' [OK]" % r.get("name"))
             if r.get("category"):
@@ -682,7 +682,7 @@ def cmd_skills(rest=""):
         if not parts:
             p_err("usage: /skills sync <repo-url> [subdir]")
             return
-        r = tool_skill_sync_repo(parts[0], parts[1].strip() if len(parts) > 1 else None)
+        r = tool_skill_sync_repo(rt, parts[0], parts[1].strip() if len(parts) > 1 else None)
         if r.get("ok"):
             p_ok("synced %d skills from repo [OK]" % r.get("count"))
             for s in r.get("installed", []):
@@ -694,9 +694,9 @@ def cmd_skills(rest=""):
             p_err("  " + r.get("error", "?"))
         return
     if arg:
-        cmd_skill_category(arg)
+        cmd_skill_category(rt, arg)
         return
-    skills = tool_skill_list().get("skills") or []
+    skills = tool_skill_list(rt).get("skills") or []
     if not skills:
         print("  (no skills yet - ask the agent to save one)")
         return
@@ -720,10 +720,10 @@ def cmd_skills(rest=""):
                                       col(C.DIM, tagstr)))
 
 
-def cmd_skill_category(rest):
+def cmd_skill_category(rt, rest):
     """List skills in a category, or list all categories."""
     arg = (rest or "").strip().lower()
-    skills = tool_skill_list().get("skills") or []
+    skills = tool_skill_list(rt).get("skills") or []
     if arg in ("ls", "list", "show"):
         # list categories
         cats = {}
@@ -741,7 +741,7 @@ def cmd_skill_category(rest):
         return
     if not arg:
         # no arg: list all categories
-        cmd_skill_category("ls")
+        cmd_skill_category(rt, "ls")
         return
     # show skills in one category
     cat_skills = [s for s in skills if (s.get("category") or "(flat)") == arg]
@@ -761,10 +761,10 @@ def cmd_skill_category(rest):
                                   col(C.DIM, tagstr)))
 
 
-def cmd_reflect():
+def cmd_reflect(rt):
     """Review all feedback + improvement areas and propose actions."""
-    fb = _store_get(FEEDBACK_KEY, [])
-    imps = _store_get(IMPROVEMENT_KEY, [])
+    fb = store_get(rt, FEEDBACK_KEY, [])
+    imps = store_get(rt, IMPROVEMENT_KEY, [])
     if not fb and not imps:
         p_info("(no feedback or improvements yet)")
         return
@@ -790,7 +790,7 @@ def cmd_reflect():
     if not bad and not open_imgs:
         print("    - no open issues - keep doing what works")
     print("  (re-run /reflect after making changes to mark them done)")
-def cmd_improve(rest):
+def cmd_improve(rt, rest):
     """Manage self-improvement areas.
 
     Usage:
@@ -807,7 +807,7 @@ def cmd_improve(rest):
         return
     sub = parts[0].lower()
     if sub in ("list", "ls", "show"):
-        items = _store_get(IMPROVEMENT_KEY, [])
+        items = store_get(rt, IMPROVEMENT_KEY, [])
         if not items:
             p_info("(no improvement areas yet)")
             return
@@ -829,7 +829,7 @@ def cmd_improve(rest):
             return
         area = parts[1]
         action = parts[2]
-        r = tool_improvement_set(area, action)
+        r = tool_improvement_set(rt, area, action)
         if r.get("ok"):
             p_ok("improvement recorded: %s" % area)
         else:
@@ -838,7 +838,7 @@ def cmd_improve(rest):
         if len(parts) < 2:
             p_err("usage: /improve done <area>")
             return
-        r = tool_improvement_done(parts[1])
+        r = tool_improvement_done(rt, parts[1])
         if r.get("ok"):
             p_ok("marked done: %s" % r.get("area", parts[1]))
         else:
@@ -847,17 +847,17 @@ def cmd_improve(rest):
         p_err("unknown subcommand: %s (list/add/done)" % sub)
 
 
-def cmd_install_skill(rest):
+def cmd_install_skill(rt, rest):
     # Install a skill from a local .md file or a URL (delegates to
     # tool_skill_install so GitHub/blob URLs are auto-rewritten to raw).
-    r = tool_skill_install(rest.strip())
+    r = tool_skill_install(rt, rest.strip())
     if r.get("ok"):
         p_ok("installed skill '%s' [OK]" % r.get("name"))
         if r.get("category"):
             print("    category: %s" % r["category"])
     else:
         p_err("failed to install skill: %s" % r.get("error", "unknown error"))
-def cmd_clear(history):
+def cmd_clear(rt, history):
     if not history:
         p_info("(conversation is already empty)")
         return
@@ -870,7 +870,7 @@ def cmd_clear(history):
         p_info("(cleared skipped)")
         return
     history.clear()
-    _store_set(HISTORY_KEY, [])
+    store_set(rt, HISTORY_KEY, [])
     p_ok("conversation cleared")
 
 

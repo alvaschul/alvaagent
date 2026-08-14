@@ -30,7 +30,8 @@ if _tui is None:
     _tui = _sys.modules["alvaagent_tui"]
 from alvaagent.util import (  # noqa: F401
     _env, now_iso, _fmt_k, _atomic_write, _looks_like_html, _raw_fetch,
-    mask_key, _parse_frontmatter, _frontmatter_load, _frontmatter_dump,
+    mask_key, _parse_frontmatter, _frontmatter_dump, _SKILL_FM_RE,
+    _SKILL_FM_DEFAULT, _VALID_FM_KEYS, _SKILL_RAW_MAX,
     _mini_yaml, _mini_scalar, _finish_block,
 )
 from alvaagent.context import (  # noqa: F401
@@ -58,7 +59,6 @@ from alvaagent.permissions import (  # noqa: F401
     request_permission,
 )
 from alvaagent.skills import (  # noqa: F401
-    _SKILL_FM_RE, _SKILL_FM_DEFAULT, _VALID_FM_KEYS, _SKILL_RAW_MAX,
     _skill_body_for_tool, _detect_category, _skill_filepath, _inside_skills,
     _resolve_skill_path, _skill_read, _scan_skill_files, _skill_list_all,
     tool_skill_list as _skills_list, tool_skill_read as _skills_read,
@@ -259,23 +259,53 @@ from alvaagent.agent import (  # noqa: F401
 import alvaagent.agent as _agent_mod
 
 from alvaagent.tui import (  # noqa: F401
-    SKINS, C, set_active_skin, col, p_info, p_err, p_ok, p_warn, _term_width,
+    SKINS, C, col, p_info, p_err, p_ok, p_warn, _term_width,
     _hrgb, _fgh, _rsth, _tool_line, print_user_turn, render_agent_panel,
     _md_attr_sgr, _has_ansi, _md_line, _md_prefix, style_inline, AgentWriter,
     fmt_args, tool_summary, Spinner, tool_open, tool_close, on_tool,
-    run_agent_tui, _ANSI_RE, _MD_STYLE, _UI, COLOR, CUR_SKIN, _CON,
+    _ANSI_RE, _MD_STYLE, _UI, COLOR, CUR_SKIN, _CON,
     Console, Panel, HORIZONTALS, banner, render_status_bar,
     ALVA_WORDMARK, _markup_safe, _banner_tools_lines, _banner_skills_lines,
     compress_now,
 )
 from alvaagent.commands import (  # noqa: F401
-    ask, parse_key, ask_key, ask_permission, pick_model, _SLASH_COMMANDS,
+    ask, parse_key, ask_key, pick_model, _SLASH_COMMANDS,
     cmd_models, cmd_skin, cmd_sessions, cmd_context, cmd_compress,
-    cmd_self_test, cmd_help, cmd_config, cmd_provider, cmd_test, cmd_tools,
-    cmd_trace, cmd_todos, cmd_todo, cmd_memory, cmd_feedback, cmd_skills,
+    cmd_self_test, cmd_help, cmd_config, cmd_test, cmd_tools,
+    cmd_todos, cmd_todo, cmd_memory, cmd_feedback, cmd_skills,
     cmd_skill_category, cmd_reflect, cmd_improve, cmd_install_skill, cmd_clear,
     cmd_export, cmd_multi,
 )
+import alvaagent.tui as _tui_mod
+import alvaagent.commands as _commands_mod
+
+
+# Flat command/TUI adapters (legacy flat arity): the test suite calls these
+# with their old signatures; each routes through the default runtime.
+def set_active_skin(state):
+    rt = _get_rt()
+    rt.skin = (state or {}).get("skin") or DEFAULT_SKIN
+    _tui_mod.set_active_skin(rt)
+
+
+def run_agent_tui(history, cfg):
+    rt = _get_rt()
+    rt.cfg = cfg
+    return _tui_mod.run_agent_tui(rt, history)
+
+
+def cmd_provider(state, rest):
+    rt = _get_rt()
+    rt.cfg = state
+    return _commands_mod.cmd_provider(rt, rest)
+
+
+def cmd_trace(rest):
+    return _commands_mod.cmd_trace(_get_rt(), rest)
+
+
+def ask_permission(desc):
+    return _commands_mod.ask_permission(_get_rt(), desc)
 
 # The split modules read module globals (ON_PERMISSION, _TOOLS_MODE, ...). The
 # test suite monkeypatches them through `pa.<name> = ...`. A write to the

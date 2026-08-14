@@ -3,9 +3,8 @@ import re
 import subprocess
 
 from alvaagent.permissions import request_permission
-from alvaagent.util import (  # noqa: F401
+from alvaagent.util import (
     _atomic_write, _raw_fetch, _parse_frontmatter, _frontmatter_dump,
-    _SKILL_FM_RE, _SKILL_FM_DEFAULT, _VALID_FM_KEYS, _SKILL_RAW_MAX,
 )
 
 # ---------------- skills: Hermes-style frontmatter + categorized storage ----------------

@@ -9,6 +9,7 @@ import time
 
 from alvaagent.config import ALVA_VERSION, DATA_DIR, DEFAULT_SKIN, active_cfg
 from alvaagent.agent import _strip_xml_blocks, run_agent_stream
+from alvaagent.context import default_rt
 from alvaagent.sessions import compress_history, context_usage, context_window_for
 from alvaagent.skills import tool_skill_list
 from alvaagent.tools import TOOLS, active_tools
@@ -106,11 +107,10 @@ SKINS = {
 CUR_SKIN = SKINS[DEFAULT_SKIN]
 
 
-def set_active_skin(state):
+def set_active_skin(rt):
     """Pick the persisted skin (config.json) for the rest of the session."""
     global CUR_SKIN
-    name = (state or {}).get("skin")
-    CUR_SKIN = SKINS.get(name, SKINS[DEFAULT_SKIN])
+    CUR_SKIN = SKINS.get(rt.skin, SKINS[DEFAULT_SKIN])
 
 
 def col(code, s):
@@ -690,7 +690,7 @@ def on_tool(tool_id, name, args, result, status):
         sp.start()
 
 
-def run_agent_tui(history, cfg):
+def run_agent_tui(rt, history):
     """Run the agent loop with streaming output, spinner, and live tool blocks.
 
     Returns the 'done' payload augmented with:
@@ -707,7 +707,7 @@ def run_agent_tui(history, cfg):
     writer = AgentWriter(CUR_SKIN, CUR_SKIN["agent"])
     t0 = time.monotonic()
     try:
-        for evt_type, evt_data in run_agent_stream(history, cfg):
+        for evt_type, evt_data in run_agent_stream(rt, history):
             if evt_type == "text":
                 sp.disable()   # kill the spinner BEFORE text lands (no \r collision)
                 content_parts.append(evt_data)
@@ -792,7 +792,7 @@ def _banner_skills_lines():
     """Hermes-style 'Available Skills' grid: skills grouped by category."""
     lines = ["", "[bold %s]Available Skills[/]" % HERMES_ACCENT]
     try:
-        skills = tool_skill_list().get("skills") or []
+        skills = tool_skill_list(default_rt()).get("skills") or []
     except Exception:
         skills = []
     if not skills:
@@ -857,7 +857,7 @@ def banner(state):
     right_lines = _banner_tools_lines() + _banner_skills_lines()
     right_lines.append("")
     right_lines.append("[dim %s]%d/%d tools (%s) · v%s · you are here · /help for commands[/]"
-                       % (HERMES_DIM, len(active_tools()), len(TOOLS), _tools._TOOLS_MODE, ALVA_VERSION))
+                       % (HERMES_DIM, len(active_tools()), len(TOOLS), _tools.default_rt().tool_mode, ALVA_VERSION))
 
     try:
         from rich.table import Table
@@ -907,9 +907,10 @@ def render_status_bar(state, session, elapsed, tools, history):
     print(col(C.DIM, "  " + "│".join([""] + parts)))
 
 
-def compress_now(history, cfg, threshold=0.75, force=False):
+def compress_now(rt, history, threshold=0.75, force=False):
     """If usage exceeds the threshold (or force=True), summarize older messages
     in place. Returns True when a compression happened; never raises on failure."""
+    cfg = rt.active_cfg
     tokens, window = context_usage(history, cfg)
     if window <= 0:
         p_info("(no context window configured)")

@@ -10,9 +10,9 @@ from alvaagent.util import _env
 
 # ---------------- persistence (JSON file instead of localStorage) ----------------
 # No module-global `_store` anymore: the store lives on the Runtime (`rt.store`).
-# The flat `_store` name at the bottom of this module is a LIVE VIEW of
-# `default_rt().store` (same dict object) so unthreaded consumers
-# (tools/commands) keep working until they thread rt in later steps.
+# The flat `_store_get`/`_store_set`/`_load_store`/`_save_store` bridges below
+# route through `default_rt().store` (Ruling 14/15) for the flat Phase-A
+# consumers (sessions) until they thread rt.
 
 
 def _migrate_legacy_dir():
@@ -104,10 +104,6 @@ def _store_get(key, default=None):
 def _store_set(key, value):
     set(default_rt(), key, value)
 
-
-# Live view of the default runtime's store (same dict object — mutations via
-# rt.store, pa._store, or the flat bridges all land on it).
-_store = default_rt().store
 
 TODO_KEY = "alvaagent.todos"
 MEM_PREFIX = "alvaagent.mem."
