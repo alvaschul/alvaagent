@@ -95,9 +95,6 @@ When you improve / modify / test your own system (`alvaagent/`, `test_tui.py`,
    before committing anything you created only to explore or test.
 
 ## Git
-- Remote `https://github.com/alvaschul/alvaagent.git`, branch `main`, **no
-  credential helper**. Push with the token in the URL:
-  `git push https://<TOKEN>@github.com/alvaschul/alvaagent.git main`
-- `auto-push.sh` (cron) runs `git add -A` + timestamped commit + push only when
-  there's a diff. Safe because store/config/history are gitignored, but it will
-  stage anything new (e.g. skills).
+- Remote `https://github.com/alvaschul/alvaagent.git`, branch `main`. Auth via the
+  gh CLI credential helper (`gh auth login` + `gh auth setup-git`) — no tokens
+  in URLs. Plain `git push origin main` just works.
