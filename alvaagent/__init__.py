@@ -35,6 +35,16 @@ from alvaagent.util import (  # noqa: F401
     mask_key, _parse_frontmatter, _frontmatter_load, _frontmatter_dump,
     _mini_yaml, _mini_scalar, _finish_block,
 )
+from alvaagent.config import (  # noqa: F401
+    data_dir, DATA_DIR, _LEGACY_DIRS, CONFIG_PATH, STORE_PATH, HISTORY_PATH,
+    TRACE_PATH, PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN,
+    SKIN_NAMES, ALVA_VERSION, DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT,
+    TOOL_MODES, _tool_mode_of, _skin_of, _normalize_state, load_state,
+    save_state, active_cfg,
+)
+from alvaagent.trace import (  # noqa: F401
+    _trace, _read_trace, _trace_count, _TRACE_MAX_LINES, _TRACE_MAX_BYTES,
+)
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
 # _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
