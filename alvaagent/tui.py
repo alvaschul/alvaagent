@@ -9,7 +9,7 @@ import time
 
 from alvaagent.config import ALVA_VERSION, DATA_DIR, DEFAULT_SKIN, active_cfg
 from alvaagent.agent import _strip_xml_blocks, run_agent_stream
-from alvaagent.sessions import context_usage, context_window_for
+from alvaagent.sessions import compress_history, context_usage, context_window_for
 from alvaagent.skills import tool_skill_list
 from alvaagent.tools import TOOLS, active_tools
 from alvaagent.util import _fmt_k
@@ -905,3 +905,43 @@ def render_status_bar(state, session, elapsed, tools, history):
     ]
     # Hermes-style footer: dim '│' prefix + space-separated chips.
     print(col(C.DIM, "  " + "│".join([""] + parts)))
+
+
+def compress_now(history, cfg, threshold=0.75, force=False):
+    """If usage exceeds the threshold (or force=True), summarize older messages
+    in place. Returns True when a compression happened; never raises on failure."""
+    tokens, window = context_usage(history, cfg)
+    if window <= 0:
+        p_info("(no context window configured)")
+        return False
+    if not force and tokens <= int(window * threshold):
+        return False
+    p_info("context %d%% of %s - compressing older messages..."
+           % (tokens * 100 // window, _fmt_k(window)))
+    sp = Spinner("compressing")
+    _UI["spinner"] = sp
+    sp.start()
+    try:
+        new, stats = compress_history(history, cfg)
+    except KeyboardInterrupt:
+        p_info("compression cancelled")
+        return False
+    except Exception as e:
+        p_info("compression failed: %s" % e)
+        return False
+    finally:
+        sp.stop()
+        _UI["spinner"] = None
+    if not stats:
+        if tokens > int(window * 0.6):
+            p_info("(nothing to compress - a single message dominates the window; consider /new)")
+        else:
+            p_info("(nothing to compress)")
+        return False
+    history[:] = new
+    p_ok("[OK] context compressed | %d earlier message%s -> summary"
+         % (stats["dropped"], "" if stats["dropped"] == 1 else "s"))
+    if stats.get("mode") == "fallback":
+        p_info("  (offline summary - the model call failed, kept a basic note)")
+    return True
+

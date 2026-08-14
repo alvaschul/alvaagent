@@ -106,6 +106,14 @@ from alvaagent.tui import (  # noqa: F401
     Console, Panel, HORIZONTALS, banner, render_status_bar,
     ALVA_WORDMARK, _markup_safe, _banner_tools_lines, _banner_skills_lines,
 )
+from alvaagent.commands import (  # noqa: F401
+    ask, parse_key, ask_key, ask_permission, pick_model, _SLASH_COMMANDS,
+    cmd_models, cmd_skin, cmd_sessions, cmd_context, cmd_compress,
+    cmd_self_test, cmd_help, cmd_config, cmd_provider, cmd_test, cmd_tools,
+    cmd_trace, cmd_todos, cmd_todo, cmd_memory, cmd_feedback, cmd_skills,
+    cmd_skill_category, cmd_reflect, cmd_improve, cmd_install_skill, cmd_clear,
+    cmd_export, cmd_multi,
+)
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
 # _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
