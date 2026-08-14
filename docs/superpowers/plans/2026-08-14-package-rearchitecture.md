@@ -1159,11 +1159,15 @@ git commit -m "refactor: extract commands.py (slash commands, provider prompts, 
 
 ---
 
+> **Ruling 13 (amended) — keep the `_Facade` proxy; do NOT delete it at Task 13.** The plan's original Step 4 retired the proxy, but the unmodified test suite depends on its write-through: `test_tui.py:700-707` monkeypatches `pa.active_cfg`/`pa.compress_now`/`pa.run_agent_tui`/`pa.render_agent_panel`/`pa.render_status_bar`/`pa.print_user_turn`/`pa.context_usage`/`pa.save_session` and those MUST land on the bare-name module globals that `repl.send_message` reads (repl.py imports them by name, so write-through reaches it); likewise `pa._sleep_retry` (test 749), `pa._TURN_TIMEOUT` (agent.py), `pa.COLOR` (tui.py), `pa.yaml` (util.py:7). With the proxy gone, `pa.active_cfg = ...` would only set `alvaagent.active_cfg` and `send_message` would run against the real config — the dead-turn tests fail. Proxy retirement is deferred to Task 15 (after Task 14 reworks the tests). Also: do NOT add `from alvaagent.repl import main` directly to the facade — in import order 2 (`import alvaagent_tui` first) the facade runs while `repl` is mid-import (shim → repl → config → alvaagent), so a facade-level `from alvaagent.repl import main` raises `ImportError: cannot import name 'main' from partially initialized module`. Instead the SHIM re-exports the repl surface and `pa.<repl-name>` reads resolve through the `_Facade._tui` read-forward (established Task 1 pattern). The facade's eager block (lines 24-33) no-ops after shimification (`_store` absent) — remove it and add `import urllib.request, urllib.error` + guarded `import yaml` (the only eager names the tests still read at runtime; `pa.signal` appears only inside a string literal at test 567, `pa.time` is never read — neither needed).
+
+> **Ruling 13 (amended) — verified repl.py header** (plan's Step 1 was aspirational; scan of the moved 171-518 shows): stdlib `os, readline, signal, sys, threading` (NOT time/urllib); config `HISTORY_PATH, TOOL_MODES, active_cfg, load_state` (NOT save_state/data_dir); store `_load_store, _store_get, ACTIVE_SESSION_KEY` (NOT _store_set); client `cancel_agent`; sessions `load_session, save_session, delete_session, _find_session, _rename_session_in_store, auto_title, _unique_session_name, trim_history, new_session_name, context_usage` (NOT estimate_tokens/sessions_map/summarize_with_llm/compress_history); tools `_set_tool_mode, _sync_tool_mode, active_tools, tool_skill_remove` + `import alvaagent.tools as _tools` (repl's `/tools` branch reads `_tools._TOOLS_MODE` — Ruling 7/11 qualified idiom); tui `C, COLOR, banner, col, compress_now, on_tool, p_err, p_info, p_ok, p_warn, print_user_turn, render_agent_panel, render_status_bar, run_agent_tui, set_active_skin` + `import alvaagent.tui as _tui` (repl prompt reads `_tui.CUR_SKIN` — Ruling 11); commands `_SLASH_COMMANDS, ask_permission` + the 20 dispatched `cmd_*` (cmd_clear, cmd_compress, cmd_config, cmd_context, cmd_export, cmd_help, cmd_improve, cmd_install_skill, cmd_memory, cmd_models, cmd_multi, cmd_provider, cmd_self_test, cmd_sessions, cmd_skill_category, cmd_skills, cmd_skin, cmd_test, cmd_tools, cmd_trace — cmd_todos/todo/feedback/reflect NOT used by the REPL); util `_fmt_k`. `_agent`/`_perms` stay as the existing local imports inside `main()` (Ruling 2 form already present — move verbatim, do NOT rework).
+
 ### Task 13: Extract `repl.py` + make `alvaagent_tui.py` a shim
 
 **Files:**
 - Create: `alvaagent/repl.py`
-- Modify: `alvaagent_tui.py` (becomes the shim), `alvaagent/__init__.py` (stops importing from the shim), `alvaagent/__main__.py`
+- Modify: `alvaagent_tui.py` (becomes the shim), `alvaagent/__init__.py` (drop the eager block, keep the proxy), `alvaagent/__main__.py`
 
 **Interfaces:**
 - Consumes: everything — `config`, `store`, `permissions`, `skills`, `tools`, `client`, `sessions`, `agent`, `tui`, `commands`.
@@ -1171,9 +1175,9 @@ git commit -m "refactor: extract commands.py (slash commands, provider prompts, 
 
 - [ ] **Step 1: Create `alvaagent/repl.py`**
 
-Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- REPL ...` and end of file (roughly lines 4689-5212): `new_session_name` (already moved to sessions — skip it), `setup_completion`, `save_completion_history`, `_slash_complete`, `_markup_safe` (TUI helper — moves here with the REPL), `send_message`, `repl`, `main`.
+Move verbatim from `alvaagent_tui.py`: lines **171-517** — the `# ---------------- REPL ----------------` marker through the end of `main()` (`        _cleanup()` at 517), trimming trailing blanks. Contains `setup_completion`, `save_completion_history`, `_slash_complete`, `send_message`, `repl`, `main`. The `if __name__ == "__main__": main()` block (old 520-521) does NOT move — it belongs to the shim.
 
-Header imports:
+Header imports (VERIFIED — use these, then let pyflakes F401 refine):
 
 ```python
 import os
@@ -1182,40 +1186,35 @@ import signal
 import sys
 import threading
 
-from alvaagent.config import load_state, save_state, active_cfg, data_dir
-from alvaagent.store import _store_get, _store_set, ACTIVE_SESSION_KEY
-from alvaagent.permissions import ON_PERMISSION
-from alvaagent.tools import _sync_tool_mode, _set_tool_mode, _TOOLS_MODE, _TOOL_MODES, active_tools
+from alvaagent.config import HISTORY_PATH, TOOL_MODES, active_cfg, load_state
+from alvaagent.store import _load_store, _store_get, ACTIVE_SESSION_KEY
 from alvaagent.client import cancel_agent
 from alvaagent.sessions import (
-    load_session, save_session, delete_session, _find_session,
-    _rename_session_in_store, compress_now, context_usage, _unique_session_name,
-    auto_title, new_session_name, trim_history,
+    auto_title, context_usage, delete_session, _find_session, load_session,
+    new_session_name, _rename_session_in_store, save_session, trim_history,
+    _unique_session_name,
 )
-from alvaagent.trace import _trace
+from alvaagent.tools import (
+    _set_tool_mode, _sync_tool_mode, active_tools, tool_skill_remove,
+)
 from alvaagent.tui import (
-    set_active_skin, col, C, COLOR, CUR_SKIN, p_info, p_err, p_ok, p_warn,
-    print_user_turn, render_agent_panel, render_status_bar, banner, run_agent_tui,
-    on_tool,
+    C, COLOR, banner, col, compress_now, on_tool, p_err, p_info, p_ok, p_warn,
+    print_user_turn, render_agent_panel, render_status_bar, run_agent_tui,
+    set_active_skin,
 )
 from alvaagent.commands import (
-    cmd_help, cmd_config, cmd_provider, cmd_test, cmd_tools, cmd_trace,
-    cmd_models, cmd_skin, cmd_sessions, cmd_context, cmd_compress, cmd_clear,
-    cmd_multi, cmd_install_skill, cmd_self_test, cmd_improve, cmd_skills,
-    cmd_memory, cmd_export, ask_permission, pick_model, ask_key,
+    _SLASH_COMMANDS, ask_permission,
+    cmd_clear, cmd_compress, cmd_config, cmd_context, cmd_export, cmd_help,
+    cmd_improve, cmd_install_skill, cmd_memory, cmd_models, cmd_multi,
+    cmd_provider, cmd_self_test, cmd_sessions, cmd_skill_category, cmd_skills,
+    cmd_skin, cmd_test, cmd_tools, cmd_trace,
 )
+from alvaagent.util import _fmt_k
+import alvaagent.tools as _tools
+import alvaagent.tui as _tui
 ```
 
-Inside `main()`, the hook assignments become (Ruling 2: `ON_TOOL` lives in `agent.py`, not `tui`):
-
-```python
-    import alvaagent.agent as _agent
-    import alvaagent.permissions as _perms
-    _perms.ON_PERMISSION = ask_permission
-    _agent.ON_TOOL = on_tool
-```
-
-`on_tool` is imported from `tui`. Verify `main()`'s signal/screen handling, `_cleanup`, `_restored`, and `banner(state)`/`repl()` calls move verbatim.
+`main()` keeps its existing body verbatim: `import alvaagent.agent as _agent`, `import alvaagent.permissions as _perms`, `_agent.ON_TOOL = on_tool`, `_perms.ON_PERMISSION = ask_permission`, plus the signal/alt-screen `_cleanup`/`_restored`/`banner(state)`/`repl()` handling. `ask_permission` comes from commands, `on_tool` from tui, `_perms`/`_agent` are local module aliases. The REPL marker comment travels into repl.py as its section header.
 
 - [ ] **Step 2: Turn `alvaagent_tui.py` into the shim**
 
@@ -1229,13 +1228,16 @@ Keeps the historical entry points working unchanged:
     python3 alvaagent_tui.py   (start.sh and the `alvaagent` launcher)
     import alvaagent_tui       (old docs / external scripts)
 """
-from alvaagent.repl import main  # noqa: E402,F401
+from alvaagent.repl import (  # noqa: E402,F401
+    _slash_complete, main, repl, save_completion_history, send_message,
+    setup_completion,
+)
 
 if __name__ == "__main__":
     main()
 ```
 
-Delete the old header comment block? No — replace the whole file (the docstring above is the new header). Use the write/overwrite step.
+The shim re-exports the full repl surface (not just `main`) because the facade's `_Facade` proxy reads `pa.<name>` by forwarding to this module first (Ruling 13) — `pa.send_message`, `pa.setup_completion`, `pa.save_completion_history`, `pa.main` all resolve here. `start.sh`, `alvaagent.sh`, `alva_fix.sh`, and the launcher keep working (they exec `python3 alvaagent_tui.py`).
 
 - [ ] **Step 3: Update `__main__.py`**
 
@@ -1246,18 +1248,23 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 4: Rewrite the facade to stop importing the shim**
+- [ ] **Step 4: Patch the facade (KEEP the proxy — Ruling 13)**
 
 In `alvaagent/__init__.py`:
-1. Remove the `from alvaagent_tui import *` and the `from alvaagent_tui import (...)`, and the `from alvaagent_tui import main` if present.
-2. **Delete the entire `_Facade` proxy block** — the `import sys as _sys, types as _types` through `_sys.modules[__name__].__class__ = _Facade` lines (Task 1 Step 1). If it is left behind, `import alvaagent` crashes with `KeyError: 'alvaagent_tui'` (nothing imports the shim anymore), and even if the shim were imported first, every non-dunder read would forward to the 5-line shim and raise `AttributeError` for everything except `main`. This is the proxy's scheduled retirement.
-3. Rebuild the re-exports so they come ONLY from the modules (they already do, from Tasks 2-12). Then add:
-
-```python
-from alvaagent.repl import main  # noqa: F401
-```
-
-Update the facade docstring to say the flat API is now re-exported from the package modules.
+1. Keep lines 20-23 (`_tui = _sys.modules.get("alvaagent_tui")` / `import alvaagent_tui` fallback) — `_Facade._tui` must point at the shim.
+2. Remove the eager re-export block (lines 24-33: the `if "_store" in _tui.__dict__:` star-import + explicit `from alvaagent_tui import (...)`).
+3. Add near `import subprocess` (line 7):
+   ```python
+   import urllib.error  # noqa: F401
+   import urllib.request  # noqa: F401
+   try:
+       import yaml  # noqa: F401
+   except ImportError:
+       yaml = None
+   ```
+   (the only eager-list names the test suite still reads at runtime; `pa.signal` appears only inside a string literal at test 567, `pa.time` is never read.)
+4. **KEEP the `_Facade` class + write-through + `_Facade._tui = _tui` + `__class__ = _Facade` unchanged.** Update the stale comments (the "until Task 13" note at ~122-123 and the import-order comment at 10-19) to describe the new arrangement: reads forward to the shim (repl surface) with fallback to the facade's own re-exported namespace; writes land on the facade + shim + every loaded `alvaagent.*` submodule exposing the name.
+5. Do NOT add `from alvaagent.repl import ...` to the facade (import-order-2 circularity — Ruling 13).
 
 - [ ] **Step 5: Verify `import alvaagent_tui` still works**
 
