@@ -83,6 +83,13 @@ from alvaagent.client import (  # noqa: F401
     _readable_error, _retryable_status, _sleep_retry, _Cancelled,
     chat_completion, chat_completion_stream, fetch_models, cancel_agent,
 )
+from alvaagent.sessions import (  # noqa: F401
+    context_window_for, estimate_tokens, estimate_message_tokens, context_usage,
+    sessions_map, load_session, save_session, delete_session, _find_session,
+    _rename_session_in_store, auto_title, _unique_session_name,
+    summarize_with_llm, _fallback_summary, compress_history,
+    trim_history, new_session_name,
+)
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
 # _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
