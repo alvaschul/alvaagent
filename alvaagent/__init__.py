@@ -44,7 +44,7 @@ from alvaagent.store import (  # noqa: F401
 )
 from alvaagent.permissions import (  # noqa: F401
     _READONLY_PREFIXES, _RISKY_TOKENS, _RISKY_OPERATORS, _tokenize_shell,
-    classify_command, PROJECT_DIR, _in_project, classify_file_action,
+    classify_command, PROJECT_DIR, classify_file_action,
     request_permission,
 )
 from alvaagent.skills import (  # noqa: F401

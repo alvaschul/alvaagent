@@ -300,7 +300,7 @@ def repl(rt):
             elif c == "/memory":
                 cmd_memory(rt)
             elif c == "/export":
-                cmd_export(history)
+                cmd_export(rt, history)
             elif c == "/stop":
                 cancel_agent(rt)
                 p_info("stopping...")

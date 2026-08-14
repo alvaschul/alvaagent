@@ -344,6 +344,8 @@ def skill_sync_repo(rt, repo, subdir=None):
             root = os.path.join(tmp, "skills")
         if not os.path.isdir(root):
             return {"ok": False, "error": "subdir %r not found in the repo" % subdir}
+        if not os.path.realpath(root).startswith(os.path.realpath(tmp)):
+            return {"ok": False, "error": "subdir %r escapes the clone directory" % subdir}
         installed, skipped, errors = [], [], []
         for dirpath, _dirs, files in os.walk(root):
             for f in sorted(files):

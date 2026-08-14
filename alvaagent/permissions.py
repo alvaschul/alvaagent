@@ -1,7 +1,5 @@
 import os
 
-from alvaagent.config import DATA_DIR
-
 # ---------------- autonomy: permissions ----------------
 # The agent can run shell commands, edit files and manage skills. Everything
 # outside the project folder (or risky) goes through rt.on_permission, which
@@ -48,7 +46,7 @@ _RISKY_TOKENS = frozenset({
     "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "pwsh",
     "eval", "exec", "source", "command", "xargs", "nohup", "env",
 })
-_RISKY_OPERATORS = frozenset({">", ">>", "|", "&&", ";"})
+_RISKY_OPERATORS = frozenset({">", ">>", "|", "&&", "||", "&", ";"})
 
 
 def _tokenize_shell(cmd):
@@ -115,15 +113,7 @@ def classify_command(cmd):
     return "ask"
 
 
-def _in_project(path):
-    real = os.path.realpath(os.path.expanduser(str(path)))
-    for base in (os.path.realpath(PROJECT_DIR), os.path.realpath(DATA_DIR)):
-        if real == base or real.startswith(base + os.sep):
-            return True
-    return False
-
-
-def classify_file_action(rt, path, kind):
+def classify_file_action(rt, path):
     """allow / ask for a file action (reads and writes prompt outside the
     project or the runtime's data dir)."""
     real = os.path.realpath(os.path.expanduser(str(path)))

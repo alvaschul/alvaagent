@@ -583,6 +583,8 @@ def tool_summary(result):
         return str(result.get("error", "failed"))[:80]
     if "found" in result:
         return "found" if result.get("found") else "not found"
+    if "matches" in result:
+        return "%d matches" % result.get("count", len(result.get("matches", [])))
     if "count" in result:
         return "%d todos" % result.get("count", 0)
     if result.get("ok") is True:

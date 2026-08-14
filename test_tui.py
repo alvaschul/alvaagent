@@ -17,6 +17,7 @@ Runtimes are fully isolated: every test builds its own Runtime through
 never collide. The mock LLM server is started lazily on first use and reused
 for the whole process.
 """
+import atexit
 import builtins
 import contextlib
 import inspect
@@ -229,6 +230,8 @@ def test_classify_command():
     assert pa.classify_command("echo `touch /tmp/x`") == "ask"
     assert pa.classify_command("cat /etc/passwd $(whoami)") == "ask"
     assert pa.classify_command("ls -la; rm -rf /") == "ask"
+    assert pa.classify_command("echo hi & whoami") == "ask"
+    assert pa.classify_command("ls || whoami") == "ask"
     assert pa.classify_command("env X=1 rm -rf /") == "ask"
     assert pa.classify_command("git push") == "ask"
     assert pa.classify_command("catastrophe --version") == "ask"
@@ -276,6 +279,8 @@ def test_widened_allowlist():
     assert pa.classify_command("unzip a.zip -d out") == "ask"
     assert pa.classify_command("tar -xf a.tar") == "ask"
     assert pa.classify_command("cd /x && rm -rf /") == "ask"
+    assert pa.classify_command("echo hi & whoami") == "ask"
+    assert pa.classify_command("ls || whoami") == "ask"
     assert pa.classify_command("git remote add o x") == "ask"
 
 
@@ -620,7 +625,8 @@ def test_agent_loop_mock():
     assert "AGENT_LOOP_OK" in str(res1.get("content", ""))
     assert isinstance(res1.get("history"), list) and len(res1["history"]) >= 10
     # persisted todos / memory from the loop
-    store = json.load(open(os.path.join(rt.data_dir, "store.json")))
+    with open(os.path.join(rt.data_dir, "store.json")) as _fh:
+        store = json.load(_fh)
     assert any(t.get("text") == "buy milk" for t in store.get("alvaagent.todos", []))
     assert store.get("alvaagent.mem.name") == "Alex"
     # observability: the loop wrote trace entries into this runtime's trace.log
@@ -642,13 +648,8 @@ def test_plain_path():
 
 def test_self_test_harness():
     rt = mock_rt()
-    _saved_data_dir = tools_mod.DATA_DIR
-    tools_mod.DATA_DIR = rt.data_dir
-    try:
-        results = json.loads(pa.self_test(rt))
-        assert all(v is True for v in results.values()), json.dumps(results)
-    finally:
-        tools_mod.DATA_DIR = _saved_data_dir
+    results = json.loads(pa.self_test(rt))
+    assert all(v is True for v in results.values()), json.dumps(results)
 
 
 def test_atomic_store_writes():
@@ -658,7 +659,8 @@ def test_atomic_store_writes():
     sp = os.path.join(rt.data_dir, "store.json")
     assert os.path.exists(sp)
     try:
-        _reloaded = json.load(open(sp))
+        with open(sp) as _fh:
+            _reloaded = json.load(_fh)
         assert isinstance(_reloaded, dict)
     except Exception as e:
         raise AssertionError("store.json corrupted: %s" % e)
@@ -667,7 +669,8 @@ def test_atomic_store_writes():
     pa.store_save(rt)
     rt.store["alvaagent.mem.x"] = "v2"
     pa.store_save(rt)
-    _reloaded2 = json.load(open(sp))
+    with open(sp) as _fh:
+        _reloaded2 = json.load(_fh)
     assert _reloaded2.get("alvaagent.mem.x") == "v2"
     _leftover = [f for f in os.listdir(rt.data_dir)
                  if f.startswith(".store.") or f.startswith(".tmp.") or f.endswith(".tmp")]
@@ -1259,7 +1262,7 @@ _FACADE_SURFACE = (
     "context_usage", "compress_history", "sessions_map", "read_trace",
     "trace_count", "trace", "skill_list", "skill_save", "store_save",
     "store_get", "store_set", "visible", "set_mode", "sync_tool_mode",
-    "request_permission", "ask_permission", "save_session", "load_session",
+    "request_permission", "ask_permission", "save_session",
 )
 
 
@@ -1300,10 +1303,16 @@ def test_no_import_cycles():
 
 
 def test_cli_smoke():
-    # `python3 -m alvaagent` boots and exits cleanly on EOF stdin
+    # `python3 -m alvaagent` boots and exits cleanly on EOF stdin. Runs with
+    # ALVA_DATA_DIR pointed at a temp dir so the REPL never touches the real
+    # ~/.alvaagent store/sessions.
+    _tmp = tempfile.mkdtemp(prefix="alva_cli_")
+    _TMP_DIRS.append(_tmp)
+    _env = dict(os.environ)
+    _env["ALVA_DATA_DIR"] = _tmp
     r = subprocess.run([sys.executable, "-m", "alvaagent"],
                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                       timeout=30)
+                       timeout=30, env=_env)
     assert r.returncode == 0, (r.returncode, r.stdout[-500:], r.stderr[-500:])
 
 
@@ -1324,11 +1333,25 @@ def _run_all():
     return 0 if failures == 0 else 1
 
 
-if __name__ == "__main__":
-    _mock_server()
-    print("[mock server ready]")
-    code = _run_all()
+def _cleanup():
     _stop_server()
-    for d in _TMP_DIRS:
+    for d in list(_TMP_DIRS):
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _on_exit():
+    try:
+        _cleanup()
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    atexit.register(_on_exit)
+    try:
+        _mock_server()
+        print("[mock server ready]")
+        code = _run_all()
+    finally:
+        _cleanup()
     sys.exit(code)

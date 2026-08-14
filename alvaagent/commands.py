@@ -5,7 +5,7 @@ import urllib.error
 import urllib.request
 
 from alvaagent.config import (
-    PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN, DATA_DIR,
+    PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN,
     active_cfg, save_state,
 )
 from alvaagent.store import (
@@ -791,6 +791,8 @@ def cmd_reflect(rt):
     if not bad and not open_imgs:
         print("    - no open issues - keep doing what works")
     print("  (re-run /reflect after making changes to mark them done)")
+
+
 def cmd_improve(rt, rest):
     """Manage self-improvement areas.
 
@@ -875,13 +877,13 @@ def cmd_clear(rt, history):
     p_ok("conversation cleared")
 
 
-def cmd_export(history):
+def cmd_export(rt, history):
     """Export the conversation as plain text."""
     if not history:
         p_info("(no conversation to export)")
         return
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = os.path.join(DATA_DIR, "conversation_%s.txt" % ts)
+    fname = os.path.join(rt.data_dir, "conversation_%s.txt" % ts)
     lines = []
     for m in history:
         role = m.get("role", "?")
