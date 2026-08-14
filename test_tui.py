@@ -25,7 +25,7 @@ MOCK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mock_llm_server
 DATA = tempfile.mkdtemp(prefix="alva_tui_test_")
 os.environ["ALVA_DATA_DIR"] = DATA
 
-import alvaagent_tui as pa  # noqa: E402
+import alvaagent as pa  # noqa: E402
 
 failures = 0
 
