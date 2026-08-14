@@ -21,6 +21,8 @@ _SKILL_FM_DEFAULT = {
 
 _VALID_FM_KEYS = frozenset(("name", "description", "version", "author", "tags", "related_skills"))
 
+_cancel_flag = [False]  # shared mutable cancel latch (Ctrl+C sets [0]); both tui and tools check it
+
 
 def _mini_scalar(v):
     """Coerce a bare frontmatter scalar to a Python value (strips quotes,

@@ -23,10 +23,9 @@ from alvaagent.store import (
     _store, _store_get, _store_set,
 )
 from alvaagent.trace import _trace
-from alvaagent.util import _atomic_write
+from alvaagent.util import _atomic_write, _cancel_flag
 
 _STREAM_POLL = 0.25               # cancel-check interval while polling the python child
-_cancel_flag = [False]
 
 # ---------------- autonomy: shell + files + skills ----------------
 def tool_run_command(command):

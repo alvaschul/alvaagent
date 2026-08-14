@@ -108,7 +108,7 @@ except Exception:  # pragma: no cover - only when rich is unavailable
 from alvaagent.util import (  # noqa: E402,F401
     _env, now_iso, _fmt_k, _atomic_write, _looks_like_html, _raw_fetch,
     mask_key, _parse_frontmatter, _frontmatter_load, _frontmatter_dump,
-    _mini_yaml, _mini_scalar, _finish_block,
+    _mini_yaml, _mini_scalar, _finish_block, _cancel_flag,
 )
 
 # paths / config moved to alvaagent/config.py (Task 3)
@@ -529,7 +529,6 @@ def fetch_models(base_url, api_key, timeout=20):
 MAX_STEPS = 25
 _TURN_TIMEOUT = 180
 _MAX_CONSEC_TOOL_FAILURES = 4
-_cancel_flag = [False]
 ON_TOOL = None  # optional hook: ON_TOOL(tool_id, name, args, result, status)
 
 
