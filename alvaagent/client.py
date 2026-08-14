@@ -6,8 +6,6 @@ import time
 import urllib.error
 import urllib.request
 
-from alvaagent.util import _cancel_flag
-
 # ---------------- LLM client (OpenAI-compatible) ----------------
 SYSTEM_PROMPT = """You are alvaagent, a helpful AI agent running on the user's Android device (Termux / proot).
 You can call tools to do real work. Guidelines:
@@ -118,7 +116,7 @@ class _Cancelled(Exception):
     """Raised when the user cancels mid-stream (propagates to the caller as a stop)."""
 
 
-def chat_completion(messages, config, tools=None):
+def chat_completion(rt, messages, config, tools=None):
     base = (config.get("base_url") or "").rstrip("/")
     url = base + "/chat/completions"
     payload = {
@@ -144,7 +142,7 @@ def chat_completion(messages, config, tools=None):
     for attempt in range(_MAX_RETRIES + 1):
         if attempt:
             _sleep_retry(attempt)
-        if _cancel_flag[0]:
+        if rt.cancel.is_set():
             raise RuntimeError("LLM request cancelled by user")
         try:
             with urllib.request.urlopen(req, timeout=180) as r:
@@ -180,7 +178,7 @@ def chat_completion(messages, config, tools=None):
     raise RuntimeError("LLM request failed after %d attempts: %s" % (_MAX_RETRIES + 1, last_err))
 
 
-def chat_completion_stream(messages, config, tools=None):
+def chat_completion_stream(rt, messages, config, tools=None):
     """Streaming version of chat_completion. Yields (content_chunk, tool_calls_json_or_None)."""
     base = (config.get("base_url") or "").rstrip("/")
     url = base + "/chat/completions"
@@ -207,7 +205,7 @@ def chat_completion_stream(messages, config, tools=None):
     for attempt in range(_MAX_RETRIES + 1):
         if attempt:
             _sleep_retry(attempt)
-        if _cancel_flag[0]:
+        if rt.cancel.is_set():
             raise _Cancelled()
         try:
             resp = urllib.request.urlopen(req, timeout=60)
@@ -242,7 +240,7 @@ def chat_completion_stream(messages, config, tools=None):
         # full socket timeout.
         if sock is not None:
             while True:
-                if _cancel_flag[0]:
+                if rt.cancel.is_set():
                     resp.close()
                     raise _Cancelled()
                 rlist, _, _ = select.select([sock], [], [], _STREAM_POLL)
@@ -251,7 +249,7 @@ def chat_completion_stream(messages, config, tools=None):
                 if time.monotonic() - last_byte_at > _STREAM_IDLE_LIMIT:
                     resp.close()
                     raise RuntimeError("LLM stream stalled (no data for %ds)" % _STREAM_IDLE_LIMIT)
-        elif _cancel_flag[0]:
+        elif rt.cancel.is_set():
             resp.close()
             raise _Cancelled()
         chunk = resp.read(1024)
@@ -340,7 +338,7 @@ def chat_completion_stream(messages, config, tools=None):
     return
 
 
-def fetch_models(base_url, api_key, timeout=20):
+def fetch_models(rt, base_url, api_key, timeout=20):
     """GET {base}/models and return the list of model ids (raises on failure)."""
     base = (base_url or "").rstrip("/")
     if not base:
@@ -374,6 +372,6 @@ def fetch_models(base_url, api_key, timeout=20):
                        % (_MAX_RETRIES + 1, last_err))
 
 
-def cancel_agent():
-    _cancel_flag[0] = True
+def cancel_agent(rt):
+    rt.cancel.set()
 

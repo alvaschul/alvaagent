@@ -5,6 +5,7 @@ facade re-exports the old flat API so `import alvaagent as pa` behaves like
 the original module.
 """
 import os  # noqa: F401
+import json as _json
 import subprocess  # noqa: F401  (read via the facade fallback so pa.subprocess.run monkeypatches keep working)
 import urllib.error  # noqa: F401
 import urllib.request  # noqa: F401
@@ -86,8 +87,8 @@ from alvaagent.client import (  # noqa: F401
     SYSTEM_PROMPT,
     _MAX_RETRIES, _RETRY_BACKOFF, _STREAM_IDLE_LIMIT, _STREAM_POLL,
     _readable_error, _retryable_status, _sleep_retry, _Cancelled,
-    chat_completion, chat_completion_stream, fetch_models, cancel_agent,
 )
+import alvaagent.client as _client_mod
 from alvaagent.sessions import (  # noqa: F401
     context_window_for, estimate_tokens, estimate_message_tokens, context_usage,
     sessions_map, load_session, save_session, delete_session, _find_session,
@@ -95,42 +96,6 @@ from alvaagent.sessions import (  # noqa: F401
     summarize_with_llm, _fallback_summary, compress_history,
     trim_history, new_session_name,
 )
-from alvaagent.agent import (  # noqa: F401
-    _TURN_TIMEOUT, _MAX_CONSEC_TOOL_FAILURES, ON_TOOL,
-    _repair_tool_pairs, _report_tool,
-    run_agent, _clean_segment, _strip_xml_blocks, _parse_xml_tool_calls,
-    _strip_xml, run_agent_stream,
-)
-
-from alvaagent.tui import (  # noqa: F401
-    SKINS, C, set_active_skin, col, p_info, p_err, p_ok, p_warn, _term_width,
-    _hrgb, _fgh, _rsth, _tool_line, print_user_turn, render_agent_panel,
-    _md_attr_sgr, _has_ansi, _md_line, _md_prefix, style_inline, AgentWriter,
-    fmt_args, tool_summary, Spinner, tool_open, tool_close, on_tool,
-    run_agent_tui, _ANSI_RE, _MD_STYLE, _UI, COLOR, CUR_SKIN, _CON,
-    Console, Panel, HORIZONTALS, banner, render_status_bar,
-    ALVA_WORDMARK, _markup_safe, _banner_tools_lines, _banner_skills_lines,
-    compress_now,
-)
-from alvaagent.commands import (  # noqa: F401
-    ask, parse_key, ask_key, ask_permission, pick_model, _SLASH_COMMANDS,
-    cmd_models, cmd_skin, cmd_sessions, cmd_context, cmd_compress,
-    cmd_self_test, cmd_help, cmd_config, cmd_provider, cmd_test, cmd_tools,
-    cmd_trace, cmd_todos, cmd_todo, cmd_memory, cmd_feedback, cmd_skills,
-    cmd_skill_category, cmd_reflect, cmd_improve, cmd_install_skill, cmd_clear,
-    cmd_export, cmd_multi,
-)
-
-# The split modules read module globals (ON_PERMISSION, _TOOLS_MODE, ...). The
-# test suite monkeypatches them through `pa.<name> = ...`. A write to the
-# facade must land on the facade + the shim (alvaagent_tui) + every loaded
-# alvaagent.* submodule that exposes the name (the def-owner plus any module
-# that imported it by name). Reads forward to the shim first (the repl surface:
-# send_message, setup_completion, main, ...), then fall back to this facade's
-# own re-exported namespace (the flat API imported from the package modules).
-import types as _types
-
-
 # Flat adapters for the retired module globals: they read/write the default
 # runtime's state so `pa._permission`, `pa._store_get`, `pa._store_set`,
 # `pa._save_store`, ... keep working exactly like the old globals.
@@ -265,6 +230,73 @@ def dispatch_tool(*a, **k):
 
 def self_test():
     return _tools_self_test(_get_rt())
+
+
+# Flat LLM/agent adapters: the tests (and legacy callers) invoke these with
+# their old signatures; each adapter routes through the default rt.
+def chat_completion(messages, config, tools=None):
+    return _client_mod.chat_completion(_get_rt(), messages, config, tools=tools)
+
+
+def chat_completion_stream(messages, config, tools=None):
+    return _client_mod.chat_completion_stream(_get_rt(), messages, config, tools=tools)
+
+
+def fetch_models(base_url, api_key, timeout=20):
+    return _client_mod.fetch_models(_get_rt(), base_url, api_key, timeout=timeout)
+
+
+def cancel_agent():
+    return _client_mod.cancel_agent(_get_rt())
+
+
+from alvaagent.agent import (  # noqa: F401
+    _TURN_TIMEOUT, _MAX_CONSEC_TOOL_FAILURES,
+    _repair_tool_pairs,
+    _clean_segment, _strip_xml_blocks, _parse_xml_tool_calls,
+    _strip_xml,
+)
+import alvaagent.agent as _agent_mod
+
+from alvaagent.tui import (  # noqa: F401
+    SKINS, C, set_active_skin, col, p_info, p_err, p_ok, p_warn, _term_width,
+    _hrgb, _fgh, _rsth, _tool_line, print_user_turn, render_agent_panel,
+    _md_attr_sgr, _has_ansi, _md_line, _md_prefix, style_inline, AgentWriter,
+    fmt_args, tool_summary, Spinner, tool_open, tool_close, on_tool,
+    run_agent_tui, _ANSI_RE, _MD_STYLE, _UI, COLOR, CUR_SKIN, _CON,
+    Console, Panel, HORIZONTALS, banner, render_status_bar,
+    ALVA_WORDMARK, _markup_safe, _banner_tools_lines, _banner_skills_lines,
+    compress_now,
+)
+from alvaagent.commands import (  # noqa: F401
+    ask, parse_key, ask_key, ask_permission, pick_model, _SLASH_COMMANDS,
+    cmd_models, cmd_skin, cmd_sessions, cmd_context, cmd_compress,
+    cmd_self_test, cmd_help, cmd_config, cmd_provider, cmd_test, cmd_tools,
+    cmd_trace, cmd_todos, cmd_todo, cmd_memory, cmd_feedback, cmd_skills,
+    cmd_skill_category, cmd_reflect, cmd_improve, cmd_install_skill, cmd_clear,
+    cmd_export, cmd_multi,
+)
+
+# The split modules read module globals (ON_PERMISSION, _TOOLS_MODE, ...). The
+# test suite monkeypatches them through `pa.<name> = ...`. A write to the
+# facade must land on the facade + the shim (alvaagent_tui) + every loaded
+# alvaagent.* submodule that exposes the name (the def-owner plus any module
+# that imported it by name). Reads forward to the shim first (the repl surface:
+# send_message, setup_completion, main, ...), then fall back to this facade's
+# own re-exported namespace (the flat API imported from the package modules).
+import types as _types
+
+
+def run_agent(history_json, config_json):
+    rt = _get_rt()
+    rt.cfg = _normalize_state(_json.loads(config_json))
+    return _agent_mod.run_agent(rt, history_json)
+
+
+def run_agent_stream(history, config):
+    rt = _get_rt()
+    rt.cfg = _normalize_state(config)
+    return _agent_mod.run_agent_stream(rt, history)
 
 
 class _Facade(_types.ModuleType):

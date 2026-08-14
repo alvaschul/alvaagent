@@ -3,18 +3,14 @@ import json
 import re
 import time
 
-from alvaagent.client import (
-    SYSTEM_PROMPT, _Cancelled, chat_completion, chat_completion_stream,
-)
-from alvaagent.tools import dispatch_tool, active_tools
+from alvaagent.client import SYSTEM_PROMPT, _Cancelled
+from alvaagent.tools import visible
 from alvaagent.trace import _trace
-from alvaagent.util import _cancel_flag
 
 # ---------------- agent loop ----------------
 MAX_STEPS = 25
 _TURN_TIMEOUT = 180
 _MAX_CONSEC_TOOL_FAILURES = 4
-ON_TOOL = None  # optional hook: ON_TOOL(tool_id, name, args, result, status)
 
 
 
@@ -64,18 +60,19 @@ def _repair_tool_pairs(history):
     return out
 
 
-def _report_tool(tool_id, name, args, result, status):
-    if ON_TOOL is not None:
+def _report_tool(rt, tool_id, name, args, result, status):
+    if rt.on_tool is not None:
         try:
-            ON_TOOL(tool_id, name, args, result, status)
+            rt.on_tool(tool_id, name, args, result, status)
         except Exception:
             pass
 
 
-def run_agent(history_json, config_json):
+def run_agent(rt, history_json):
+    from alvaagent import chat_completion, dispatch_tool
     history = json.loads(str(history_json))
-    config = json.loads(str(config_json))
-    _cancel_flag[0] = False
+    config = rt.active_cfg
+    rt.cancel.clear()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     history = _repair_tool_pairs(history)
     for m in history:
@@ -91,7 +88,7 @@ def run_agent(history_json, config_json):
     _t0 = time.monotonic()
     _trace({"event": "turn_start", "steps": 0})
     for step in range(MAX_STEPS):
-        if _cancel_flag[0]:
+        if rt.cancel.is_set():
             _trace({"event": "turn_end", "reason": "cancelled", "steps": step})
             return json.dumps({"content": "(stopped by user)", "history": messages, "cancelled": True})
         if _TURN_TIMEOUT <= 0 or time.monotonic() - _t0 > _TURN_TIMEOUT:
@@ -99,7 +96,7 @@ def run_agent(history_json, config_json):
             messages.append({"role": "assistant", "content": note})
             _trace({"event": "turn_end", "reason": "timeout", "steps": step})
             return json.dumps({"content": note, "history": messages, "cancelled": False})
-        data = chat_completion(messages, config, tools=active_tools())
+        data = chat_completion(messages, config, tools=visible(rt))
         msg = data["choices"][0]["message"]
         if msg.get("content") is None:
             msg["content"] = ""
@@ -111,7 +108,7 @@ def run_agent(history_json, config_json):
             return json.dumps({"content": msg.get("content") or "", "history": messages, "cancelled": False})
 
         for tc in tool_calls:
-            if _cancel_flag[0]:
+            if rt.cancel.is_set():
                 _trace({"event": "turn_end", "reason": "cancelled", "steps": step + 1})
                 return json.dumps({"content": "(stopped by user)", "history": messages, "cancelled": True})
             fn = tc.get("function", {})
@@ -123,7 +120,7 @@ def run_agent(history_json, config_json):
             except Exception:
                 args = {}
             tool_id = tc.get("id", "?")
-            _report_tool(tool_id, name, args, None, "running")
+            _report_tool(rt, tool_id, name, args, None, "running")
             _trace({"event": "tool", "name": name, "args": args})
             result = dispatch_tool(name, args)
             status = "done" if (isinstance(result, dict) and "error" not in result) else "error"
@@ -132,7 +129,7 @@ def run_agent(history_json, config_json):
             else:
                 consec_failures = 0
             _trace({"event": "tool", "name": name, "status": status})
-            _report_tool(tool_id, name, args, result, status)
+            _report_tool(rt, tool_id, name, args, result, status)
             messages.append({"role": "tool", "tool_call_id": tool_id, "content": json.dumps(result)})
 
         if consec_failures >= _MAX_CONSEC_TOOL_FAILURES:
@@ -236,9 +233,12 @@ def _strip_xml(text):
     return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
-def run_agent_stream(history, config):
+def run_agent_stream(rt, history, config=None):
     """Generator that yields ('text', chunk) or ('tool', tool_info) or ('done', final_dict)."""
-    _cancel_flag[0] = False
+    from alvaagent import chat_completion_stream, dispatch_tool
+    if config is None:
+        config = rt.active_cfg
+    rt.cancel.clear()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     history = _repair_tool_pairs(history)
     for m in history:
@@ -254,7 +254,7 @@ def run_agent_stream(history, config):
     _t0 = time.monotonic()
     _trace({"event": "turn_start", "steps": 0})
     for step in range(MAX_STEPS):
-        if _cancel_flag[0]:
+        if rt.cancel.is_set():
             _trace({"event": "turn_end", "reason": "cancelled", "steps": step})
             yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
             return
@@ -269,8 +269,8 @@ def run_agent_stream(history, config):
         content_parts = []
         tool_calls_result = None
         try:
-            for chunk, tcs in chat_completion_stream(messages, config, tools=active_tools()):
-                if _cancel_flag[0]:
+            for chunk, tcs in chat_completion_stream(messages, config, tools=visible(rt)):
+                if rt.cancel.is_set():
                     yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
                     return
                 if chunk:
@@ -294,7 +294,7 @@ def run_agent_stream(history, config):
             msg["tool_calls"] = tool_calls_result
             messages.append(msg)
             for tc in tool_calls_result:
-                if _cancel_flag[0]:
+                if rt.cancel.is_set():
                     yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
                     return
                 fn = tc.get("function", {})
@@ -321,7 +321,7 @@ def run_agent_stream(history, config):
             xml_calls = _parse_xml_tool_calls(full_content)
             messages.append(msg)
             for i, (name, args) in enumerate(xml_calls):
-                if _cancel_flag[0]:
+                if rt.cancel.is_set():
                     yield "done", {"content": "(stopped by user)", "history": messages, "cancelled": True}
                     return
                 yield "tool_start", {"name": name, "args": args}
