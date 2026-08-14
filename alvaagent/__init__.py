@@ -79,7 +79,13 @@ class _Facade(_types.ModuleType):
     def __getattribute__(self, name):
         if name.startswith("__") and name.endswith("__"):
             return super().__getattribute__(name)
-        return getattr(_Facade._tui, name)
+        try:
+            return getattr(_Facade._tui, name)
+        except AttributeError:
+            # Names that have moved out of alvaagent_tui (and are not mirrored
+            # back) live on in this facade's own namespace (e.g. SKILLS_DIR,
+            # Task 6) or were set by the import system (util, config, ...).
+            return super().__getattribute__(name)
 
     def __setattr__(self, name, value):
         if name.startswith("__") and name.endswith("__"):
