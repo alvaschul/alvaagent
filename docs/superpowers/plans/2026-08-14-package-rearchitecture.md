@@ -96,7 +96,44 @@ from alvaagent_tui import (  # noqa: F401
     _read_trace, _save_store, _sleep_retry, _store_get, _strip_xml,
     _trace_count, _unique_session_name, signal, subprocess, urllib, time, yaml,
 )
+
+# The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
+# _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
+# As the mechanical split moves readers into alvaagent.* submodules, a write to
+# the facade must land in every loaded module that exposes the name (the
+# def-owner plus any module that imported it by name). Reads forward to
+# alvaagent_tui, which re-imports the full surface until Task 13.
+import sys as _sys, types as _types
+
+
+class _Facade(_types.ModuleType):
+    _tui = None
+
+    def __getattribute__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            return super().__getattribute__(name)
+        return getattr(_Facade._tui, name)
+
+    def __setattr__(self, name, value):
+        if name.startswith("__") and name.endswith("__"):
+            super().__setattr__(name, value)
+            return
+        super().__setattr__(name, value)
+        setattr(_Facade._tui, name, value)
+        for _mname, _mod in _sys.modules.items():
+            if _mname.startswith("alvaagent.") and hasattr(_mod, name):
+                setattr(_mod, name, value)
+
+
+_Facade._tui = _sys.modules["alvaagent_tui"]
+_sys.modules[__name__].__class__ = _Facade
 ```
+
+**Why the proxy (Ruling 3):** the plan originally specified a plain re-export, but `test_tui.py` monkeypatches module globals via `pa.<name> = ...` (~35 sites) and the single file's functions read those globals from `alvaagent_tui`'s own namespace — a plain re-export breaks every patch. The proxy forwards reads to `alvaagent_tui` (which re-imports the whole surface after every extraction task) and forwards writes to `alvaagent_tui` **plus every loaded `alvaagent.*` submodule that currently exposes the name**. This keeps all existing patch sites working unchanged as readers move: e.g. `pa.ON_PERMISSION = ...` lands on `permissions.ON_PERMISSION` from Task 5 on, `pa._TOOLS_MODE = ...` lands on `tools._TOOLS_MODE` from Task 7 on, `pa.dispatch_tool`/`pa.chat_completion`/`pa._TURN_TIMEOUT` land on `agent`'s imported bindings from Task 10 on, and the Task-13 `repl` imports are patched too. `pa.urllib.request.urlopen = ...` patches the shared stdlib module in place and needs no help.
+
+**Known residual gap (handled in Task 7):** reads of names that code mutates *internally* (not via a facade write) are stale — `tools._set_tool_mode`/`_maybe_enable_full` mutate `tools._TOOLS_MODE` directly, so `pa._TOOLS_MODE` (forwarded to `alvaagent_tui`) won't see it. Task 7 redirects the tiered-tool-selection test block to `_tools._TOOLS_MODE`.
+
+**The proxy is temporary:** delete it when Task 13 rewrites the facade to stop importing `alvaagent_tui` (Task 13 Step 4 does this explicitly).
 
 - [ ] **Step 2: Create `__main__.py`**
 
@@ -693,18 +730,27 @@ from alvaagent.tools import (  # noqa: E402,F401
 
 The REPL's two `_sync_tool_mode(state)` calls must now go through the tools module — the import above brings `_sync_tool_mode` into `alvaagent_tui`'s namespace, so the existing calls keep working unchanged. `TOOL_IMPL` calls the `tool_*` functions by bare name inside `tools.py` — that still works (same module).
 
-- [ ] **Step 3: Re-export from the facade**
+- [ ] **Step 3: Redirect the tiered-mode test block (Ruling 3)**
+
+`_TOOLS_MODE` is now owned by `tools.py`, and `_maybe_enable_full`/`_set_tool_mode` mutate `tools._TOOLS_MODE` directly. The facade write-through keeps `pa._TOOLS_MODE = ...` assignments working, but the test's READ of the internally-mutated value (`assert pa._TOOLS_MODE == "full"` after `dispatch_tool("self_test", {})`) would see the stale `alvaagent_tui` copy. In `test_tui.py`:
+
+1. Add at the top (with the other module-level imports): `import alvaagent.tools as _tools`.
+2. Replace every `pa._TOOLS_MODE` in the tiered tool-selection block (lines ~1133-1160 — the save, both assignments, the auto-enable assert, and the finally-restores) with `_tools._TOOLS_MODE`.
+
+This is the only test-patch redirection the whole phase-A needs; every other `pa.<name> = ...` site keeps working via the facade write-through.
+
+- [ ] **Step 4: Re-export from the facade**
 
 Add the same names from `alvaagent.tools` to `alvaagent/__init__.py`.
 
-- [ ] **Step 4: Run the tests**
+- [ ] **Step 5: Run the tests**
 
 Run: `python3 test_tui.py` — Expected: `ALL TESTS PASSED ✓` (calculator, sandbox, classifiers, tool tiering, run_python, skill tools, self-test path checks).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add alvaagent/tools.py alvaagent/__init__.py alvaagent_tui.py
+git add alvaagent/tools.py alvaagent/__init__.py alvaagent_tui.py test_tui.py
 git commit -m "refactor: extract tools.py (tool impls, registry, dispatch, tiered selection, self-test)"
 ```
 
@@ -1155,7 +1201,10 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Rewrite the facade to stop importing the shim**
 
-In `alvaagent/__init__.py`, remove the `from alvaagent_tui import *` and the `from alvaagent_tui import (...)`, and the `from alvaagent_tui import main` if present. Rebuild the re-exports so they come ONLY from the modules (they already do, from Tasks 2-12). Then add:
+In `alvaagent/__init__.py`:
+1. Remove the `from alvaagent_tui import *` and the `from alvaagent_tui import (...)`, and the `from alvaagent_tui import main` if present.
+2. **Delete the entire `_Facade` proxy block** — the `import sys as _sys, types as _types` through `_sys.modules[__name__].__class__ = _Facade` lines (Task 1 Step 1). If it is left behind, `import alvaagent` crashes with `KeyError: 'alvaagent_tui'` (nothing imports the shim anymore), and even if the shim were imported first, every non-dunder read would forward to the 5-line shim and raise `AttributeError` for everything except `main`. This is the proxy's scheduled retirement.
+3. Rebuild the re-exports so they come ONLY from the modules (they already do, from Tasks 2-12). Then add:
 
 ```python
 from alvaagent.repl import main  # noqa: F401
