@@ -511,7 +511,7 @@ git commit -m "refactor: extract store.py (atomic store.json persistence + names
 - Produces:
   - `_READONLY_PREFIXES`, `_RISKY_TOKENS`, `_RISKY_OPERATORS` (module consts)
   - `_APPROVED_SET` (module set — Runtime phase moves it to `rt.approved`)
-  - `_tokenize_shell(cmd) -> list`, `classify_command(cmd) -> "allow"|"ask"|"block"`
+  - `_tokenize_shell(cmd) -> list`, `classify_command(cmd) -> "allow"|"ask"|"deny"` (empty command → "deny"; code comment says block, body returns deny)
   - `_in_project(path) -> bool`, `classify_file_action(path, mode) -> "allow"|"ask"` — keep the existing signature verbatim (gains `rt` only in Task 14)
   - `_permission(action, ok=True, hint="")` — keep the exact current callable signature; it reads the module-level `_APPROVED_SET` and `ON_PERMISSION` defined in this module.
 
