@@ -13,25 +13,28 @@ import urllib.request
 
 from alvaagent.client import _STREAM_POLL
 from alvaagent.config import DATA_DIR, TOOL_MODES, save_state
-from alvaagent.permissions import PROJECT_DIR, _permission, classify_command, classify_file_action
+from alvaagent.context import Runtime, default_rt
+from alvaagent.permissions import (
+    PROJECT_DIR, classify_command, classify_file_action, request_permission,
+)
 from alvaagent.skills import (
     tool_skill_install, tool_skill_list, tool_skill_read, tool_skill_remove,
     tool_skill_save, tool_skill_sync_repo,
 )
 from alvaagent.store import (
     FEEDBACK_KEY, IMPROVEMENT_KEY, MEM_PREFIX, TODO_KEY,
-    _store, _store_get, _store_set,
+    get as store_get, set as store_set,
 )
 from alvaagent.trace import _trace
-from alvaagent.util import _atomic_write, _cancel_flag
+from alvaagent.util import _atomic_write
 
 # ---------------- autonomy: shell + files + skills ----------------
-def tool_run_command(command):
+def tool_run_command(rt, command):
     """Run a shell command on the device (Termux). Risky commands ask the user."""
     command = str(command).strip()
     if not command:
         return {"ok": False, "error": "empty command"}
-    if classify_command(command) == "ask" and not _permission("run command: %s" % command[:160]):
+    if classify_command(command) == "ask" and not request_permission(rt, "run command: %s" % command[:160]):
         return {"ok": False, "error": "permission denied by user"}
     try:
         proc = subprocess.run(command, shell=True, capture_output=True,
@@ -45,11 +48,11 @@ def tool_run_command(command):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_file_read(path):
+def tool_file_read(rt, path):
     path = str(path).strip()
     if not path:
         return {"ok": False, "error": "empty path"}
-    if classify_file_action(path, "read") == "ask" and not _permission("read file: %s" % path):
+    if classify_file_action(rt, path, "read") == "ask" and not request_permission(rt, "read file: %s" % path):
         return {"ok": False, "error": "permission denied by user"}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -63,11 +66,11 @@ def tool_file_read(path):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_file_write(path, content):
+def tool_file_write(rt, path, content):
     path = str(path).strip()
     if not path:
         return {"ok": False, "error": "empty path"}
-    if classify_file_action(path, "write") == "ask" and not _permission("write file: %s" % path):
+    if classify_file_action(rt, path, "write") == "ask" and not request_permission(rt, "write file: %s" % path):
         return {"ok": False, "error": "permission denied by user"}
     try:
         text = str(content)
@@ -77,11 +80,11 @@ def tool_file_write(path, content):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_file_edit(path, old, new):
+def tool_file_edit(rt, path, old, new):
     path = str(path).strip()
     if not path:
         return {"ok": False, "error": "empty path"}
-    if classify_file_action(path, "write") == "ask" and not _permission("edit file: %s" % path):
+    if classify_file_action(rt, path, "write") == "ask" and not request_permission(rt, "edit file: %s" % path):
         return {"ok": False, "error": "permission denied by user"}
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -95,7 +98,7 @@ def tool_file_edit(path, old, new):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_file_list(path="."):
+def tool_file_list(rt, path="."):
     path = str(path).strip() or "."
     try:
         entries = sorted(os.listdir(path))
@@ -111,7 +114,7 @@ def tool_file_list(path="."):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_file_search(pattern, path=None, max_depth=3):
+def tool_file_search(rt, pattern, path=None, max_depth=3):
     """Find files by glob pattern (e.g. '*.py', 'test*') under a directory.
 
     Depth-limited, read-only walk (hidden dirs skipped, results capped) so it
@@ -153,72 +156,72 @@ def tool_file_search(pattern, path=None, max_depth=3):
 
 
 # ---------------- tools ----------------
-def tool_todo_list():
-    todos = _store_get(TODO_KEY, [])
+def tool_todo_list(rt):
+    todos = store_get(rt, TODO_KEY, [])
     return {"count": len(todos), "todos": todos}
 
 
-def tool_todo_add(text):
+def tool_todo_add(rt, text):
     text = str(text).strip()
     if not text:
         return {"ok": False, "error": "empty todo text"}
-    todos = _store_get(TODO_KEY, [])
+    todos = store_get(rt, TODO_KEY, [])
     todos.append({"text": text, "done": False})
-    _store_set(TODO_KEY, todos)
+    store_set(rt, TODO_KEY, todos)
     return {"ok": True, "index": len(todos) - 1, "text": text, "count": len(todos)}
 
 
-def tool_todo_toggle(index):
-    todos = _store_get(TODO_KEY, [])
+def tool_todo_toggle(rt, index):
+    todos = store_get(rt, TODO_KEY, [])
     try:
         i = int(index)
         todos[i]["done"] = not todos[i]["done"]
-        _store_set(TODO_KEY, todos)
+        store_set(rt, TODO_KEY, todos)
         return {"ok": True, "index": i, "done": todos[i]["done"], "text": todos[i]["text"]}
     except Exception as e:
         return {"ok": False, "error": "invalid index %r: %s" % (index, e)}
 
 
-def tool_todo_remove(index):
-    todos = _store_get(TODO_KEY, [])
+def tool_todo_remove(rt, index):
+    todos = store_get(rt, TODO_KEY, [])
     try:
         i = int(index)
         removed = todos.pop(i)
-        _store_set(TODO_KEY, todos)
+        store_set(rt, TODO_KEY, todos)
         return {"ok": True, "removed": removed}
     except Exception as e:
         return {"ok": False, "error": "invalid index %r: %s" % (index, e)}
 
 
-def tool_memory_save(key, value):
+def tool_memory_save(rt, key, value):
     key = str(key).strip()
     if not key:
         return {"ok": False, "error": "empty key"}
-    _store_set(MEM_PREFIX + key, str(value))
+    store_set(rt, MEM_PREFIX + key, str(value))
     return {"ok": True, "key": key, "stored": str(value)}
 
 
-def tool_memory_recall(key):
+def tool_memory_recall(rt, key):
     key = str(key).strip()
-    v = _store_get(MEM_PREFIX + key)
+    v = store_get(rt, MEM_PREFIX + key)
     if v is None:
         return {"ok": False, "key": key, "found": False}
     return {"ok": True, "key": key, "found": True, "value": v}
 
 
-def tool_memory_list():
+def tool_memory_list(rt):
     """List every saved memory fact (key + value)."""
     facts = [{"key": k[len(MEM_PREFIX):], "value": v}
-             for k, v in _store.items() if k.startswith(MEM_PREFIX)]
+             for k, v in rt.store.items() if k.startswith(MEM_PREFIX)]
     return {"ok": True, "count": len(facts), "facts": facts}
 
 
-def tool_memory_search(query=""):
+def tool_memory_search(rt, query=""):
     """Search saved memory facts by key or value (case-insensitive substring).
     An empty query returns everything (same as memory_list)."""
     q = str(query or "").strip().lower()
     facts = []
-    for k, v in _store.items():
+    for k, v in rt.store.items():
         if not k.startswith(MEM_PREFIX):
             continue
         key = k[len(MEM_PREFIX):]
@@ -238,7 +241,7 @@ def tool_get_time():
 
 
 
-def tool_feedback(rating, notes=None):
+def tool_feedback(rt, rating, notes=None):
     """Record user feedback on the agent's last response.
 
     rating: "good", "bad", or "neutral". notes: optional free text.
@@ -253,15 +256,15 @@ def tool_feedback(rating, notes=None):
         "notes": notes,
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
     }
-    fb = _store_get(FEEDBACK_KEY, [])
+    fb = store_get(rt, FEEDBACK_KEY, [])
     fb.append(entry)
     if len(fb) > 50:
         fb = fb[-50:]
-    _store_set(FEEDBACK_KEY, fb)
+    store_set(rt, FEEDBACK_KEY, fb)
     return {"ok": True, "rating": rating, "stored": True}
 
 
-def tool_improvement_set(area, action):
+def tool_improvement_set(rt, area, action):
     """Record an area to improve and a concrete action to take.
 
     area: short label like "response brevity".
@@ -272,7 +275,7 @@ def tool_improvement_set(area, action):
     action = str(action or "").strip()
     if not area or not action:
         return {"ok": False, "error": "both area and action are required"}
-    items = _store_get(IMPROVEMENT_KEY, [])
+    items = store_get(rt, IMPROVEMENT_KEY, [])
     updated = False
     for it in items:
         if it["area"].lower() == area.lower():
@@ -290,38 +293,38 @@ def tool_improvement_set(area, action):
         })
     if len(items) > 30:
         items = items[-30:]
-    _store_set(IMPROVEMENT_KEY, items)
+    store_set(rt, IMPROVEMENT_KEY, items)
     return {"ok": True, "area": area, "stored": True}
 
 
-def tool_improvement_list():
+def tool_improvement_list(rt):
     """List all improvement areas the agent has recorded."""
-    return {"ok": True, "improvements": _store_get(IMPROVEMENT_KEY, [])}
+    return {"ok": True, "improvements": store_get(rt, IMPROVEMENT_KEY, [])}
 
 
-def tool_improvement_done(area):
+def tool_improvement_done(rt, area):
     """Mark an improvement area as resolved."""
     area = str(area or "").strip().lower()
     if not area:
         return {"ok": False, "error": "area is required"}
-    items = _store_get(IMPROVEMENT_KEY, [])
+    items = store_get(rt, IMPROVEMENT_KEY, [])
     for it in items:
         if it["area"].lower() == area:
             it["done"] = True
             it["resolved"] = datetime.datetime.now().isoformat(timespec="seconds")
-            _store_set(IMPROVEMENT_KEY, items)
+            store_set(rt, IMPROVEMENT_KEY, items)
             return {"ok": True, "area": it["area"], "done": True}
     return {"ok": False, "error": "no improvement area named: %s" % area}
 
 
-def tool_reflect():
+def tool_reflect(rt):
     """Run a structured self-reflection pass.
 
     Reads the last 5 feedback entries and all pending improvements. Returns a
     summary the agent can use to decide what to change.
     """
-    fb = _store_get(FEEDBACK_KEY, [])
-    imps = _store_get(IMPROVEMENT_KEY, [])
+    fb = store_get(rt, FEEDBACK_KEY, [])
+    imps = store_get(rt, IMPROVEMENT_KEY, [])
     pending = [i for i in imps if not i.get("done")]
     recent_bad = [e for e in fb if e.get("rating") == "bad"][-5:]
     return {
@@ -335,7 +338,7 @@ def tool_reflect():
     }
 
 
-def tool_web_fetch(url):
+def tool_web_fetch(rt, url):
     url = str(url).strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         return {"ok": False, "error": "only http/https URLs are allowed"}
@@ -491,7 +494,7 @@ def classify_python(code):
     return "allow"
 
 
-def tool_run_python(code):
+def tool_run_python(rt, code):
     """Execute Python code in a child process and return the output.
 
     The code runs under `python -c` in a separate process with a wall-clock
@@ -504,7 +507,7 @@ def tool_run_python(code):
         return {"ok": False, "error": "empty code"}
     if len(code) > 10000:
         return {"ok": False, "error": "code too long (>10000 chars)"}
-    if classify_python(code) == "ask" and not _permission("run python: %s" % code[:160]):
+    if classify_python(code) == "ask" and not request_permission(rt, "run python: %s" % code[:160]):
         return {"ok": False, "error": "permission denied by user"}
     try:
         proc = subprocess.Popen(
@@ -518,7 +521,7 @@ def tool_run_python(code):
     reason = None
     try:
         while proc.poll() is None:
-            if _cancel_flag[0]:
+            if rt.cancel.is_set():
                 proc.kill()
                 reason = "cancelled by user"
                 break
@@ -739,17 +742,8 @@ TOOLS = [
 # The model only sees a curated CORE set by default (~half of the registry).
 # Advertising 28 tools at once makes the model mis-pick tools and slows every
 # turn; the meta tools (skills, self-improvement, self-test, reflect) stay one
-# `/tools` keystroke away. `_TOOLS_MODE` is module-global (single-user TUI)
-# and persisted via config.json under "tool_mode".
-_TOOLS_MODE = "core"
-
-
-def _sync_tool_mode(state):
-    """Restore the persisted tool mode after config load (no cycle: config is a leaf)."""
-    global _TOOLS_MODE
-    _TOOLS_MODE = state.get("tool_mode", "core")
-
-
+# `/tools` keystroke away. The mode lives on the Runtime (rt.tool_mode) and is
+# persisted via config.json under "tool_mode".
 _CORE_TOOL_NAMES = {
     "calculator", "run_python", "web_fetch", "get_time",
     "memory_save", "memory_recall", "memory_search",
@@ -766,74 +760,167 @@ _ADVANCED_TOOL_NAMES = {
 }
 
 
-def active_tools():
+def visible(rt):
     """Tool schemas sent to the model: the CORE set, or everything in 'full' mode."""
-    if _TOOLS_MODE == "full":
+    if rt.tool_mode == "full":
         return TOOLS
     return [t for t in TOOLS if t["function"]["name"] in _CORE_TOOL_NAMES]
 
 
-def _maybe_enable_full(name):
+def maybe_enable_full(rt, name):
     """Lazy-load advanced tools: the first time the model calls an advanced
     tool while in core mode, widen the advertised set to 'full' (one-way until
     the user runs /tools core). Returns True when the mode was just switched."""
-    global _TOOLS_MODE
-    if _TOOLS_MODE != "full" and name in _ADVANCED_TOOL_NAMES:
-        _TOOLS_MODE = "full"
+    if rt.tool_mode != "full" and name in _ADVANCED_TOOL_NAMES:
+        rt.tool_mode = "full"
         _trace({"event": "tool_mode", "mode": "full", "tool": name,
                 "reason": "advanced tool requested by the model"})
         return True
     return False
 
 
-def _set_tool_mode(state, mode):
+def sync_tool_mode(rt):
+    """Restore the persisted tool mode onto the runtime (no cycle: config is a leaf)."""
+    rt.tool_mode = rt.cfg.get("tool_mode", "core")
+
+
+def set_mode(rt, mode):
     """Switch the advertised tool set and persist the choice in config.json."""
-    global _TOOLS_MODE
     if mode not in TOOL_MODES:
         mode = "core"
-    _TOOLS_MODE = mode
-    if isinstance(state, dict):
-        state["tool_mode"] = mode
-        try:
-            save_state(state)
-        except Exception:
-            pass
+    rt.tool_mode = mode
+    rt.cfg["tool_mode"] = mode
+    try:
+        save_state(rt)
+    except Exception:
+        pass
     _trace({"event": "tool_mode", "mode": mode, "reason": "user /tools"})
 
-TOOL_IMPL = {
-    "calculator": lambda a: tool_calculator(a.get("expression")),
-    "web_fetch": lambda a: tool_web_fetch(a.get("url")),
-    "get_time": lambda a: tool_get_time(),
-    "memory_save": lambda a: tool_memory_save(a.get("key"), a.get("value")),
-    "memory_recall": lambda a: tool_memory_recall(a.get("key")),
-    "memory_search": lambda a: tool_memory_search(a.get("query")),
-    "memory_list": lambda a: tool_memory_list(),
-    "todo_add": lambda a: tool_todo_add(a.get("text")),
-    "todo_list": lambda a: tool_todo_list(),
-    "todo_toggle": lambda a: tool_todo_toggle(a.get("index")),
-    "todo_remove": lambda a: tool_todo_remove(a.get("index")),
-    "run_command": lambda a: tool_run_command(a.get("command")),
-    "run_python": lambda a: tool_run_python(a.get("code")),
-    "file_read": lambda a: tool_file_read(a.get("path")),
-    "file_write": lambda a: tool_file_write(a.get("path"), a.get("content")),
-    "file_edit": lambda a: tool_file_edit(a.get("path"), a.get("old"), a.get("new")),
-    "file_list": lambda a: tool_file_list(a.get("path")),
-    "file_search": lambda a: tool_file_search(a.get("pattern"), a.get("path"), a.get("max_depth")),
-    "feedback": lambda a: tool_feedback(a.get("rating"), a.get("notes")),
-    "improvement_set": lambda a: tool_improvement_set(a.get("area"), a.get("action")),
-    "improvement_list": lambda a: tool_improvement_list(),
-    "improvement_done": lambda a: tool_improvement_done(a.get("area")),
-    "self_test": lambda a: tool_self_test(),
-    "reflect": lambda a: tool_reflect(),
-    "skill_list": lambda a: tool_skill_list(),
-    "skill_read": lambda a: tool_skill_read(a.get("name")),
-    "skill_save": lambda a: tool_skill_save(
-        a.get("name"), a.get("content"),
-        category=a.get("category")),
-    "skill_remove": lambda a: tool_skill_remove(a.get("name")),
-    "skill_install": lambda a: tool_skill_install(a.get("source"), a.get("category")),
-    "skill_sync_repo": lambda a: tool_skill_sync_repo(a.get("repo"), a.get("subdir")),
-}
+
+def active_tools():
+    """Flat Phase-A bridge: the default rt's advertised tool set."""
+    return visible(default_rt())
+
+
+def _sync_tool_mode(state):
+    """Flat Phase-A bridge: mirror the caller's config dict onto the default
+    rt, then sync its tool_mode from the persisted value."""
+    rt = default_rt()
+    if isinstance(state, dict):
+        rt.cfg = state
+    sync_tool_mode(rt)
+
+
+def _set_tool_mode(state, mode):
+    """Flat Phase-A bridge: mirror the caller's config dict onto the default
+    rt, then switch (and persist) the tool mode on it."""
+    rt = default_rt()
+    if isinstance(state, dict):
+        rt.cfg = state
+    set_mode(rt, mode)
+
+class Tools:
+    """Every tool as a method keyed by its TOOLS schema name.
+
+    `dispatch_tool` builds one of these per call so each tool resolves its
+    runtime (store, approvals, cancel flag, skills dir) through the rt it is
+    dispatched against instead of module globals.
+    """
+
+    def __init__(self, rt):
+        self.rt = rt
+
+    def calculator(self, args):
+        return tool_calculator(args.get("expression"))
+
+    def run_python(self, args):
+        return tool_run_python(self.rt, args.get("code"))
+
+    def web_fetch(self, args):
+        return tool_web_fetch(self.rt, args.get("url"))
+
+    def get_time(self, args):
+        return tool_get_time()
+
+    def memory_save(self, args):
+        return tool_memory_save(self.rt, args.get("key"), args.get("value"))
+
+    def memory_recall(self, args):
+        return tool_memory_recall(self.rt, args.get("key"))
+
+    def memory_search(self, args):
+        return tool_memory_search(self.rt, args.get("query"))
+
+    def memory_list(self, args):
+        return tool_memory_list(self.rt)
+
+    def todo_add(self, args):
+        return tool_todo_add(self.rt, args.get("text"))
+
+    def todo_list(self, args):
+        return tool_todo_list(self.rt)
+
+    def todo_toggle(self, args):
+        return tool_todo_toggle(self.rt, args.get("index"))
+
+    def todo_remove(self, args):
+        return tool_todo_remove(self.rt, args.get("index"))
+
+    def run_command(self, args):
+        return tool_run_command(self.rt, args.get("command"))
+
+    def file_read(self, args):
+        return tool_file_read(self.rt, args.get("path"))
+
+    def file_write(self, args):
+        return tool_file_write(self.rt, args.get("path"), args.get("content"))
+
+    def file_edit(self, args):
+        return tool_file_edit(self.rt, args.get("path"), args.get("old"), args.get("new"))
+
+    def file_list(self, args):
+        return tool_file_list(self.rt, args.get("path"))
+
+    def file_search(self, args):
+        return tool_file_search(
+            self.rt, args.get("pattern"), args.get("path"), args.get("max_depth"))
+
+    def feedback(self, args):
+        return tool_feedback(self.rt, args.get("rating"), args.get("notes"))
+
+    def improvement_set(self, args):
+        return tool_improvement_set(self.rt, args.get("area"), args.get("action"))
+
+    def improvement_list(self, args):
+        return tool_improvement_list(self.rt)
+
+    def improvement_done(self, args):
+        return tool_improvement_done(self.rt, args.get("area"))
+
+    def self_test(self, args):
+        return tool_self_test()
+
+    def reflect(self, args):
+        return tool_reflect(self.rt)
+
+    def skill_list(self, args):
+        return tool_skill_list(self.rt)
+
+    def skill_read(self, args):
+        return tool_skill_read(self.rt, args.get("name"))
+
+    def skill_save(self, args):
+        return tool_skill_save(
+            self.rt, args.get("name"), args.get("content"), category=args.get("category"))
+
+    def skill_remove(self, args):
+        return tool_skill_remove(self.rt, args.get("name"))
+
+    def skill_install(self, args):
+        return tool_skill_install(self.rt, args.get("source"), args.get("category"))
+
+    def skill_sync_repo(self, args):
+        return tool_skill_sync_repo(self.rt, args.get("repo"), args.get("subdir"))
 
 
 
@@ -844,13 +931,25 @@ _TOOL_ERROR_HINTS = {
     "file_write": "hint: the path may be outside the project or unwritable; try a path inside the project folder",
 }
 
-def dispatch_tool(name, args):
-    fn = TOOL_IMPL.get(name)
-    if fn is None:
+def dispatch_tool(*args, **kwargs):
+    """Dual-dispatch (Phase A): rt-first `(rt, name, args)` from the facade
+    and the Tools class; flat `(name, args)` from the agent's run loop (falls
+    back to default_rt, which is the same runtime on every Phase A entry
+    path). Dispatch is the single funnel for tool-mode auto-enable, error
+    hints, and exception wrapping."""
+    if len(args) == 3 and isinstance(args[0], Runtime):
+        rt, name, tool_args = args
+    elif len(args) == 2:
+        name, tool_args = args
+        rt = default_rt()
+    else:
+        raise TypeError("dispatch_tool expects (rt, name, args) or (name, args)")
+    tool = getattr(Tools(rt), name, None)
+    if tool is None:
         return {"error": "unknown tool: %s" % name}
-    switched = _maybe_enable_full(name)
+    switched = maybe_enable_full(rt, name)
     try:
-        result = fn(args)
+        result = tool(tool_args)
         if isinstance(result, dict) and not result.get("ok", True) and "hint" not in result:
             result["hint"] = _TOOL_ERROR_HINTS.get(name, "")
         if switched and isinstance(result, dict):
@@ -866,7 +965,7 @@ def tool_count():
     return len(TOOLS)
 
 
-def self_test():
+def self_test(rt):
     checks = []
     checks.append(("calculator", tool_calculator("2+3*4")["result"] == 14))
     try:
@@ -874,37 +973,36 @@ def self_test():
         checks.append(("sandbox", False))
     except Exception:
         checks.append(("sandbox", True))
-    r = tool_todo_add("self-test")
+    r = tool_todo_add(rt, "self-test")
     checks.append(("todos", r["ok"] is True))
     if r.get("ok"):
-        tool_todo_remove(r["index"])
-    checks.append(("memory", tool_memory_recall("__no_such_key__")["found"] is False))
+        tool_todo_remove(rt, r["index"])
+    checks.append(("memory", tool_memory_recall(rt, "__no_such_key__")["found"] is False))
     checks.append(("clock", isinstance(tool_get_time(), dict) and "iso" in tool_get_time()))
 
     # run_python: dispatched, sandboxed, permission-gated
     try:
-        checks.append(("run_python_dispatch", tool_run_python("print(2+2)").get("output") == "4\n"))
+        checks.append(("run_python_dispatch", tool_run_python(rt, "print(2+2)").get("output") == "4\n"))
     except Exception:
         checks.append(("run_python_dispatch", False))
     checks.append(("run_python_gate", classify_python("import os") == "ask"))
 
     # tiered tool selection: core mode advertises a subset, full mode all
-    global _TOOLS_MODE
-    _saved_mode = _TOOLS_MODE
+    _saved_mode = rt.tool_mode
     try:
-        _TOOLS_MODE = "core"
+        rt.tool_mode = "core"
         checks.append(("tools_core_subset",
-                       len(active_tools()) < len(TOOLS)
+                       len(visible(rt)) < len(TOOLS)
                        and "skill_list" not in _CORE_TOOL_NAMES
                        and "run_command" in _CORE_TOOL_NAMES))
-        _TOOLS_MODE = "full"
-        checks.append(("tools_full_all", len(active_tools()) == len(TOOLS)))
+        rt.tool_mode = "full"
+        checks.append(("tools_full_all", len(visible(rt)) == len(TOOLS)))
     finally:
-        _TOOLS_MODE = _saved_mode
+        rt.tool_mode = _saved_mode
 
     # skills: list should work
     try:
-        skills = tool_skill_list()
+        skills = tool_skill_list(rt)
         checks.append(("skills_list", skills.get("ok") is True))
     except Exception:
         checks.append(("skills_list", False))
@@ -916,7 +1014,7 @@ def self_test():
 
     # file tools: read this file
     try:
-        r = tool_file_read(__file__)
+        r = tool_file_read(rt, __file__)
         checks.append(("file_read", r.get("ok") is True))
     except Exception:
         checks.append(("file_read", False))
@@ -925,9 +1023,9 @@ def self_test():
     # deny-on-outside-write never blocks the check)
     try:
         tmp = os.path.join(DATA_DIR, ".alva_self_test_tmp.txt")
-        r = tool_file_write(tmp, "test content")
+        r = tool_file_write(rt, tmp, "test content")
         if r.get("ok"):
-            content = tool_file_read(tmp).get("content", "")
+            content = tool_file_read(rt, tmp).get("content", "")
             checks.append(("file_write", content == "test content"))
             os.remove(tmp)
         else:
@@ -937,25 +1035,25 @@ def self_test():
 
     # feedback + improvement + reflect tools
     try:
-        r = tool_feedback("good", "self-test check")
+        r = tool_feedback(rt, "good", "self-test check")
         checks.append(("feedback", r.get("ok") is True))
     except Exception:
         checks.append(("feedback", False))
 
     try:
-        r = tool_improvement_set("test-area", "test action")
+        r = tool_improvement_set(rt, "test-area", "test action")
         checks.append(("improvement_set", r.get("ok") is True))
     except Exception:
         checks.append(("improvement_set", False))
 
     try:
-        imps = tool_improvement_list()
+        imps = tool_improvement_list(rt)
         checks.append(("improvement_list", imps.get("ok") is True))
     except Exception:
         checks.append(("improvement_list", False))
 
     try:
-        r = tool_reflect()
+        r = tool_reflect(rt)
         checks.append(("reflect", r.get("ok") is True))
     except Exception:
         checks.append(("reflect", False))
@@ -1008,7 +1106,7 @@ def tool_self_test():
 
     # Run built-in self_test checks
     try:
-        builtin_json = self_test()
+        builtin_json = self_test(default_rt())
         builtin_checks = json.loads(builtin_json) if isinstance(builtin_json, str) else builtin_json
         builtin_ok = all(v for v in builtin_checks.values())
         result["tests"].append({

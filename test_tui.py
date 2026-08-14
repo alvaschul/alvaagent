@@ -26,7 +26,6 @@ DATA = tempfile.mkdtemp(prefix="alva_tui_test_")
 os.environ["ALVA_DATA_DIR"] = DATA
 
 import alvaagent as pa  # noqa: E402
-import alvaagent.tools as _tools  # noqa: E402
 
 failures = 0
 
@@ -1131,10 +1130,11 @@ try:
               "run_python truncates large outputs to _PY_MAX_CHARS")
 
     # ---------- tiered tool selection (core vs full) ----------
-    _saved_mode = _tools._TOOLS_MODE
+    _rt14 = pa.build_runtime()
+    _saved_mode = _rt14.tool_mode
     try:
-        _tools._TOOLS_MODE = "core"
-        _core = pa.active_tools()
+        _rt14.tool_mode = "core"
+        _core = pa.visible(_rt14)
         _core_names = {t["function"]["name"] for t in _core}
         assert_ok(0 < len(_core) < len(pa.TOOLS),
                   "core mode advertises a curated subset (%d/%d)"
@@ -1143,22 +1143,22 @@ try:
                   "core set keeps the everyday tools")
         assert_ok("skill_list" not in _core_names and "self_test" not in _core_names,
                   "core set hides the advanced meta-tools")
-        _tools._TOOLS_MODE = "full"
-        assert_ok(len(pa.active_tools()) == len(pa.TOOLS),
+        _rt14.tool_mode = "full"
+        assert_ok(len(pa.visible(_rt14)) == len(pa.TOOLS),
                   "full mode advertises all tools")
     finally:
-        _tools._TOOLS_MODE = _saved_mode
+        _rt14.tool_mode = _saved_mode
     # lazy auto-enable: an advanced tool call flips the mode to full (one-way)
-    _saved_mode = _tools._TOOLS_MODE
+    _saved_mode = _rt14.tool_mode
     try:
-        _tools._TOOLS_MODE = "core"
-        _r = pa.dispatch_tool("self_test", {})
-        assert_ok(_tools._TOOLS_MODE == "full",
+        _rt14.tool_mode = "core"
+        _r = pa.dispatch_tool(_rt14, "self_test", {})
+        assert_ok(_rt14.tool_mode == "full",
                   "calling an advanced tool auto-enables full mode")
         assert_ok("Advanced tool set enabled" in _r.get("hint", ""),
                   "auto-enable tells the model the full set is now visible")
     finally:
-        _tools._TOOLS_MODE = _saved_mode
+        _rt14.tool_mode = _saved_mode
     # /trace plumbing: _read_trace + cmd_trace render without crashing
     try:
         import io as _io, contextlib as _cl

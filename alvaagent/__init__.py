@@ -4,6 +4,7 @@ Package layout replaces the original single-file alvaagent_tui.py. This
 facade re-exports the old flat API so `import alvaagent as pa` behaves like
 the original module.
 """
+import os  # noqa: F401
 import subprocess  # noqa: F401  (read via the facade fallback so pa.subprocess.run monkeypatches keep working)
 import urllib.error  # noqa: F401
 import urllib.request  # noqa: F401
@@ -56,25 +57,30 @@ from alvaagent.permissions import (  # noqa: F401
     request_permission,
 )
 from alvaagent.skills import (  # noqa: F401
-    SKILLS_DIR,
     _SKILL_FM_RE, _SKILL_FM_DEFAULT, _VALID_FM_KEYS, _SKILL_RAW_MAX,
     _skill_body_for_tool, _detect_category, _skill_filepath, _inside_skills,
     _resolve_skill_path, _skill_read, _scan_skill_files, _skill_list_all,
-    tool_skill_list, tool_skill_read, tool_skill_remove, tool_skill_save,
-    tool_skill_install, tool_skill_sync_repo,
+    tool_skill_list as _skills_list, tool_skill_read as _skills_read,
+    tool_skill_remove as _skills_remove, tool_skill_save as _skills_save,
+    tool_skill_install as _skills_install, tool_skill_sync_repo as _skills_sync,
 )
 from alvaagent.tools import (  # noqa: F401
     _PY_RUN_TIMEOUT, _PY_MAX_BYTES, _PY_MAX_CHARS, _CALC_ALLOWED,
-    _TOOLS_MODE, _CORE_TOOL_NAMES, _ADVANCED_TOOL_NAMES,
-    active_tools, _maybe_enable_full, _set_tool_mode, _sync_tool_mode,
-    tool_run_command, tool_file_read, tool_file_write, tool_file_edit,
-    tool_file_list, tool_file_search, tool_todo_list, tool_todo_add,
-    tool_todo_toggle, tool_todo_remove, tool_memory_save, tool_memory_recall,
-    tool_memory_list, tool_memory_search, tool_get_time, tool_feedback,
-    tool_improvement_set, tool_improvement_list, tool_improvement_done,
-    tool_reflect, tool_web_fetch, _safe_factorial, _calc_eval, _fmt_num,
-    tool_calculator, classify_python, tool_run_python, tool_count,
-    TOOLS, TOOL_IMPL, _TOOL_ERROR_HINTS, dispatch_tool, self_test, tool_self_test,
+    _CORE_TOOL_NAMES, _ADVANCED_TOOL_NAMES, _TOOL_ERROR_HINTS,
+    Tools, visible, set_mode, sync_tool_mode, maybe_enable_full,
+    tool_self_test, tool_count, classify_python,
+    tool_calculator as _tools_calculator, tool_run_python as _tools_run_python,
+    tool_web_fetch as _tools_web_fetch, tool_get_time as _tools_get_time,
+    tool_run_command as _tools_run_command,
+    tool_file_read as _tools_file_read, tool_file_write as _tools_file_write,
+    tool_file_edit as _tools_file_edit, tool_file_list as _tools_file_list,
+    tool_file_search as _tools_file_search,
+    tool_todo_list as _tools_todo_list, tool_todo_add as _tools_todo_add,
+    tool_todo_toggle as _tools_todo_toggle, tool_todo_remove as _tools_todo_remove,
+    tool_memory_save as _tools_memory_save, tool_memory_recall as _tools_memory_recall,
+    tool_memory_list as _tools_memory_list, tool_memory_search as _tools_memory_search,
+    dispatch_tool as _tools_dispatch_tool, self_test as _tools_self_test,
+    TOOLS, _safe_factorial, _calc_eval, _fmt_num,
 )
 from alvaagent.client import (  # noqa: F401
     SYSTEM_PROMPT,
@@ -142,6 +148,123 @@ def _store_set(key, value):
 
 def _save_store():
     store_save(_get_rt())
+
+
+# The skills dir is derived from the default runtime's data dir (the module
+# global in skills.py was retired when skills went rt-first).
+SKILLS_DIR = os.path.join(DATA_DIR, "skills")
+
+
+# Flat tool adapters: the tests (and legacy callers) invoke the tools with
+# their old signatures; each adapter routes through the default rt.
+def tool_calculator(expression):
+    return _tools_calculator(expression)
+
+
+def tool_run_python(code):
+    return _tools_run_python(_get_rt(), code)
+
+
+def tool_web_fetch(url):
+    return _tools_web_fetch(_get_rt(), url)
+
+
+def tool_get_time():
+    return _tools_get_time()
+
+
+def tool_run_command(command):
+    return _tools_run_command(_get_rt(), command)
+
+
+def tool_file_read(path):
+    return _tools_file_read(_get_rt(), path)
+
+
+def tool_file_write(path, content):
+    return _tools_file_write(_get_rt(), path, content)
+
+
+def tool_file_edit(path, old, new):
+    return _tools_file_edit(_get_rt(), path, old, new)
+
+
+def tool_file_list(path="."):
+    return _tools_file_list(_get_rt(), path)
+
+
+def tool_file_search(pattern, path=None, max_depth=None):
+    return _tools_file_search(_get_rt(), pattern, path, max_depth)
+
+
+def tool_todo_list():
+    return _tools_todo_list(_get_rt())
+
+
+def tool_todo_add(text):
+    return _tools_todo_add(_get_rt(), text)
+
+
+def tool_todo_toggle(index):
+    return _tools_todo_toggle(_get_rt(), index)
+
+
+def tool_todo_remove(index):
+    return _tools_todo_remove(_get_rt(), index)
+
+
+def tool_memory_save(key, value):
+    return _tools_memory_save(_get_rt(), key, value)
+
+
+def tool_memory_recall(key):
+    return _tools_memory_recall(_get_rt(), key)
+
+
+def tool_memory_list():
+    return _tools_memory_list(_get_rt())
+
+
+def tool_memory_search(query=""):
+    return _tools_memory_search(_get_rt(), query)
+
+
+def tool_skill_list():
+    return _skills_list(_get_rt())
+
+
+def tool_skill_read(name):
+    return _skills_read(_get_rt(), name)
+
+
+def tool_skill_remove(name):
+    return _skills_remove(_get_rt(), name)
+
+
+def tool_skill_save(name, content, category=None):
+    return _skills_save(_get_rt(), name, content, category)
+
+
+def tool_skill_install(source, category=None):
+    return _skills_install(_get_rt(), source, category)
+
+
+def tool_skill_sync_repo(repo, subdir=None):
+    return _skills_sync(_get_rt(), repo, subdir)
+
+
+# Dispatch is dual in Phase A: rt-first `(rt, name, args)` (from the surgical
+# tiered-tool-selection tests and the Tools class) or flat `(name, args)`
+# (from the agent's run loop). The flat form always routes through the
+# default rt, which equals the threaded rt on every Phase A entry path.
+def dispatch_tool(*a, **k):
+    if a and isinstance(a[0], Runtime):
+        return _tools_dispatch_tool(*a, **k)
+    return _tools_dispatch_tool(_get_rt(), *a, **k)
+
+
+def self_test():
+    return _tools_self_test(_get_rt())
 
 
 class _Facade(_types.ModuleType):

@@ -124,9 +124,14 @@ def _in_project(path):
     return False
 
 
-def classify_file_action(path, kind):
-    """allow / ask for a file action (reads and writes prompt outside project)."""
-    return "allow" if _in_project(path) else "ask"
+def classify_file_action(rt, path, kind):
+    """allow / ask for a file action (reads and writes prompt outside the
+    project or the runtime's data dir)."""
+    real = os.path.realpath(os.path.expanduser(str(path)))
+    for base in (os.path.realpath(PROJECT_DIR), os.path.realpath(rt.data_dir)):
+        if real == base or real.startswith(base + os.sep):
+            return "allow"
+    return "ask"
 
 
 def request_permission(rt, desc):

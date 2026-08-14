@@ -2,14 +2,11 @@ import os
 import re
 import subprocess
 
-from alvaagent.config import DATA_DIR
-from alvaagent.permissions import _permission
+from alvaagent.permissions import request_permission
 from alvaagent.util import (  # noqa: F401
     _atomic_write, _raw_fetch, _parse_frontmatter, _frontmatter_dump,
     _SKILL_FM_RE, _SKILL_FM_DEFAULT, _VALID_FM_KEYS, _SKILL_RAW_MAX,
 )
-
-SKILLS_DIR = os.path.join(DATA_DIR, "skills")
 
 # ---------------- skills: Hermes-style frontmatter + categorized storage ----------------
 # Skills mirror Hermes: each skill file is a Markdown doc with an optional YAML
@@ -64,47 +61,47 @@ def _detect_category(name):
     return None, name.strip()
 
 
-def _skill_filepath(category, name):
+def _skill_filepath(rt, category, name):
     if category:
-        return os.path.join(SKILLS_DIR, category, name + ".md")
-    return os.path.join(SKILLS_DIR, name + ".md")
+        return os.path.join(rt.skills_dir, category, name + ".md")
+    return os.path.join(rt.skills_dir, name + ".md")
 
 
-def _inside_skills(path):
-    """True when `path` (realpath) lives inside SKILLS_DIR. Guards every
-    skill-path operation against `..` traversal writing/reading/deleting
-    files elsewhere on the device."""
+def _inside_skills(rt, path):
+    """True when `path` (realpath) lives inside the runtime's skills dir.
+    Guards every skill-path operation against `..` traversal
+    writing/reading/deleting files elsewhere on the device."""
     real = os.path.realpath(path)
-    base = os.path.realpath(SKILLS_DIR)
+    base = os.path.realpath(rt.skills_dir)
     return real == base or real.startswith(base + os.sep)
 
 
-def _resolve_skill_path(name):
-    """Map a skill name to a real .md file inside SKILLS_DIR.
+def _resolve_skill_path(rt, name):
+    """Map a skill name to a real .md file inside the runtime's skills dir.
 
     Accepts flat ("frontend-design"), category/name ("brainstorming/x"), and
     the frontmatter name of a categorized skill ("brainstorming", which lives
     at skills/brainstorming/SKILL.md). Returns the resolved absolute path, or
-    None when nothing matches / the path escapes SKILLS_DIR.
+    None when nothing matches / the path escapes the skills dir.
     """
     category, skill_name = _detect_category(str(name))
     if skill_name:
-        direct = os.path.realpath(_skill_filepath(category, skill_name))
-        if os.path.isfile(direct) and _inside_skills(direct):
+        direct = os.path.realpath(_skill_filepath(rt, category, skill_name))
+        if os.path.isfile(direct) and _inside_skills(rt, direct):
             return direct
     # Fallback: scan the index and match by frontmatter name (+ category when
     # the caller qualified it). This is how categorized files whose filename
     # differs from their `name:` (e.g. category/SKILL.md) stay reachable.
     want = str(name).strip().lower()
-    for info in _skill_list_all():
+    for info in _skill_list_all(rt):
         nm = str(info.get("name") or "").lower()
         if nm != want:
             continue
         cat = str(info.get("category") or "").lower()
         if category and cat != category.lower():
             continue
-        p = os.path.realpath(os.path.join(SKILLS_DIR, info["file"]))
-        if _inside_skills(p):
+        p = os.path.realpath(os.path.join(rt.skills_dir, info["file"]))
+        if _inside_skills(rt, p):
             return p
     return None
 
@@ -135,15 +132,15 @@ def _skill_read(path):
     }
 
 
-def _scan_skill_files():
-    """Walk SKILLS_DIR and yield (category_or_None, name, filepath) for every
-    .md file, including legacy flat files. Categorized files take precedence:
-    a file under skills/<cat>/<name>.md is NOT confused with a flat
-    skills/<cat>.md (the latter is only produced by old saves)."""
-    if not os.path.isdir(SKILLS_DIR):
+def _scan_skill_files(rt):
+    """Walk the runtime's skills dir and yield (category_or_None, name,
+    filepath) for every .md file, including legacy flat files. Categorized
+    files take precedence: a file under skills/<cat>/<name>.md is NOT confused
+    with a flat skills/<cat>.md (the latter is only produced by old saves)."""
+    if not os.path.isdir(rt.skills_dir):
         return
-    for entry in os.listdir(SKILLS_DIR):
-        full = os.path.join(SKILLS_DIR, entry)
+    for entry in os.listdir(rt.skills_dir):
+        full = os.path.join(rt.skills_dir, entry)
         if os.path.isfile(full) and entry.endswith(".md"):
             yield None, entry[:-3], full
         elif os.path.isdir(full):
@@ -154,25 +151,26 @@ def _scan_skill_files():
                     yield cat, sub[:-3], sub_full
 
 
-def _skill_list_all():
-    """Scan SKILLS_DIR and return a list of skill dicts (Hermes-style).
+def _skill_list_all(rt):
+    """Scan the runtime's skills dir and return a list of skill dicts
+    (Hermes-style).
 
     Each dict has: name, category, file, description, tags, related_skills.
     Flat files (no category folder) get category=None; categorized files get
     their folder name. Frontmatter is parsed from each .md file.
     """
     skills = []
-    for cat, name, path in _scan_skill_files():
+    for cat, name, path in _scan_skill_files(rt):
         info = _skill_read(path)
         if info is None:
             continue
         info["category"] = cat
-        info["file"] = os.path.relpath(path, SKILLS_DIR)
+        info["file"] = os.path.relpath(path, rt.skills_dir)
         skills.append(info)
     return skills
 
 
-def tool_skill_list():
+def tool_skill_list(rt):
     """List every skill on the device with metadata (Hermes-style).
 
     Returns {"ok": True, "skills": [dict, ...]} where each dict has:
@@ -180,12 +178,12 @@ def tool_skill_list():
     When the caller only wants names it can read d["name"].
     """
     try:
-        return {"ok": True, "skills": _skill_list_all()}
+        return {"ok": True, "skills": _skill_list_all(rt)}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_skill_read(name):
+def tool_skill_read(rt, name):
     """Read a skill by name (flat) or category/name (categorized).
 
     Returns {"ok": True, "name": ..., "category": ..., "file": ...,
@@ -195,19 +193,19 @@ def tool_skill_read(name):
     name = str(name).strip()
     if not name:
         return {"ok": False, "error": "empty name"}
-    path = _resolve_skill_path(name)
+    path = _resolve_skill_path(rt, name)
     if path is None:
         return {"ok": False, "error": "no such skill: %s" % name}
     info = _skill_read(path)
     if info is None:
         return {"ok": False, "error": "no such skill: %s" % name}
-    rel = os.path.relpath(path, SKILLS_DIR)
+    rel = os.path.relpath(path, rt.skills_dir)
     info["category"] = os.path.dirname(rel) if "/" in rel else None
     info["file"] = rel
     return {"ok": True, **info}
 
 
-def tool_skill_remove(name):
+def tool_skill_remove(rt, name):
     """Delete a skill by name (flat) or category/name (categorized).
 
     Returns {"ok": True} on success, {"ok": False, "error": ...} otherwise.
@@ -215,19 +213,19 @@ def tool_skill_remove(name):
     name = str(name).strip()
     if not name:
         return {"ok": False, "error": "empty name"}
-    path = _resolve_skill_path(name)
-    if path is None or not _inside_skills(path):
+    path = _resolve_skill_path(rt, name)
+    if path is None or not _inside_skills(rt, path):
         return {"ok": False, "error": "no such skill: %s" % name}
     try:
         os.remove(path)
+        rel = os.path.relpath(path, rt.skills_dir)
         return {"ok": True, "name": os.path.splitext(os.path.basename(path))[0],
-                "category": os.path.dirname(os.path.relpath(path, SKILLS_DIR))
-                if "/" in os.path.relpath(path, SKILLS_DIR) else None}
+                "category": os.path.dirname(rel) if "/" in rel else None}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
-def tool_skill_save(name, content, category=None):
+def tool_skill_save(rt, name, content, category=None):
     """Save a skill with optional YAML frontmatter.
 
     `name` may be "skill-name" (flat) or "category/skill-name" (categorized);
@@ -254,7 +252,7 @@ def tool_skill_save(name, content, category=None):
         fm["name"] = name
     if not fm.get("description"):
         fm["description"] = name.replace("-", " ").replace("_", " ").title()
-    path = _skill_filepath(cat, name)
+    path = _skill_filepath(rt, cat, name)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # rebuild the .md source with a clean frontmatter block
@@ -272,13 +270,13 @@ def tool_skill_save(name, content, category=None):
 # ---------------- skills: install from URL / git repo ----------------
 
 
-def tool_skill_install(source, category=None):
+def tool_skill_install(rt, source, category=None):
     """Install a skill from a local .md file, a raw .md URL, or a GitHub URL.
 
     GitHub repo/blob URLs are rewritten to raw.githubusercontent.com so the
     full markdown is fetched (not the web_fetch snippet), parsed for
-    frontmatter, and saved into SKILLS_DIR via tool_skill_save. Returns the
-    installed skill's name/category/path.
+    frontmatter, and saved into the runtime's skills dir via tool_skill_save.
+    Returns the installed skill's name/category/path.
     """
     source = str(source or "").strip()
     if not source:
@@ -292,7 +290,7 @@ def tool_skill_install(source, category=None):
         name = os.path.basename(source)
         if name.lower().endswith(".md"):
             name = name[:-3]
-        return tool_skill_save(name, content, category)
+        return tool_skill_save(rt, name, content, category)
     if source.startswith(("http://", "https://")):
         url = source
         if "github.com/" in url and "/blob/" in url:
@@ -312,11 +310,11 @@ def tool_skill_install(source, category=None):
             name = str(fm["name"])
         if not name or name in (".", ""):
             return {"ok": False, "error": "cannot determine a skill name from %s" % url}
-        return tool_skill_save(name, content, category)
+        return tool_skill_save(rt, name, content, category)
     return {"ok": False, "error": "source must be a local path or an http(s) URL"}
 
 
-def tool_skill_sync_repo(repo, subdir=None):
+def tool_skill_sync_repo(rt, repo, subdir=None):
     """Clone a git repo of skills and import every .md as a skill.
 
     Categories come from each file's folder (top-level folder only - nested
@@ -326,7 +324,7 @@ def tool_skill_sync_repo(repo, subdir=None):
     repo = str(repo or "").strip()
     if not repo:
         return {"ok": False, "error": "empty repo URL"}
-    if not _permission("clone skills repo: %s" % repo[:160]):
+    if not request_permission(rt, "clone skills repo: %s" % repo[:160]):
         return {"ok": False, "error": "permission denied by user"}
     import tempfile, shutil
     tmp = tempfile.mkdtemp(prefix="alva_skills_")
@@ -369,7 +367,7 @@ def tool_skill_sync_repo(repo, subdir=None):
                 if fm.get("name"):
                     name = str(fm["name"])
                 category = rel.split(os.sep)[0] if rel not in (".", "") else None
-                r = tool_skill_save(name, content, category)
+                r = tool_skill_save(rt, name, content, category)
                 if r.get("ok"):
                     installed.append({"name": r["name"], "category": r.get("category"),
                                       "path": r.get("path")})
