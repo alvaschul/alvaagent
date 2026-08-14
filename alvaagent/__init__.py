@@ -5,32 +5,27 @@ facade re-exports the old flat API so `import alvaagent as pa` behaves like
 the original module.
 """
 import subprocess  # noqa: F401  (read via the facade fallback so pa.subprocess.run monkeypatches keep working)
+import urllib.error  # noqa: F401
+import urllib.request  # noqa: F401
+try:
+    import yaml  # noqa: F401
+except ImportError:
+    yaml = None
 import sys as _sys
 
-# The eager re-export must only run against a fully loaded alvaagent_tui.
-# Three import orders all need to work:
+# alvaagent_tui is the compatibility shim (re-exports the repl surface from
+# alvaagent.repl). Two import orders need to work:
 #   1. `import alvaagent` first (the test suite): alvaagent_tui is not loaded
-#      yet — import it here, then re-export.
-#   2. `import alvaagent_tui` first: it is mid-import (its own
-#      `from alvaagent.util import ...` pulled this package in before `_store`
-#      is defined) — skip the re-export; the proxy below forwards reads to it
-#      once it finishes loading.
-#   3. `python3 alvaagent_tui.py` script mode: same as 1 (the facade imports it
-#      as a module) — unchanged.
+#      yet — import it here; the proxy below forwards reads to it.
+#   2. `import alvaagent_tui` first: it is mid-import (its `from
+#      alvaagent.repl import ...` pulled this package in before the shim
+#      finished loading) — the proxy below still forwards reads to it once it
+#      finishes loading. The facade itself never imports from alvaagent.repl
+#      directly (that would re-enter the partial import in order 2).
 _tui = _sys.modules.get("alvaagent_tui")
 if _tui is None:
     import alvaagent_tui
     _tui = _sys.modules["alvaagent_tui"]
-if "_store" in _tui.__dict__:
-    from alvaagent_tui import *  # noqa: F401,F403
-    from alvaagent_tui import (  # noqa: F401
-        _store, _APPROVED_SET, _cancel_flag,
-        ON_PERMISSION, ON_TOOL, _UI, CUR_SKIN, COLOR,
-        _atomic_write, _find_session, _fmt_k, _looks_like_html, _md_line,
-        _normalize_state, _parse_xml_tool_calls, _permission, _raw_fetch,
-        _read_trace, _save_store, _sleep_retry, _store_get, _strip_xml,
-        _unique_session_name, signal, urllib, time, yaml,
-    )
 from alvaagent.util import (  # noqa: F401
     _env, now_iso, _fmt_k, _atomic_write, _looks_like_html, _raw_fetch,
     mask_key, _parse_frontmatter, _frontmatter_load, _frontmatter_dump,
@@ -105,6 +100,7 @@ from alvaagent.tui import (  # noqa: F401
     run_agent_tui, _ANSI_RE, _MD_STYLE, _UI, COLOR, CUR_SKIN, _CON,
     Console, Panel, HORIZONTALS, banner, render_status_bar,
     ALVA_WORDMARK, _markup_safe, _banner_tools_lines, _banner_skills_lines,
+    compress_now,
 )
 from alvaagent.commands import (  # noqa: F401
     ask, parse_key, ask_key, ask_permission, pick_model, _SLASH_COMMANDS,
@@ -115,12 +111,13 @@ from alvaagent.commands import (  # noqa: F401
     cmd_export, cmd_multi,
 )
 
-# The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
-# _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
-# As the mechanical split moves readers into alvaagent.* submodules, a write to
-# the facade must land in every loaded module that exposes the name (the
-# def-owner plus any module that imported it by name). Reads forward to
-# alvaagent_tui, which re-imports the full surface until Task 13.
+# The split modules read module globals (ON_PERMISSION, _TOOLS_MODE, ...). The
+# test suite monkeypatches them through `pa.<name> = ...`. A write to the
+# facade must land on the facade + the shim (alvaagent_tui) + every loaded
+# alvaagent.* submodule that exposes the name (the def-owner plus any module
+# that imported it by name). Reads forward to the shim first (the repl surface:
+# send_message, setup_completion, main, ...), then fall back to this facade's
+# own re-exported namespace (the flat API imported from the package modules).
 import types as _types
 
 

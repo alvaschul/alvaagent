@@ -1,4 +1,4 @@
-from alvaagent_tui import main
+from alvaagent.repl import main
 
 if __name__ == "__main__":
     main()
