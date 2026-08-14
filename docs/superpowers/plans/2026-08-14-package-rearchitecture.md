@@ -314,8 +314,9 @@ def data_dir():
 ```
 
 - `_LEGACY_DIRS` (lines ~130-133), `CONFIG_PATH`, `STORE_PATH`, `HISTORY_PATH`, `TRACE_PATH` (derive from `data_dir()` at module import — same as today).
+- **`DATA_DIR` module constant** `DATA_DIR = data_dir()` — remaining `alvaagent_tui.py` code references `DATA_DIR` at 10+ sites (SKILLS_DIR ~365, `_inside_skills` boundary ~476, self-test ~2535, export ~4426, status bar ~4628) and must import it back. `_LEGACY_DIRS` needs the **two-level-up `__file__` correction** (original `__file__` was the repo root; in config.py it is the package dir).
 - `PROVIDERS`, `DEFAULT_CFG`, `FIRST_RUN_CFG`, `DEFAULT_SKIN`, `SKIN_NAMES`, `ALVA_VERSION`, `DEFAULT_CONTEXT_WINDOW`, `MODEL_CONTEXT` (lines ~139-181, verbatim).
-- `TOOL_MODES = ("core", "full")` (move the tuple; **delete it from the tools section of `alvaagent_tui.py` now**).
+- `TOOL_MODES = ("core", "full")` (move the tuple; **delete it from the tools section of `alvaagent_tui.py` now** — it is the private `_TOOL_MODES` in tui, renamed `TOOL_MODES` here; the two remaining tui references in `_set_tool_mode` (~1643) and the `/tools` command (~4803) must be updated to `TOOL_MODES`).
 - `_tool_mode_of` (verbatim, but validate against `TOOL_MODES`).
 - `_skin_of` (verbatim).
 - `_normalize_state` (verbatim EXCEPT: replace both `_tool_mode_of(raw)` calls with the config-local `_tool_mode_of(raw)` — it's in the same module now).
@@ -338,10 +339,11 @@ Delete the whole paths/config block (functions + constants above) from `alvaagen
 ```python
 # paths / config moved to alvaagent/config.py (Task 3)
 from alvaagent.config import (  # noqa: E402,F401
-    data_dir, CONFIG_PATH, STORE_PATH, HISTORY_PATH, TRACE_PATH,
-    PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN, SKIN_NAMES,
-    ALVA_VERSION, DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT, TOOL_MODES,
-    _tool_mode_of, _skin_of, _normalize_state, load_state, save_state, active_cfg,
+    data_dir, DATA_DIR, _LEGACY_DIRS, CONFIG_PATH, STORE_PATH, HISTORY_PATH,
+    TRACE_PATH, PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN,
+    SKIN_NAMES, ALVA_VERSION, DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT,
+    TOOL_MODES, _tool_mode_of, _skin_of, _normalize_state, load_state,
+    save_state, active_cfg,
 )
 ```
 
@@ -409,10 +411,11 @@ Add to `alvaagent/__init__.py`:
 
 ```python
 from alvaagent.config import (  # noqa: F401
-    data_dir, CONFIG_PATH, STORE_PATH, HISTORY_PATH, TRACE_PATH,
-    PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN, SKIN_NAMES,
-    ALVA_VERSION, DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT, TOOL_MODES,
-    _tool_mode_of, _skin_of, _normalize_state, load_state, save_state, active_cfg,
+    data_dir, DATA_DIR, _LEGACY_DIRS, CONFIG_PATH, STORE_PATH, HISTORY_PATH,
+    TRACE_PATH, PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN,
+    SKIN_NAMES, ALVA_VERSION, DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT,
+    TOOL_MODES, _tool_mode_of, _skin_of, _normalize_state, load_state,
+    save_state, active_cfg,
 )
 from alvaagent.trace import (  # noqa: F401
     _trace, _read_trace, _trace_count, _TRACE_MAX_LINES, _TRACE_MAX_BYTES,
@@ -597,11 +600,11 @@ git commit -m "refactor: extract permissions.py (command/python/file classifiers
 
 **Interfaces:**
 - Consumes: `util` (`_parse_frontmatter`, `_frontmatter_dump`, `_raw_fetch`, `_looks_like_html`, `_atomic_write`), `store` (`_store_get`, `_store_set`), `permissions` (`classify_file_action`, `_permission`, `ON_PERMISSION`), `config` (project root).
-- Produces: `_SKILL_FM_RE`, `_SKILL_FM_DEFAULT`, `_VALID_FM_KEYS`, `_SKILL_RAW_MAX`, `_skill_body_for_tool`, `_detect_category`, `_skill_filepath`, `_inside_skills`, `_resolve_skill_path`, `_skill_read`, `_scan_skill_files`, `_skill_list_all`, `tool_skill_list`, `tool_skill_read`, `tool_skill_remove`, `tool_skill_save`, `tool_skill_install`, `tool_skill_sync_repo`.
+- Produces: `_skill_body_for_tool`, `_detect_category`, `_skill_filepath`, `_inside_skills`, `_resolve_skill_path`, `_skill_read`, `_scan_skill_files`, `_skill_list_all`, `tool_skill_list`, `tool_skill_read`, `tool_skill_remove`, `tool_skill_save`, `tool_skill_install`, `tool_skill_sync_repo`.
 
 - [ ] **Step 1: Create `alvaagent/skills.py`**
 
-Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- skills: Hermes-style frontmatter ...` and `# ---------------- tools ...` (roughly lines 635-1215), EXCEPT the mini-yaml helpers already moved to `util.py` in Task 2 (`_mini_scalar`, `_finish_block`, `_mini_yaml`, `_frontmatter_load`, `_frontmatter_dump`, `_parse_frontmatter` — do not copy them again; import them instead). Also exclude `_atomic_write` (Task 2), `_looks_like_html`, `_raw_fetch` (Task 2).
+Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- skills: Hermes-style frontmatter ...` and `# ---------------- tools ...` (roughly lines 635-1215), EXCEPT the mini-yaml helpers already moved to `util.py` in Task 2 (`_mini_scalar`, `_finish_block`, `_mini_yaml`, `_frontmatter_load`, `_frontmatter_dump`, `_parse_frontmatter` — do not copy them again; import them instead). Also exclude `_atomic_write` (Task 2), `_looks_like_html`, `_raw_fetch` (Task 2), and the constants `_SKILL_FM_RE`, `_SKILL_FM_DEFAULT`, `_VALID_FM_KEYS`, `_SKILL_RAW_MAX` — these now live in `util.py` (Task 2 deviation, reviewed and accepted) and must be IMPORTED from `alvaagent.util`, not re-copied from git history (a re-copy would shadow util's copies with divergent objects that `_parse_frontmatter`/`_raw_fetch` still read).
 
 Header imports:
 
@@ -615,7 +618,8 @@ from alvaagent.permissions import classify_file_action, _permission
 from alvaagent.store import _store_get, _store_set
 from alvaagent.util import (
     _atomic_write, _looks_like_html, _raw_fetch,
-    _parse_frontmatter, _frontmatter_dump,
+    _SKILL_FM_RE, _SKILL_FM_DEFAULT, _VALID_FM_KEYS, _SKILL_RAW_MAX,
+    _parse_frontmatter, _frontmatter_load, _frontmatter_dump,
 )
 ```
 
