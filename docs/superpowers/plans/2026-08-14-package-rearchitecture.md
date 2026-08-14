@@ -899,29 +899,30 @@ git commit -m "refactor: extract sessions.py (session store, context tracking, a
 - Modify: `alvaagent_tui.py`, `alvaagent/__init__.py`
 
 **Interfaces:**
-- Consumes: `config` (`TRACE_PATH`, `active_cfg`, `data_dir`), `store` (`_store_get`? check bodies), `client` (`chat_completion_stream`, `_Cancelled`, `_sleep_retry`, `_cancel_flag`), `tools` (`TOOLS`, `dispatch_tool`, `TOOL_IMPL`, `active_tools`, `_maybe_enable_full`, `_TOOL_ERROR_HINTS`), `trace` (`_trace`, `_read_trace`, `_trace_count`), `util`.
-- Produces: `_TURN_TIMEOUT`, `_MAX_CONSEC_TOOL_FAILURES`, **`ON_TOOL`** (module hook — stays in this module, see Ruling 2), XML regex consts (`_XML_*`), `_repair_tool_pairs`, `_report_tool(...)`, `run_agent(messages, cfg, ...)` (verbatim), `_clean_segment`, `_strip_xml_blocks`, `_parse_xml_tool_calls`, `_strip_xml`, `run_agent_stream(messages, cfg, ...)` (verbatim).
+- Consumes: `client` (`chat_completion_stream`, `_Cancelled`), `tools` (`dispatch_tool`, `active_tools`), `trace` (`_trace`, `_read_trace`, `_trace_count`), `util` (`_cancel_flag`).
+- Produces: `_TURN_TIMEOUT`, `_MAX_CONSEC_TOOL_FAILURES`, **`ON_TOOL`** (module hook — stays in this module, see Ruling 2), XML regex consts (`_XML_*`), `_repair_tool_pairs`, `_report_tool(...)`, `run_agent(messages, cfg, ...)` (verbatim), `_clean_segment`, `_strip_xml_blocks`, `_parse_xml_tool_calls`, `_strip_xml`, `run_agent_stream(messages, cfg, ...)` (verbatim). (`MAX_STEPS` stays local to agent.py — no tui/test use.)
 - Note: the trace helpers (`_trace`/`_read_trace`/`_trace_count`/`_TRACE_MAX_LINES`/`_TRACE_MAX_BYTES`) already moved to `trace.py` in Task 3 — **do not move them again**; import them.
+
+> **Ruling 10 (amended):** The move range is the agent loop section *only*: current tui **176-521** (`# ---------------- agent loop` marker through `run_agent_stream`'s final `yield`). The old end marker `# ---------------- harness self-test` no longer exists (moved to tools.py in Task 7). `compress_now` (524-560), the `Terminal UI` banner, `class C`, and `COLOR` (through the `skins` marker at 583) stay behind per Rulings 9 + the UI boundary. Verified header is smaller than originally planned: `config`, `_sleep_retry`, `TOOLS`/`TOOL_IMPL`/`_maybe_enable_full`/`_TOOL_ERROR_HINTS` have zero uses in the section; `_cancel_flag` is imported from `alvaagent.util` (Ruling 8 canonical owner, not client). The trace import block that sits mid-section (old tui ~229) moves along and is trimmed to `_trace, _read_trace, _trace_count`; tui gets a fresh `from alvaagent.trace import _read_trace` because `cmd_trace` (~1773) still needs it.
 
 - [ ] **Step 1: Create `alvaagent/agent.py`**
 
-Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- agent loop ...` and `# ---------------- harness self-test ...` (roughly lines 2292-2682), **minus** the trace helpers already extracted in Task 3. Include `ON_TOOL = None` (line ~2297).
+Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- agent loop ...` and the end of `run_agent_stream` (current lines 176-521), **minus** the trace helpers already extracted in Task 3. Include `ON_TOOL = None` (line ~180).
 
 Header imports:
 
 ```python
 import json
 import re
+import time
 
-from alvaagent.config import TRACE_PATH, active_cfg
-from alvaagent.client import (
-    chat_completion_stream, _Cancelled, _sleep_retry, _cancel_flag,
-)
-from alvaagent.tools import TOOLS, dispatch_tool, active_tools, _maybe_enable_full, TOOL_IMPL
+from alvaagent.client import chat_completion_stream, _Cancelled
+from alvaagent.tools import dispatch_tool, active_tools
 from alvaagent.trace import _trace, _read_trace, _trace_count
+from alvaagent.util import _cancel_flag
 ```
 
-`run_agent_stream` references `_cancel_flag`, `_TURN_TIMEOUT`, `_MAX_CONSEC_TOOL_FAILURES`, `dispatch_tool`, `_trace`, `_repair_tool_pairs` — all local to this module (or imported above) after the move. Check for `_sleep_retry` usage.
+`run_agent_stream` references `_cancel_flag`, `_TURN_TIMEOUT`, `_MAX_CONSEC_TOOL_FAILURES`, `dispatch_tool`, `_trace`, `_repair_tool_pairs` — all local to this module (or imported above) after the move. `_sleep_retry` is not used.
 
 - [ ] **Step 2: Patch `alvaagent_tui.py`**
 
