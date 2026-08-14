@@ -1290,24 +1290,42 @@ git commit -m "refactor: extract repl.py (REPL, send_message, main, signal/scree
 
 ---
 
-## Phase B — Runtime threading (retire the globals)
+## Phase B — Runtime context object (thread + bridge, behavior-preserving)
 
-### Task 14: `Runtime` context object threaded through everything
+> **Design authority:** `docs/superpowers/specs/2026-08-14-runtime-context-design.md`
+> (spec, committed `b0b4e11`). This plan implements that spec; the spec wins on
+> any conflict with the older Phase B section it replaces.
+>
+> **Ruling 14 (bridge sequencing):** the spec's §5 listed the facade bridge as a
+> final commit, but the original suite must be green after EVERY commit. The
+> facade bridge pieces therefore land in the SAME commit as the module threading
+> they serve: commit 1 introduces `_get_rt()`; each later commit adds that
+> module's accessors/adapters. The `_Facade` proxy, generic write-through, and
+> shim stay intact throughout Phase A and are retired only in Task 15.
+
+### Task 14: Thread `Runtime` through every module; bridge keeps original suite green
+
+**Goal:** retire the mutable process globals by threading a `Runtime` context
+object; the ORIGINAL `test_tui.py` (249 checks) keeps passing essentially
+unchanged as the machine proof that behavior is preserved.
 
 **Files:**
-- Create: `alvaagent/context.py` (replace placeholder)
-- Modify: every module — `util` (none), `config`, `store`, `permissions`, `skills`, `tools`, `client`, `sessions`, `agent`, `tui`, `commands`, `repl`
-- Modify: `test_tui.py` (tool call sites + a Runtime builder helper)
+- Create: `alvaagent/context.py`
+- Modify: `alvaagent/{store,config,permissions,skills,tools,client,agent,sessions,trace,tui,commands,repl}.py`
+- Modify: `alvaagent/__init__.py` (facade bridge, per-commit)
+- Modify: `test_tui.py` (ONLY the `_tools._TOOLS_MODE` block in Step 2 — no other test edits in Phase A)
+- Test: `python3 test_tui.py` — must end `ALL TESTS PASSED ✓` after every commit
 
-**Interfaces:**
+**Interfaces (spec §2):**
 
-The `Runtime` dataclass (full definition):
+- `alvaagent/context.py`:
 
 ```python
 """Runtime context object — replaces the single-file module globals."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import threading
 from typing import Callable, Optional
 
@@ -1328,97 +1346,162 @@ class Runtime:
     last_turn: dict = field(default_factory=dict)
 
     @property
-    def active_cfg(self):
+    def active_cfg(self) -> dict:
         return self.cfg["profiles"][self.cfg["active"]]
-```
 
-Builder (in `context.py`):
+    @property
+    def skills_dir(self) -> str:
+        return os.path.join(self.data_dir, "skills")
 
-```python
+
 def build_runtime(data_dir=None):
     import alvaagent.config as config
     import alvaagent.store as store
     if data_dir is None:
         data_dir = config.data_dir()
     rt = Runtime(data_dir=data_dir)
-    rt.cfg = config.load_state()          # returns the normalized state dict
+    rt.cfg = config.load_state()
     rt.tool_mode = rt.cfg.get("tool_mode", "core")
     rt.skin = rt.cfg.get("skin", "midnight")
-    store.load(rt)                         # store module function now takes rt
+    store.load(rt)
     return rt
 ```
 
-**Global → Runtime mapping (apply every row):**
+- Module signatures (all rt-first; details per step below):
+  - store: `load(rt)`, `save(rt)`, `get(rt, key, default=None)`, `set(rt, key, value)`
+  - config: `load_state()` (pure), `save_state(rt)`, `active_cfg(rt)`
+  - permissions: `request_permission(rt, desc)` (matches current `_permission(desc)`; the spec's vestigial `ok=True, hint=""` params do NOT exist in current code — YAGNI), `classify_file_action(rt, path, mode)`
+  - skills: `skill_list(rt)`, `skill_read(rt, name)`, `skill_save(rt, name, content, category=None)`, `skill_remove(rt, name)`, `skill_install(rt, source, category=None)`, `skill_sync_repo(rt, repo, subdir=None)`
+  - tools: `Tools(rt)` class (one method per TOOLS schema name, takes full `args` dict), `dispatch_tool(rt, name, args)`, `visible(rt)`, `set_mode(rt, mode)`, `maybe_enable_full(rt, name)`, `self_test(rt)`; delete `TOOL_IMPL` dict and `_TOOLS_MODE`
+  - client: `chat_completion(rt, messages, **kw)`, `chat_completion_stream(rt, messages, **kw)`, `fetch_models(rt, base_url, api_key)`, `cancel_agent(rt)` → `rt.cancel.set()`; streams check `rt.cancel.is_set()`
+  - agent: `run_agent(rt, messages)`, `run_agent_stream(rt, messages)`; calls `rt.on_tool` if set; delete `ON_TOOL` global
+  - sessions: `sessions_map(rt)`, `load_session(rt)`, `save_session(rt)`, `delete_session(rt, name)`, `rename_session(rt, old, new)`, `find_session(rt, name)`, `unique_session_name(rt, name)`, `context_usage(rt, history)`, `compress_now(rt, threshold=None)`, `trim_history(rt, history)`, `auto_title(rt, text, history)`, `new_session_name(rt)`, `summarize(rt, ...)`
+  - trace: `trace(rt, **event)`, `read_trace(rt, n)`, `trace_count(rt)` — paths derived from `rt.data_dir`
+  - tui: `set_active_skin(rt)`, `run_agent_tui(rt)`, `render_status_bar(rt, session, elapsed, tools, history)`, `print_user_turn(rt, ...)`; tool open/close operate on `rt.spinner`; delete `_UI` global, `CUR_SKIN`/`COLOR` derive from `rt.skin`
+  - commands: `cmd_*(rt, ...)`; `ask_permission(rt, ...)`
+  - repl: `send_message(rt, text) -> str`, `repl(rt)`, `main()` = build_runtime + hooks + `set_active_skin(rt)` + `banner(rt)` + `repl(rt)`
 
-| Old global / param | Becomes | Notes |
-|---|---|---|
-| `store._store` | `rt.store` | `store.get(rt, k, d)` / `store.set(rt, k, v)` / `store.load(rt)` / `store.save(rt)` |
-| `tools._TOOLS_MODE` | `rt.tool_mode` | `tools.set_mode(rt, mode)`, `tools.visible(rt)`, dispatch auto-enables via `rt` |
-| `permissions._APPROVED_SET` | `rt.approved` | `request_permission(rt, ...)` |
-| `client._cancel_flag` | `rt.cancel` (`threading.Event`) | `cancel_agent(rt)` → `rt.cancel.set()`; stream checks `rt.cancel.is_set()` |
-| `permissions.ON_PERMISSION` | `rt.on_permission` | `request_permission` uses it; `build_runtime` leaves `None` (headless deny) |
-| `tui.ON_TOOL` (was `alvaagent_tui.ON_TOOL`) | `rt.on_tool` | agent loop calls it if set |
-| `tui._UI["spinner"]` | `rt.spinner` | `tool_open`/`tool_close` operate on `rt.spinner` |
-| `tui.CUR_SKIN` + `tui.COLOR` | `rt.skin` | tui keeps module-level current-skin via `set_active_skin(rt)`; render helpers unchanged |
-| `repl._last_turn` | `rt.last_turn` | `/redo` reads it |
-| `state` param | `rt.cfg` | `active_cfg(state)` → `rt.active_cfg` |
-| `session`, `history` params | `rt.session`, `rt.history` | `send_message(rt, text)` returns session name |
+---
 
-**Key signature changes (apply exactly):**
+- [ ] **Step 1: context.py + thread `store`/`config`/`permissions` + their facade accessors**
+
+1. Create `alvaagent/context.py` with the exact code above.
+2. `store.py`: delete the `_store` module global and the import-time
+   `_load_store()` call. Add `load(rt)` (was `_load_store`), `save(rt)` (was
+   `_save_store`), `get(rt, key, default=None)` (was `_store_get`),
+   `set(rt, key, value)` (was `_store_set`). All internal reads/writes go
+   through `rt.store`. `_migrate_legacy_dir(data_dir)` is unchanged.
+3. `config.py`: `save_state(state)` → `save_state(rt)` (persists `rt.cfg`);
+   `active_cfg(state)` → `active_cfg(rt)`. `load_state()` stays pure. Delete
+   the module-level `active_cfg` global if one exists (it does not — verify
+   with grep). `TRACE_PATH` stays a config constant but `trace.py` derives the
+   actual path from `rt.data_dir` (Step 3).
+4. `permissions.py`: rename `_permission(desc)` → `request_permission(rt, desc)`
+   (same body, reading `rt.approved`/`rt.on_permission` instead of the
+   globals); `classify_file_action(path, mode)` → `classify_file_action(rt,
+   path, mode)` (uses `rt.data_dir` + `PROJECT_DIR`). Delete `_APPROVED_SET`
+   and `ON_PERMISSION` globals. `classify_command` and `_in_project` unchanged
+   (pure; `PROJECT_DIR`/`DATA_DIR` module constants stay).
+5. `alvaagent/__init__.py` — bridge for the retired names (do NOT touch the
+   `_Facade` class or write-through yet):
 
 ```python
-# config.py
-def load_state() -> dict                        # unchanged; no global side effects
-def save_state(rt)                              # was save_state(state); persists rt.cfg
-def active_cfg(rt) -> dict                      # was active_cfg(state)
-# store.py
-def load(rt) / save(rt) / get(rt, key, default=None) / set(rt, key, value)
-# permissions.py
-def request_permission(rt, action, ok=True, hint="")  # was _permission(action, ok, hint)
-def classify_file_action(rt, path, mode)               # was classify_file_action(path, mode)
-# skills.py
-def skill_list(rt) / skill_read(rt, name) / skill_save(rt, name, content, category=None)
-def skill_remove(rt, name) / skill_install(rt, source, category=None) / skill_sync_repo(rt, repo, subdir=None)
-# tools.py
-class Tools:
-    def __init__(self, rt): self.rt = rt
-    def calculator(self, args): ...              # args is the full params dict
-    def run_python(self, args): ...
-    # ... one method per tool name in TOOLS, named exactly the schema name
-def dispatch_tool(rt, name, args): ...
-def visible(rt) -> list                          # was active_tools()
-def set_mode(rt, mode) -> None                   # was _set_tool_mode(state, mode)
-def maybe_enable_full(rt, name) -> bool          # was _maybe_enable_full(name)
-def self_test(rt) -> str                         # was self_test()
-# client.py
-def chat_completion(rt, messages, **kw)          # was chat_completion(state, messages, **kw)
-def chat_completion_stream(rt, messages, **kw)
-def fetch_models(rt)                             # was fetch_models(state)
-def cancel_agent(rt)                             # rt.cancel.set()
-# agent.py
-def run_agent(rt, messages)                      # thread rt; drop separate cfg
-def run_agent_stream(rt, messages)
-# trace.py
-def trace(rt, **event) / read_trace(rt, n) / trace_count(rt)   # was _trace/_read_trace/_trace_count
-# sessions.py
-def sessions_map(rt) / load_session(rt) / save_session(rt)
-def delete_session(rt, name) / rename_session(rt, old, new) / find_session(rt, name)
-def context_usage(rt, history) / compress_now(rt, threshold=None)
-# tui.py
-def set_active_skin(rt)                          # reads rt.skin
-def run_agent_tui(rt)                            # was run_agent_tui(history, cfg)
-def render_status_bar(rt, session, elapsed, tools, history)
-# commands.py
-def cmd_*(rt, ...)                               # every cmd_* takes rt first; the old
-                                                 #   `state`/`history` params come from rt
-# repl.py
-def send_message(rt, text) -> str                # returns session name
-def repl(rt) / main()                            # main(): rt = build_runtime(); wire hooks
+_rt = None
+def _get_rt():
+    global _rt
+    if _rt is None:
+        _rt = build_runtime()
+    return _rt
 ```
 
-**Dispatch through `Tools` (replaces `TOOL_IMPL`):**
+   Add to the `_Facade` class (properties on the facade module class so both
+   read (`__getattribute__`) and write (`__setattr__`) resolve through them —
+   `super().__getattribute__`/`super().__setattr__` honor data descriptors):
 
-Delete the `TOOL_IMPL` lambda dict in `tools.py`. Dispatch becomes:
+```python
+    @property
+    def _store(self):
+        return _get_rt().store
+
+    @property
+    def _APPROVED_SET(self):
+        return _get_rt().approved
+
+    @property
+    def ON_PERMISSION(self):
+        return _get_rt().on_permission
+
+    @ON_PERMISSION.setter
+    def ON_PERMISSION(self, value):
+        _get_rt().on_permission = value
+
+    @property
+    def active_cfg(self):
+        return _get_rt().active_cfg
+
+    @active_cfg.setter
+    def active_cfg(self, value):
+        rt = _get_rt()
+        rt.cfg["profiles"][rt.cfg["active"]] = value
+```
+
+   And facade adapter functions (module-level, plain defs):
+
+```python
+def _permission(desc):
+    return request_permission(_get_rt(), desc)
+
+def _store_get(key, default=None):
+    return store_get(_get_rt(), key, default)
+
+def _save_store():
+    store_save(_get_rt())
+```
+
+   (Import `store.get`/`store.set`/`store.load`/`store.save` as
+   `store_get`/`store_set`/`store_load`/`store_save` if their names collide
+   with facade re-exports, or import the store module as `_store_mod`.)
+6. Verify (must ALL pass):
+   - `python3 test_tui.py` → `ALL TESTS PASSED ✓`
+   - `python3 -c "import alvaagent as pa; pa._APPROVED_SET.clear(); assert isinstance(pa._store, dict); print('bridge ok')"`
+7. Commit:
+
+```bash
+git add alvaagent/context.py alvaagent/store.py alvaagent/config.py alvaagent/permissions.py alvaagent/__init__.py
+git commit -m "refactor: introduce Runtime context; thread store/config/permissions; facade bridge accessors"
+```
+
+---
+
+- [ ] **Step 2: Thread `skills`/`tools` + tool adapters + the surgical test edit**
+
+1. `skills.py`: `tool_skill_list/read/save/remove/install/sync_repo` →
+   `skill_list(rt)`, `skill_read(rt, name)`, `skill_save(rt, name, content,
+   category=None)`, `skill_remove(rt, name)`, `skill_install(rt, source,
+   category=None)`, `skill_sync_repo(rt, repo, subdir=None)`. Paths derive
+   from `rt.skills_dir` (drop the `SKILLS_DIR` module global; keep `_inside_skills`
+   etc. taking a dir). Facade: re-export the new names as `tool_skill_list(rt)`
+   etc. AND keep flat adapters `tool_skill_list()`, `tool_skill_read(name)`,
+   `tool_skill_save(name, content, category=None)`, `tool_skill_remove(name)`,
+   `tool_skill_install(source, category=None)`, `tool_skill_sync_repo(repo,
+   subdir=None)` that call `_get_rt()` + the new functions.
+2. `tools.py`: build the `Tools` class — one method per name in `TOOLS` (from
+   the `TOOL_IMPL` dict keys), each method takes the full `args` dict and
+   calls the existing private logic now taking `(rt, ...)`. E.g.:
+
+```python
+class Tools:
+    def __init__(self, rt):
+        self.rt = rt
+
+    def calculator(self, args):
+        return tool_calculator(self.rt, args.get("expression"))
+
+    def run_command(self, args):
+        return tool_run_command(self.rt, args.get("command"))
+```
+
+   Replace `TOOL_IMPL`-driven dispatch with:
 
 ```python
 def dispatch_tool(rt, name, args):
@@ -1439,24 +1522,113 @@ def dispatch_tool(rt, name, args):
                 "hint": _TOOL_ERROR_HINTS.get(name, "check the tool arguments and try again")}
 ```
 
-Each `Tools` method takes the full `args` dict and plucks what it needs, e.g.:
+   Rename `_TOOLS_MODE` reads to `rt.tool_mode`; `_set_tool_mode(state, mode)` →
+   `set_mode(rt, mode)`; `_sync_tool_mode(cfg)` → `sync_tool_mode(rt)`;
+   `active_tools()` → `visible(rt)`; `_maybe_enable_full(name)` →
+   `maybe_enable_full(rt, name)` (reads/writes `rt.tool_mode`); `self_test()` →
+   `self_test(rt)`. Delete the `_TOOLS_MODE` global and the `TOOL_IMPL` dict.
+   Keep constants (`_PY_RUN_TIMEOUT`, `_PY_MAX_BYTES`, `_PY_MAX_CHARS`,
+   `_CALC_ALLOWED`, `_TOOL_ERROR_HINTS`, `TOOLS`, `_CORE_TOOL_NAMES`,
+   `_ADVANCED_TOOL_NAMES`). Memory/todo/feedback/reflect tool logic takes
+   `(rt, ...)` and reads/writes `rt.store` via `store.get(rt, ...)`/`store.set(rt, ...)`.
+3. `alvaagent/__init__.py` — tool flat adapters (plain defs) for every name the
+   suite calls: `tool_calculator(expr)`, `tool_todo_add(text)`,
+   `tool_todo_list()`, `tool_todo_toggle(i)`, `tool_todo_remove(i)`,
+   `tool_memory_save(k, v)`, `tool_memory_recall(k)`, `tool_memory_list()`,
+   `tool_memory_search(q)`, `tool_get_time()`, `tool_run_command(cmd)`,
+   `tool_file_read(p)`, `tool_file_write(p, c)`, `tool_file_edit(p, o, n)`,
+   `tool_file_list(p)`, `tool_file_search(pat, path=None, max_depth=None)`,
+   `tool_web_fetch(url)`, `tool_skill_*` (Step 2.1), `self_test()` →
+   `tools_self_test(_get_rt())`, `dispatch_tool(rt, name, args)` re-exported.
+   Each adapter: `return <rt-based fn>(_get_rt(), <old args mapped>)`.
+   `tool_web_fetch(url)` keeps using `util._raw_fetch` (still module-level).
+4. `test_tui.py` — the ONLY Phase A edit: the tiered-tool block
+   (the lines using `_tools._TOOLS_MODE`, ~1133-1160). Rewrite it to drive rt:
 
 ```python
-    def calculator(self, args):
-        return tool_calculator(self.rt, args.get("expression"))
+    _rt14 = pa.build_runtime()
+    _tools_tool_mode = _rt14.tool_mode
+    _rt14.tool_mode = "full"
+    assert_ok(pa.visible(_rt14) == pa.TOOLS, "full mode advertises all tools")
+    _res14 = pa.dispatch_tool(_rt14, "self_test", {})
+    assert_ok(_rt14.tool_mode == "full" and "hint" in _res14,
+              "dispatch_tool auto-enables full mode for advanced tools")
+    _rt14.tool_mode = "core"
+    assert_ok(pa.visible(_rt14) != pa.TOOLS, "core mode hides advanced tools")
+    _rt14.tool_mode = _tools_tool_mode
 ```
 
-Keep the existing `tool_*` logic as private functions taking `(rt, ...)` (or fold inline — your choice, behavior first). `self_test` becomes `self_test(rt)` and `tool_self_test(rt)` runs the external harness against the repo root as in Task 7.
+   Preserve the block's original assertions/restore intent exactly.
+5. Verify:
+   - `python3 test_tui.py` → `ALL TESTS PASSED ✓`
+   - `/data/data/com.termux/files/usr/bin/python3 -m pyflakes alvaagent/tools.py alvaagent/skills.py` → 0 findings
+   - `python3 -c "import alvaagent as pa; print(pa.tool_calculator('6*7'))"`
+6. Commit:
 
-- [ ] **Step 1: Replace `alvaagent/context.py` with the full Runtime + builder** (code above). Add `__version__`-adjacent sanity: none needed.
+```bash
+git add alvaagent/skills.py alvaagent/tools.py alvaagent/__init__.py test_tui.py
+git commit -m "refactor: thread Runtime through skills/tools (Tools class, dispatch_tool, set_mode, self_test); flat tool adapters"
+```
 
-- [ ] **Step 2: Thread rt through the leaf modules** — `store`, `config` (`save_state(rt)`, `active_cfg(rt)`), `permissions` (`request_permission(rt, ...)`, `classify_file_action(rt, ...)`). Update each module's internals: reads of `_store` become `rt.store`; `_save_store()` becomes `save(rt)`; `_APPROVED_SET` becomes `rt.approved`; `ON_PERMISSION` becomes `rt.on_permission`. Remove the now-dead module globals (`_store`, `_APPROVED_SET`, `ON_PERMISSION`). Drop the import-time `_load_store()` — store now loads in `build_runtime()`.
+---
 
-- [ ] **Step 3: Thread rt through `skills` and `tools`** — `skill_*(rt, ...)`; `Tools` class; `dispatch_tool(rt, ...)`; `visible(rt)`/`set_mode(rt, ...)`; remove `_TOOLS_MODE`. Update `self_test(rt)`.
+- [ ] **Step 3: Thread `client`/`agent`/`sessions`/`trace` + their facade adapters**
 
-- [ ] **Step 4: Thread rt through `client`, `agent`, `sessions`** — remove `_cancel_flag` (use `rt.cancel`); `trace(rt, ...)`; `run_agent(rt, messages)`; session funcs read `rt.session`/`rt.history`.
+1. `client.py`: `chat_completion(rt, messages, **kw)`,
+   `chat_completion_stream(rt, messages, **kw)`, `fetch_models(rt, base_url,
+   api_key)`; replace `_cancel_flag` (imported from util as a `[False]` list)
+   with `rt.cancel` (`rt.cancel.is_set()` checks, `cancel_agent(rt)` →
+   `rt.cancel.set()`); remove `_cancel_flag` from `util.py` if unused elsewhere
+   (grep; `agent.py` also uses it — handled this step). Keep `_sleep_retry`,
+   `_MAX_RETRIES`, `_RETRY_BACKOFF`, `_STREAM_*`, `_readable_error`,
+   `_retryable_status`, `SYSTEM_PROMPT`.
+2. `agent.py`: `run_agent(rt, messages)`, `run_agent_stream(rt, messages)`;
+   delete `ON_TOOL` global — agent calls `rt.on_tool(...)` if set; delete the
+   `_cancel_flag` import (uses `rt.cancel`); `_TURN_TIMEOUT`,
+   `_MAX_CONSEC_TOOL_FAILURES`, XML-parsing helpers stay module-level.
+3. `sessions.py`: all functions rt-first per Interfaces; session/history read
+   from `rt.session`/`rt.history`; `compress_now(rt, threshold=None)`;
+   summarize/auto_title take rt (LLM via `client.chat_completion(rt, ...)`).
+4. `trace.py`: `trace(rt, **event)`, `read_trace(rt, n)`, `trace_count(rt)`;
+   path derived from `rt.data_dir` (keep `_TRACE_MAX_LINES`/`_TRACE_MAX_BYTES`
+   constants).
+5. `alvaagent/__init__.py` — adapters: `chat_completion(messages, **kw)` →
+   `client.chat_completion(_get_rt(), messages, **kw)`;
+   `chat_completion_stream(messages, **kw)`;
+   `fetch_models(base_url, api_key)`; `run_agent(messages_json, cfg_json)` →
+   `rt = _get_rt(); rt.cfg = json.loads(cfg_json); return agent.run_agent(rt, json.loads(messages_json))`;
+   `run_agent_stream(messages, cfg)` similarly; `cancel_agent()` (flat) →
+   `client.cancel_agent(_get_rt())`. Re-export `context_usage(rt, history)` /
+   `save_session(rt, ...)` / `compress_now(rt, threshold=None)` module
+   functions (write-through keeps patching them for the tests). Update the
+   facade re-export blocks to the rt signatures.
+6. Verify: `python3 test_tui.py` → `ALL TESTS PASSED ✓`; pyflakes clean on
+   client/agent/sessions/trace; smoke: `python3 -c "import alvaagent as pa; print(pa.run_agent)"`.
+7. Commit:
 
-- [ ] **Step 5: Thread rt through `tui`, `commands`, `repl`** — `set_active_skin(rt)`, `run_agent_tui(rt)`, `cmd_*(rt, ...)`, `send_message(rt, text)`, `repl(rt)`. `main()` becomes:
+```bash
+git add alvaagent/client.py alvaagent/agent.py alvaagent/sessions.py alvaagent/trace.py alvaagent/util.py alvaagent/__init__.py
+git commit -m "refactor: thread Runtime through client/agent/sessions/trace (rt.cancel, rt.on_tool); facade adapters"
+```
+
+---
+
+- [ ] **Step 4: Thread `tui`/`commands`/`repl` + `main()` + their facade adapters**
+
+1. `tui.py`: `set_active_skin(rt)`, `run_agent_tui(rt)`,
+   `render_status_bar(rt, session, elapsed, tools, history)`,
+   `print_user_turn(rt, ...)`; tool open/close operate on `rt.spinner`; delete
+   `_UI` global; skin/color helpers read `rt.skin` (CUR_SKIN/COLOR stay as
+   derived module-level render values for pure helpers OR move to a
+   `_resolve_skin(rt)` helper — keep pure render functions `(skin, ...)`
+   unchanged, only call sites resolve skin from rt). `on_tool` no longer lives
+   in tui; `banner(rt)`, `ask_permission(rt, ...)` reads `rt.skin`.
+2. `commands.py`: every `cmd_*(rt, ...)`; `ask_permission(rt, ...)`;
+   `pick_model(rt, ...)`; helpers take rt where they read state; the
+   `_SLASH_COMMANDS` dict stays.
+3. `repl.py`: `send_message(rt, text) -> str` (reads `rt.history`,
+   `rt.session`, `rt.active_cfg`, writes `rt.last_turn`, returns session);
+   `repl(rt)`; `main()`:
 
 ```python
 def main():
@@ -1469,131 +1641,162 @@ def main():
     repl(rt)
 ```
 
-- [ ] **Step 6: Update `test_tui.py`** — add a builder helper near the top:
-
-```python
-def mkrt():
-    return pa.build_runtime(data_dir=DATA)
-```
-
-Replace the tool-call sites (all of these) from flat calls to `Tools` methods:
-
-- `pa.tool_calculator(x)` → `pa.Tools(mkrt()).calculator({"expression": x})`
-- `pa.tool_run_command(cmd)` → `pa.Tools(mkrt()).run_command({"command": cmd})`
-- `pa.tool_run_python(code)` → `pa.Tools(mkrt()).run_python({"code": code})`
-- `pa.tool_web_fetch(url)` → `pa.Tools(mkrt()).web_fetch({"url": url})`
-- `pa.tool_get_time()` → `pa.Tools(mkrt()).get_time({})`
-- `pa.tool_file_read(p)` → `pa.Tools(mkrt()).file_read({"path": p})`
-- `pa.tool_file_write(p, c)` → `pa.Tools(mkrt()).file_write({"path": p, "content": c})`
-- `pa.tool_file_edit(p, o, n)` → `pa.Tools(mkrt()).file_edit({"path": p, "old": o, "new": n})`
-- `pa.tool_file_list(p)` → `pa.Tools(mkrt()).file_list({"path": p})`
-- `pa.tool_file_search(pat, p, d)` → `pa.Tools(mkrt()).file_search({"pattern": pat, "path": p, "max_depth": d})`
-- `pa.tool_memory_save(k, v)` / `tool_memory_recall(k)` / `tool_memory_search(q)` / `tool_memory_list()` → `pa.Tools(mkrt()).memory_*({...})`
-- `pa.tool_todo_add(t)` / `tool_todo_list()` / `tool_todo_toggle(i)` / `tool_todo_remove(i)` → `pa.Tools(mkrt()).todo_*({...})`
-- `pa.tool_skill_list()` / `tool_skill_read(n)` / `tool_skill_save(n, c, category=...)` / `tool_skill_remove(n)` / `tool_skill_install(s, cat)` / `tool_skill_sync_repo(r, s)` → `pa.Tools(mkrt()).skill_*({...})`
-- `pa.self_test()` → `pa.self_test(mkrt())` (facade exposes the module function taking rt — see Step 7)
-- `pa._permission(...)` → `pa.request_permission(mkrt(), ...)` (check the actual call signatures in the test and adapt the arg order)
-- `pa._store`, `pa._save_store`, `pa._store_get`, `pa._APPROVED_SET`, `pa._TOOLS_MODE`, `pa.ON_PERMISSION`, `pa._cancel_flag` → rewrite those assertions against `mkrt().store`, `pa.store.save(rt)`, `pa.store.get(rt, ...)`, `mkrt().approved`, `mkrt().tool_mode`, `mkrt().on_permission`, `mkrt().cancel`. Read each test before editing and preserve intent.
-- `pa._MAX_CONSEC_TOOL_FAILURES`, `pa._TURN_TIMEOUT`, `pa._PY_MAX_BYTES`, `pa._PY_RUN_TIMEOUT`, `pa.TRACE_PATH` → unchanged (module constants still on the facade).
-- `pa.chat_completion(...)`/`pa.chat_completion_stream(...)`/`pa.fetch_models(...)` → pass `mkrt()` as first arg.
-- `pa.run_agent(...)`/`pa.run_agent_stream(...)`/`pa.cmd_provider(...)`/`pa.cmd_trace(...)`/`pa.send_message(...)` → pass `mkrt()` and drop the old `state`/`history`/`session` args per the new signatures.
-
-- [ ] **Step 7: Update the facade re-exports** — drop the retired globals (`_store`, `_TOOLS_MODE`, `_APPROVED_SET`, `_cancel_flag`, `ON_PERMISSION`, `ON_TOOL`, `_UI`, `CUR_SKIN`, `COLOR`, `_TOOL_IMPL`, `_sync_tool_mode`, `tool_*` flat names). Add `Runtime`, `build_runtime`, `request_permission`, `visible`, `set_mode`, `dispatch_tool`, `Tools`, and the new `store`/`config`/`sessions`/`agent`/`tui`/`commands`/`repl` names the tests use. **Keep** `TRACE_PATH`, `_MAX_CONSEC_TOOL_FAILURES`, `_TURN_TIMEOUT`, `_PY_MAX_BYTES`, `_PY_RUN_TIMEOUT`, `SKINS`, `TOOLS`, `AgentWriter`, `Spinner`, `C`, `DEFAULT_CONTEXT_WINDOW`, `FIRST_RUN_CFG`, `HISTORY_PATH`, `MAX_SESSIONS`, `ACTIVE_SESSION_KEY`, `COLOR`-adjacent display names if tests still reference them (re-check with `grep`).
-
-- [ ] **Step 8: Run the tests**
-
-Run: `python3 test_tui.py` — Expected: `ALL TESTS PASSED ✓`. Iterate on failures: any missed global read or stale signature shows up here. Also run:
+   Delete the `_last_turn` module global (→ `rt.last_turn`). Import
+   `build_runtime`, `set_active_skin`, `on_tool` from the leaves.
+4. `alvaagent/__init__.py` — adapters: `send_message(text, history, state,
+   session)` → `rt = _get_rt(); rt.history = history; rt.cfg = state; rt.session = session; return repl.send_message(rt, text)`;
+   `cmd_provider(state, args)` → `rt = _get_rt(); rt.cfg = state; return commands.cmd_provider(rt, args)`;
+   `cmd_trace(n)` → `commands.cmd_trace(_get_rt(), n)`;
+   `ask_permission(desc)` → `commands.ask_permission(_get_rt(), desc)`;
+   `run_agent_tui(history, cfg)` → build rt, `tui.run_agent_tui(rt)`;
+   `print_user_turn(...)`/`render_agent_panel(...)`/`render_status_bar(...)` →
+   rt-first. Keep the shim + `_Facade` intact.
+5. Verify:
+   - `python3 test_tui.py` → `ALL TESTS PASSED ✓`
+   - Both import orders + app entry: `timeout 20 python3 -c "import alvaagent_tui; import alvaagent as pa; pa.main()" < /dev/null` → banner + prompt + exit 0; `python3 -m alvaagent` starts
+   - pyflakes clean on tui/commands/repl
+   - `grep -rn '^_store\b\|^_TOOLS_MODE\|^_APPROVED_SET\|^ON_PERMISSION\|^ON_TOOL\|^_last_turn\|^_cancel_flag\|^_UI ' alvaagent/*.py` → no hits in leaf modules
+6. Commit:
 
 ```bash
-python3 -c "import alvaagent as pa; print(pa.build_runtime(data_dir='/tmp/alva_rt_check'))"
-```
-
-(creates nothing but loads config; must not raise).
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add alvaagent/context.py alvaagent/*.py test_tui.py
-git commit -m "refactor: introduce Runtime context object; retire module globals (store, tool mode, approvals, cancel, UI hooks, skin)"
+git add alvaagent/tui.py alvaagent/commands.py alvaagent/repl.py alvaagent/__init__.py
+git commit -m "refactor: thread Runtime through tui/commands/repl; main() builds runtime and threads it; send_message(rt, text)"
 ```
 
 ---
 
-## Phase C — Hardening
+- [ ] **Step 5: Phase A full verification + final commit**
 
-### Task 15: New architecture tests + facade coverage
+1. Suite ×2: `python3 test_tui.py` twice → `ALL TESTS PASSED ✓` both runs.
+2. Smoke probes:
+
+```bash
+python3 -c "import alvaagent as pa; rt=pa.build_runtime(); print(pa.tool_calculator('2+3'))"
+timeout 20 python3 -c "import alvaagent_tui; import alvaagent as pa; pa.main()" < /dev/null   # banner + prompt + bye, exit 0
+python3 -m alvaagent   # starts (kill after banner)
+```
+
+3. Write-through still reaches rt-backed functions:
+
+```bash
+python3 -c "
+import alvaagent as pa, sys
+_old = pa.save_session
+pa.save_session = lambda *a, **k: None
+assert sys.modules['alvaagent.sessions'].save_session is pa.save_session
+pa.save_session = _old
+print('write-through ok')"
+```
+
+4. pyflakes all modules: only sanctioned re-export F401 noise in
+   `alvaagent/__init__.py`; 0 findings elsewhere.
+5. `git status` clean except intended; commit any stragglers (none expected).
+6. Record the Phase A summary in `.superpowers/sdd/.../progress.md`.
+
+---
+
+## Phase C — Runtime migration (suite rewrite + retirement)
+
+### Task 15: Migrate `test_tui.py` to the rt API; retire the facade bridge + proxy
+
+**Goal:** the package becomes a clean rt API: the suite is pytest-style with
+per-test isolation, and the facade bridge (default rt, accessors, adapters,
+`_Facade` proxy, write-through) is deleted.
 
 **Files:**
-- Modify: `test_tui.py`
+- Modify: `test_tui.py` (full conversion to pytest-style functions + rt API)
+- Modify: `alvaagent/__init__.py` (delete bridge; plain module re-exports)
+- Modify: `alvaagent_tui.py` (unchanged shim; verify)
+- Test: `python3 test_tui.py` (bundled zero-dep runner) — new pytest-style suite green; pytest-collection-compatible
 
-- [ ] **Step 1: Add a no-cycle import test**
+**Interfaces (spec §4):** `mkrt(data_dir=None)` helper; per-test fresh rt/DATA;
+mock server session fixture; architecture checks.
 
-```python
-def check_no_cycles():
-    import alvaagent.context
-    import alvaagent.util
-    import alvaagent.config
-    import alvaagent.trace
-    import alvaagent.store
-    import alvaagent.permissions
-    import alvaagent.skills
-    import alvaagent.tools
-    import alvaagent.client
-    import alvaagent.agent
-    import alvaagent.sessions
-    import alvaagent.tui
-    import alvaagent.commands
-    import alvaagent.repl
-    return True
-assert_ok(check_no_cycles(), "all package modules import cleanly (no import cycles)")
-```
+- [ ] **Step 1: Add `mkrt` + session fixture + convert the harness**
 
-- [ ] **Step 2: Add a facade-surface test**
+Restructure `test_tui.py`:
+- Keep the top (PORT, BASE, MOCK, mock-server management) but move DATA setup
+  into per-test code: `def mkrt(data_dir=None): return pa.build_runtime(data_dir=data_dir)`.
+- Convert each inline check block into `def test_<name>():` functions. Stateful
+  blocks (permission cache, store, todo/memory) build their own rt and DATA.
+- Keep `assert_ok` semantics; add a summary.
+- Add the bundled runner at the bottom:
 
 ```python
-missing = []
-for _name in ["Runtime", "build_runtime", "Tools", "dispatch_tool", "TOOLS",
-              "SKINS", "AgentWriter", "Spinner", "chat_completion",
-              "chat_completion_stream", "run_agent", "run_agent_stream",
-              "classify_command", "classify_python", "load_session", "main"]:
-    if not hasattr(pa, _name):
-        missing.append(_name)
-assert_ok(not missing, "facade exposes the architecture API (missing: %s)" % (", ".join(missing) or "none"))
+if __name__ == "__main__":
+    import traceback as _tb
+    _names = [n for n in sorted(dir()) if n.startswith("test_") and callable(globals()[n])]
+    _fails = 0
+    for _n in _names:
+        _nf_before = failures
+        try:
+            globals()[_n]()
+        except Exception as _e:
+            _tb.print_exc()
+            failures += 1
+        _fails += failures - _nf_before
+    print("\n%d tests, %d failures" % (len(_names), _fails))
+    sys.exit(1 if _fails else 0)
 ```
 
-(Locate this snippet near the other module-level checks in `test_tui.py`; `pa` and `assert_ok` are already defined above it.)
+  Output must still end with `ALL TESTS PASSED ✓` on success.
 
-- [ ] **Step 3: Add a dispatch-through-Tools test**
+- [ ] **Step 2: Migrate every flat call site to the rt API**
 
-```python
-def check_tools_dispatch():
-    rt = mkrt()
-    r = pa.dispatch_tool(rt, "calculator", {"expression": "2+3*4"})
-    return r.get("result") == 14
-assert_ok(check_tools_dispatch(), "dispatch_tool routes through Tools class")
-```
+Rewrite each test to the rt signatures, preserving assertions 1:1:
+- `pa.tool_calculator(x)` → `pa.Tools(rt).calculator({"expression": x})` (and
+  every other tool, mapping args exactly as in the old plan's Step 6 list)
+- `pa.send_message(text, history, state, session)` → `pa.send_message(rt, text)`
+  (rt built with the needed history/session/state)
+- `pa.run_agent(h_json, cfg_json)` → `pa.run_agent(rt, json.loads(h_json))`
+- `pa.chat_completion(messages, **kw)` → `pa.chat_completion(rt, messages, **kw)`
+- `pa.cmd_provider(state, args)` → `pa.cmd_provider(rt, args)`;
+  `pa.cmd_trace("3")` → `pa.cmd_trace(rt, "3")`
+- `pa._permission(desc)` → `pa.request_permission(rt, desc)`;
+  `pa._APPROVED_SET` → `rt.approved`; `pa._store` → `rt.store`;
+  `pa._save_store()` → `pa.store_save(rt)` (or `store.save(rt)`)
+- DI seams: `pa._sleep_retry = …` → `client._sleep_retry = …`;
+  `pa._raw_fetch = …` → `util._raw_fetch = …` (qualified-name patches)
+- `pa.ON_PERMISSION = …` → `rt.on_permission = …`
+- `pa.active_cfg = …` → write into `rt.cfg`'s active profile
 
-- [ ] **Step 4: Add an entry-point shim test**
+- [ ] **Step 3: Delete the bridge**
 
-```python
-def check_shim():
-    import importlib
-    m = importlib.import_module("alvaagent_tui")
-    return callable(getattr(m, "main", None))
-assert_ok(check_shim(), "alvaagent_tui.py shim exposes main()")
-```
+`alvaagent/__init__.py`: remove `_get_rt()`, the `_Facade` class, all
+accessors/adapters, the write-through, the `_Facade._tui` read-forward, and
+the `__class__` swap. Make `alvaagent/__init__.py` a plain module re-exporting
+`Runtime`, `build_runtime`, `Tools`, `dispatch_tool`, `visible`, `set_mode`,
+and the rt-based module functions (config/store/permissions/skills/tools/
+client/agent/sessions/trace/tui/commands/repl surfaces). Keep the shim
+(`alvaagent_tui.py`) re-exporting the repl surface for `python3
+alvaagent_tui.py`. Verify both import orders and app entry still work.
 
-- [ ] **Step 5: Run the tests and commit**
+- [ ] **Step 4: Add the architecture tests**
 
-Run: `python3 test_tui.py` — Expected: `ALL TESTS PASSED ✓`
+- No-import-cycles: import every `alvaagent.*` module in sequence; must not raise.
+- Facade surface: `Runtime`, `build_runtime`, `Tools`, `dispatch_tool`,
+  `TOOLS`, `SKINS`, `AgentWriter`, `Spinner`, `chat_completion`,
+  `chat_completion_stream`, `run_agent`, `run_agent_stream`,
+  `classify_command`, `classify_python`, `load_session`, `main` all exist.
+- No retired globals: assert none of `_store`, `_TOOLS_MODE`, `_APPROVED_SET`,
+  `_cancel_flag`, `ON_PERMISSION`, `ON_TOOL`, `_last_turn`, `_UI` exist as
+  leaf-module module-globals (iterate `alvaagent.*` module dicts).
+
+- [ ] **Step 5: Verify + commit**
+
+- `python3 test_tui.py` → green, ends `ALL TESTS PASSED ✓`
+- `python3 -m pyflakes alvaagent/*.py` → only sanctioned facade F401 noise
+- both import orders + `python3 alvaagent_tui.py` start
+- `git grep -n '_TOOLS_MODE\|^_store\|_APPROVED_SET' alvaagent/` → only
+  docs/comments
+- Commit:
 
 ```bash
-git add test_tui.py
-git commit -m "test: add package-architecture checks (no cycles, facade surface, Tools dispatch, shim)"
+git add test_tui.py alvaagent/__init__.py
+git commit -m "refactor: retire facade bridge and proxy; test suite uses explicit Runtime (pytest-style)"
 ```
 
 ---
-
 ### Task 16: Documentation
 
 **Files:**
