@@ -20,3 +20,6 @@ package-lock.json
 # Local opencode session config (not part of the project)
 .opencode/
 opencode.json
+
+# SDD planning workspace (ledger, task briefs, review packages)
+.superpowers/
