@@ -16,9 +16,9 @@ from alvaagent.util import _fmt_k
 
 # Rich backs the Hermes-style panels (pure-Python, pip-installs on Termux).
 # The Hermes agent TUI renders with Rich `Panel(box=HORIZONTALS)`; we mirror
-# that exactly so alvaagent reads as Hermes. `pip install --break-system-packages
-# rich` is run by alva_fix.sh; if it's somehow absent we fall back to a tiny
-# ANSI shim so the TUI still launches.
+# that exactly so alvaagent reads as Hermes. `pip install rich` makes it
+# available; if it's somehow absent we fall back to a tiny ANSI shim so the
+# TUI still launches.
 try:
     from rich.console import Console
     from rich.panel import Panel
