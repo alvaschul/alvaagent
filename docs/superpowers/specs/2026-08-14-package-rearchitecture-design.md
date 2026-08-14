@@ -1,7 +1,7 @@
 # alvaagent: Single-File → Package Re-architecture
 
 Date: 2026-08-14
-Status: Approved design (spec for implementation)
+Status: Implemented
 
 ## Problem
 

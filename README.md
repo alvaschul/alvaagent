@@ -5,13 +5,15 @@ chat agent with real tool use (calculator, web_fetch, shell, file ops, skills,
 memory, todos) entirely on your phone. **Zero pip installs** — Python stdlib only.
 
 ## What it is
-A single-file Python TUI that talks to any OpenAI-compatible endpoint and can
+A stdlib-only Python **package** (`alvaagent/`) behind a one-file launcher shim
+(`alvaagent_tui.py`) that talks to any OpenAI-compatible endpoint and can
 actually *do* things on your device: run shell commands, read/write/edit files,
 manage a to-do list, remember facts, and save reusable procedures as "skills".
 Built for Termux, runs offline-friendly, and survives flaky mobile connections.
 
 ## Features
-- **Python TUI** (`alvaagent_tui.py`) — stdlib only, no dependencies to install.
+- **Python TUI** (`alvaagent_tui.py` shim → `alvaagent/` package) — stdlib only,
+  no dependencies to install.
 - **30 tools** (curated for the model): calculator, sandboxed run_python,
   web_fetch, get_time, memory save/recall/search/list, todos, shell, file
   read/write/edit/list/search, skill save/read/list/remove/install/sync,
@@ -23,7 +25,7 @@ Built for Termux, runs offline-friendly, and survives flaky mobile connections.
   chat ("install this repo") or with `/skills install <url>` /
   `/skills sync <repo>`.
 - **Tiered tool selection**: by default the model only sees a curated 15-tool
-  CORE set (computation, memory, todos, shell, files) — not all 28 at once, so
+  CORE set (computation, memory, todos, shell, files) — not all 30 at once, so
   it mis-picks tools less and answers faster. Advanced meta-tools (skills,
   self-improvement, self_test, reflect) stay one keystroke away:
   `/tools full` advertises everything, `/tools core` reverts, and any advanced
@@ -61,9 +63,11 @@ ln -sf "$PWD/alvaagent" /data/data/com.termux/files/usr/bin/alvaagent
 alvaagent            # if you did step 3
 # or:
 python3 alvaagent_tui.py
+# or:
+python3 -m alvaagent
 ```
 
-That's it — no `pip install`, no virtualenv. The script is self-contained.
+That's it — no `pip install`, no virtualenv. The package is self-contained.
 
 ## First-run setup
 On first launch you'll be at the `⚡` prompt. Configure your endpoint:
@@ -136,7 +140,16 @@ tests for the command classifier and atomic store writes).
   so a kill mid-write can't corrupt your data.
 
 ## Files
-- `alvaagent_tui.py` — the harness (Python stdlib only)
+- `alvaagent/` — the app (Python stdlib only), split into focused modules:
+  - `context.py` — the `Runtime` context object (data dir, config, store,
+    approvals, cancel flag, UI hooks) + `build_runtime()`
+  - `config.py` / `store.py` / `permissions.py` / `sessions.py` / `trace.py`
+    — persistence, provider profiles, and the security classifier
+  - `client.py` / `agent.py` — OpenAI-compatible client + agent loop
+  - `skills.py` / `tools.py` — skill management and the 30 tool implementations
+  - `tui.py` / `commands.py` / `repl.py` — rendering, slash commands, REPL
+  - `util.py` — shared helpers
+- `alvaagent_tui.py` — one-line launcher shim (historical entry point)
 - `mock_llm_server.py` — offline OpenAI-compatible mock for the test suite
 - `test_tui.py` — headless test suite (run it to verify your build)
 - `start.sh` — `bash start.sh tui` launches the terminal client
@@ -146,7 +159,7 @@ tests for the command classifier and atomic store writes).
 ## Updating
 ```bash
 git pull        # pull the latest from this repo
-alvaagent       # run — the symlink always points at the updated script
+alvaagent       # run — the symlink always points at the updated code
 ```
 Your local `.alvaagent/` data is never touched by a pull. Because the launcher
 is a symlink, you never re-run the `ln` command after a pull.
