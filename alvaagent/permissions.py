@@ -1,16 +1,15 @@
 import os
 
 from alvaagent.config import DATA_DIR
+from alvaagent.context import default_rt
 
 # ---------------- autonomy: permissions ----------------
 # The agent can run shell commands, edit files and manage skills. Everything
-# outside the project folder (or risky) goes through ON_PERMISSION, which the
-# REPL wires to an interactive y/N prompt. Headless (no hook) defaults to DENY,
-# unless ALVA_AUTO_APPROVE=1 is set (attended/automated runs).
+# outside the project folder (or risky) goes through rt.on_permission, which
+# the REPL wires to an interactive y/N prompt. Headless (no hook) defaults to
+# DENY, unless ALVA_AUTO_APPROVE=1 is set (attended/automated runs).
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-ON_PERMISSION = None  # hook: ON_PERMISSION(description) -> bool
 
 # commands that are safe to run without asking
 # NOTE: `env` is intentionally NOT here - `env` executes its arguments
@@ -130,22 +129,25 @@ def classify_file_action(path, kind):
     return "allow" if _in_project(path) else "ask"
 
 
-# Descriptions approved this session run again WITHOUT prompting (exact-match,
-# in-memory only - nothing survives a restart). This is the anti-nagging layer:
-# approve `python3 test_tui.py` once and the agent can rerun it freely until
-# the process exits. Reset any time with _APPROVED_SET.clear().
-_APPROVED_SET = set()
+def request_permission(rt, desc):
+    """Resolve a permission request: session cache -> env override -> hook.
+
+    The approved-set and the hook live on the Runtime (`rt.approved` /
+    `rt.on_permission`) instead of module globals. Descriptions approved this
+    session run again WITHOUT prompting (exact-match, in-memory only - nothing
+    survives a restart). Reset any time with rt.approved.clear()."""
+    if os.environ.get("ALVA_AUTO_APPROVE") == "1":
+        return True
+    if desc in rt.approved:
+        return True
+    if rt.on_permission is not None:
+        ok = rt.on_permission(desc)
+        if ok:
+            rt.approved.add(desc)  # remember for the rest of this session
+        return ok
+    return False  # headless default: deny
 
 
 def _permission(desc):
-    """Resolve a permission request: session cache -> env override -> hook."""
-    if os.environ.get("ALVA_AUTO_APPROVE") == "1":
-        return True
-    if desc in _APPROVED_SET:
-        return True
-    if ON_PERMISSION is not None:
-        ok = ON_PERMISSION(desc)
-        if ok:
-            _APPROVED_SET.add(desc)  # remember for the rest of this session
-        return ok
-    return False  # headless default: deny
+    """Flat Phase-A bridge: route the legacy name through the default rt."""
+    return request_permission(default_rt(), desc)

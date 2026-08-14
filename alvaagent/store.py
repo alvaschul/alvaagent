@@ -5,10 +5,14 @@ import json
 import os
 
 from alvaagent.config import STORE_PATH, CONFIG_PATH, DATA_DIR, _LEGACY_DIRS
+from alvaagent.context import default_rt
 from alvaagent.util import _env
 
 # ---------------- persistence (JSON file instead of localStorage) ----------------
-_store = {}
+# No module-global `_store` anymore: the store lives on the Runtime (`rt.store`).
+# The flat `_store` name at the bottom of this module is a LIVE VIEW of
+# `default_rt().store` (same dict object) so unthreaded consumers
+# (tools/commands) keep working until they thread rt in later steps.
 
 
 def _migrate_legacy_dir():
@@ -32,23 +36,28 @@ def _migrate_legacy_dir():
             break
 
 
-def _load_store():
-    global _store
+def load(rt):
+    """Load store.json into rt.store (mutates in place so the flat `_store`
+    live view and the facade's `pa._store` property stay in sync)."""
     _migrate_legacy_dir()
     try:
         with open(STORE_PATH) as f:
-            _store = json.load(f)
+            data = json.load(f)
     except Exception:
-        _store = {}
+        data = {}
+    rt.store.clear()
+    rt.store.update(data)
     # rename keys saved under the old brand, once, in place
-    if any(k.startswith("pocket_agent.") for k in _store):
-        _store = {("alvaagent." + k[len("pocket_agent."):]) if k.startswith("pocket_agent.") else k: v
-                  for k, v in _store.items()}
-        _save_store()
+    if any(k.startswith("pocket_agent.") for k in rt.store):
+        renamed = {("alvaagent." + k[len("pocket_agent."):]) if k.startswith("pocket_agent.") else k: v
+                   for k, v in rt.store.items()}
+        rt.store.clear()
+        rt.store.update(renamed)
+        save(rt)
 
 
-def _save_store():
-    """Atomically persist the store: write to a temp file, then rename into
+def save(rt):
+    """Atomically persist rt.store: write to a temp file, then rename into
     place. A kill/crash mid-write can never leave a truncated store.json."""
     try:
         import tempfile
@@ -56,7 +65,7 @@ def _save_store():
         fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".store.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(_store, f, ensure_ascii=False)
+                json.dump(rt.store, f, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, STORE_PATH)  # atomic on POSIX
@@ -70,16 +79,35 @@ def _save_store():
         pass
 
 
+def get(rt, key, default=None):
+    return rt.store.get(key, default)
+
+
+def set(rt, key, value):
+    rt.store[key] = value
+    save(rt)
+
+
+# ---- flat Phase-A bridges (Ruling 14/15): route through the default rt ----
+def _load_store():
+    return load(default_rt())
+
+
+def _save_store():
+    save(default_rt())
+
+
 def _store_get(key, default=None):
-    return _store.get(key, default)
+    return get(default_rt(), key, default)
 
 
 def _store_set(key, value):
-    _store[key] = value
-    _save_store()
+    set(default_rt(), key, value)
 
 
-_load_store()  # load persisted todos/memory at import time
+# Live view of the default runtime's store (same dict object — mutations via
+# rt.store, pa._store, or the flat bridges all land on it).
+_store = default_rt().store
 
 TODO_KEY = "alvaagent.todos"
 MEM_PREFIX = "alvaagent.mem."

@@ -31,6 +31,10 @@ from alvaagent.util import (  # noqa: F401
     mask_key, _parse_frontmatter, _frontmatter_load, _frontmatter_dump,
     _mini_yaml, _mini_scalar, _finish_block,
 )
+from alvaagent.context import (  # noqa: F401
+    Runtime, build_runtime as _build_runtime, default_rt as _get_rt,
+)
+build_runtime = _build_runtime
 from alvaagent.config import (  # noqa: F401
     data_dir, DATA_DIR, _LEGACY_DIRS, CONFIG_PATH, STORE_PATH, HISTORY_PATH,
     TRACE_PATH, PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN,
@@ -42,14 +46,14 @@ from alvaagent.trace import (  # noqa: F401
     _trace, _read_trace, _trace_count, _TRACE_MAX_LINES, _TRACE_MAX_BYTES,
 )
 from alvaagent.store import (  # noqa: F401
-    _store, _migrate_legacy_dir, _load_store, _save_store,
-    _store_get, _store_set, TODO_KEY, MEM_PREFIX, FEEDBACK_KEY,
+    _migrate_legacy_dir, load as store_load, save as store_save,
+    get as store_get, set as store_set, TODO_KEY, MEM_PREFIX, FEEDBACK_KEY,
     IMPROVEMENT_KEY, HISTORY_KEY, SESSION_KEY, ACTIVE_SESSION_KEY, MAX_SESSIONS,
 )
 from alvaagent.permissions import (  # noqa: F401
     _READONLY_PREFIXES, _RISKY_TOKENS, _RISKY_OPERATORS, _tokenize_shell,
     classify_command, PROJECT_DIR, _in_project, classify_file_action,
-    _APPROVED_SET, _permission, ON_PERMISSION,
+    request_permission,
 )
 from alvaagent.skills import (  # noqa: F401
     SKILLS_DIR,
@@ -121,8 +125,47 @@ from alvaagent.commands import (  # noqa: F401
 import types as _types
 
 
+# Flat adapters for the retired module globals: they read/write the default
+# runtime's state so `pa._permission`, `pa._store_get`, `pa._store_set`,
+# `pa._save_store`, ... keep working exactly like the old globals.
+def _permission(desc):
+    return request_permission(_get_rt(), desc)
+
+
+def _store_get(key, default=None):
+    return store_get(_get_rt(), key, default)
+
+
+def _store_set(key, value):
+    store_set(_get_rt(), key, value)
+
+
+def _save_store():
+    store_save(_get_rt())
+
+
 class _Facade(_types.ModuleType):
     _tui = None
+
+    # Bridge properties for the retired module globals (`pa._store`,
+    # `pa._APPROVED_SET`, `pa.ON_PERMISSION`): they resolve through the
+    # default runtime. Being data descriptors on the class, BOTH reads
+    # (`__getattribute__`) and writes (`__setattr__`) honor them.
+    @property
+    def _store(self):
+        return _get_rt().store
+
+    @property
+    def _APPROVED_SET(self):
+        return _get_rt().approved
+
+    @property
+    def ON_PERMISSION(self):
+        return _get_rt().on_permission
+
+    @ON_PERMISSION.setter
+    def ON_PERMISSION(self, value):
+        _get_rt().on_permission = value
 
     def __getattribute__(self, name):
         if name.startswith("__") and name.endswith("__"):

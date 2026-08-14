@@ -3,6 +3,7 @@
 import json
 import os
 
+from alvaagent.context import Runtime
 from alvaagent.util import _env
 
 
@@ -138,14 +139,18 @@ def load_state():
 
 
 def save_state(state):
-    """Atomically persist config: temp file + fsync + rename (see _save_store)."""
+    """Atomically persist config: temp file + fsync + rename (see store.save).
+
+    Accepts a Runtime (persists rt.cfg) or a plain state dict. Strict rt-first
+    lands in Task 15 once every consumer threads rt."""
+    cfg = state.cfg if isinstance(state, Runtime) else state
     try:
         import tempfile
         os.makedirs(DATA_DIR, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".config.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, CONFIG_PATH)
@@ -160,6 +165,10 @@ def save_state(state):
 
 
 def active_cfg(state):
+    """Active profile: rt-first (rt.active_cfg) or a plain state dict (Phase A
+    bridge for the still-flat tui/commands/repl callers)."""
+    if isinstance(state, Runtime):
+        return state.active_cfg
     return state["profiles"][state["active"]]
 
 
