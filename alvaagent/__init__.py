@@ -97,6 +97,16 @@ from alvaagent.agent import (  # noqa: F401
     _strip_xml, run_agent_stream,
 )
 
+from alvaagent.tui import (  # noqa: F401
+    SKINS, C, set_active_skin, col, p_info, p_err, p_ok, p_warn, _term_width,
+    _hrgb, _fgh, _rsth, _tool_line, print_user_turn, render_agent_panel,
+    _md_attr_sgr, _has_ansi, _md_line, _md_prefix, style_inline, AgentWriter,
+    fmt_args, tool_summary, Spinner, tool_open, tool_close, on_tool,
+    run_agent_tui, _ANSI_RE, _MD_STYLE, _UI, COLOR, CUR_SKIN, _CON,
+    Console, Panel, HORIZONTALS, banner, render_status_bar,
+    ALVA_WORDMARK, _markup_safe, _banner_tools_lines, _banner_skills_lines,
+)
+
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
 # _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
 # As the mechanical split moves readers into alvaagent.* submodules, a write to
