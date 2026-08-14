@@ -971,29 +971,36 @@ git commit -m "refactor: extract agent.py (turn loop, runaway guards, XML tool-c
 - Modify: `alvaagent_tui.py`, `alvaagent/__init__.py`
 
 **Interfaces:**
-- Consumes: `config` (`SKIN_NAMES`, `DEFAULT_SKIN`, `_skin_of`, `data_dir`), `agent` (`run_agent_stream`), `trace` (`_trace`? check bodies), `util` (`_fmt_k`, `now_iso`? check), `sessions` (`context_usage`? check `render_status_bar`).
-- Produces: `SKINS`, `C`, `DEFAULT_SKIN` usage, `set_active_skin(state)`, `col`, `p_info`, `p_err`, `p_ok`, `p_warn`, `_term_width`, `_hrgb`, `_fgh`, `_rsth`, `_tool_line`, `print_user_turn`, `render_agent_panel`, `_md_attr_sgr`, `_has_ansi`, `_md_line`, `_md_prefix`, `style_inline`, `AgentWriter`, `fmt_args`, `tool_summary`, `Spinner`, `tool_open`, `tool_close`, `on_tool`, `run_agent_tui(history, cfg)`, `_ANSI_RE`, `_MD_STYLE`, `_UI`, `_CON`/`Panel`/`Console`/`HORIZONTALS`, `COLOR`/`CUR_SKIN` globals, `banner(state)`, `render_status_bar(...)`.
+- Consumes: `config` (`ALVA_VERSION`, `DATA_DIR`, `DEFAULT_SKIN`, `active_cfg`), `agent` (`run_agent_stream`, `_strip_xml_blocks`), `sessions` (`context_usage`, `context_window_for`), `tools` (`TOOLS`, `TOOLSETS`, `active_tools`, `_tools._TOOLS_MODE`), `util` (`_fmt_k`).
+- Produces: `SKINS`, `C`, `CUR_SKIN`, `set_active_skin(state)`, `col`, `p_info`, `p_err`, `p_ok`, `p_warn`, `_term_width`, `_hrgb`, `_fgh`, `_rsth`, `_tool_line`, `print_user_turn`, `render_agent_panel`, `_md_attr_sgr`, `_has_ansi`, `_md_line`, `_md_prefix`, `style_inline`, `AgentWriter`, `fmt_args`, `tool_summary`, `Spinner`, `tool_open`, `tool_close`, `on_tool`, `run_agent_tui(history, cfg)`, `_ANSI_RE`, `_MD_STYLE`, `_UI`, `_CON`/`Panel`/`Console`/`HORIZONTALS` + `_Shim*` (optional-Rich block), `COLOR`/`CUR_SKIN` globals, `ALVA_WORDMARK`, `_markup_safe`, `_banner_tools_lines`, `_banner_skills_lines`, `banner(state)`, `render_status_bar(...)`.
+
+> **Ruling 11 (amended):** The verified move ranges are four regions: optional-Rich block (old tui 71-102), `# Terminal UI` comment + `class C` + `COLOR` (228-244), the `# ---------------- skins` marker through the end of `run_agent_tui` (247-909), and `ALVA_WORDMARK` through the end of `render_status_bar` (1847-2015). `compress_now` (188-227) STAYS in the main file (Ruling 9); `ask`/`parse_key`/`ask_key`/`ask_permission` (916-968) STAY for Task 12; `send_message`/`repl`/`setup_completion` STAY. Because `set_active_skin` REBINDS `CUR_SKIN` inside tui.py, the main file's two `CUR_SKIN` reads (`ask_permission`, repl prompt) must become `_tui.CUR_SKIN` (`import alvaagent.tui as _tui`) — the same qualified-read idiom as Ruling 7's `_tools._TOOLS_MODE`. Verified header is smaller than originally planned: no `SKIN_NAMES`/`_skin_of`/`data_dir`; adds `datetime`, `shutil`, `TOOLSETS`, `import alvaagent.tools as _tools`.
 
 - [ ] **Step 1: Create `alvaagent/tui.py`**
 
-Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- skins ...` and `# ---------------- slash commands ...` (roughly lines 3094-3855), PLUS `banner` and `render_status_bar` (lines ~4811-4906, currently in the REPL section) and the rich fallback block (`_CON`, `_ShimPanel`, etc., lines ~84-110).
+Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- skins ...` and the end of `run_agent_tui` (current lines 247-909), PLUS `ALVA_WORDMARK` → `render_status_bar` (lines 1847-2015, currently in the REPL section), PLUS `class C`/`COLOR` (lines 228-244), PLUS the optional-Rich fallback block (lines 71-102).
 
 Header imports:
 
 ```python
+import datetime
+import json
 import os
+import re
+import shutil
 import sys
 import threading
 import time
 
-from alvaagent.config import SKIN_NAMES, DEFAULT_SKIN, _skin_of, data_dir
-from alvaagent.agent import run_agent_stream
+from alvaagent.config import ALVA_VERSION, DATA_DIR, DEFAULT_SKIN, active_cfg
+from alvaagent.agent import _strip_xml_blocks, run_agent_stream
+from alvaagent.sessions import context_usage, context_window_for
+from alvaagent.tools import TOOLS, TOOLSETS, active_tools
 from alvaagent.util import _fmt_k
+import alvaagent.tools as _tools
 ```
 
-Carry over the optional rich import exactly as it exists today (the `try: from rich... except:` fallback with `_ShimConsole`/`_ShimPanel`/`_ShimBox`). The `CUR_SKIN` / `COLOR` globals and `_UI = {"spinner": None}` stay module-level here (Runtime phase → `rt.skin` / `rt.spinner`). `set_active_skin(state)` stays as-is (reads `_skin_of(state)`, sets the module globals).
-
-Check `run_agent_tui`'s body: it uses `AgentWriter`, `Spinner`, `run_agent_stream`, `tool_summary` — import whatever the moved bodies reference from the modules above (if `_trace` is needed, import from `alvaagent.trace`, never from `agent`). `render_status_bar` uses `context_usage`/`_fmt_k` — import `context_usage` from sessions if present.
+Carry over the optional rich import exactly as it exists today (the `try: from rich... except:` fallback with `_ShimConsole`/`_ShimPanel`/`_ShimBox`). The `CUR_SKIN` / `COLOR` globals and `_UI = {"spinner": None}` stay module-level here (Runtime phase → `rt.skin` / `rt.spinner`). `set_active_skin(state)` stays as-is (reads `state["skin"]`, rebinds the module global — hence Ruling 11's qualified reads). `AgentWriter` needs `_strip_xml_blocks` from agent; `banner` needs `_tools._TOOLS_MODE` and the lazy `from rich.table import Table` it already wraps in try/except.
 
 - [ ] **Step 2: Patch `alvaagent_tui.py`**
 
@@ -1009,9 +1016,10 @@ from alvaagent.tui import (  # noqa: E402,F401
     run_agent_tui, _ANSI_RE, _MD_STYLE, _UI, COLOR, CUR_SKIN, _CON,
     Console, Panel, HORIZONTALS, banner, render_status_bar,
 )
+import alvaagent.tui as _tui  # noqa: E402  (Ruling 11: qualified CUR_SKIN reads)
 ```
 
-**Important:** `main()`'s hook assignment (forwarded to `_agent.ON_TOOL` in Task 10) referenced the local `on_tool` — after this move, `on_tool` comes from the import above, so the assignment still works. Leave it until the Runtime phase.
+**Ruling 11 (hook staleness):** `set_active_skin` rebinds `CUR_SKIN` inside tui.py, so the main file's two `CUR_SKIN` reads (`ask_permission` and the repl prompt) become `_tui.CUR_SKIN`. `main()`'s hook assignment (`_agent.ON_TOOL = on_tool`) is unchanged — `on_tool` now resolves via the import above.
 
 - [ ] **Step 3: Re-export from the facade**
 
