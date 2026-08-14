@@ -831,31 +831,34 @@ git commit -m "refactor: extract client.py (chat completion, streaming, retries,
 - Modify: `alvaagent_tui.py`, `alvaagent/__init__.py`
 
 **Interfaces:**
-- Consumes: `config` (`active_cfg`, `MODEL_CONTEXT`, `DEFAULT_CONTEXT_WINDOW`, `data_dir`), `store` (`_store_get`, `_store_set`, `ACTIVE_SESSION_KEY`, `MAX_SESSIONS`, `SESSION_KEY`), `client` (`chat_completion`), `util` (`now_iso`, `_fmt_k`).
-- Produces: `context_window_for(model)`, `estimate_tokens(text)`, `estimate_message_tokens(m)`, `context_usage(history, cfg)`, `sessions_map()`, `load_session(name)`, `save_session(name, history)`, `delete_session(name)`, `_find_session(name)`, `_rename_session_in_store(old, new)`, `auto_title(text)`, `_unique_session_name(base)`, `summarize_with_llm(history, cfg)`, `_fallback_summary(history)`, `compress_history(history, cfg)`, `compress_now(history, cfg, threshold=None)`, `trim_history(history)`.
+- Consumes: `config` (`MODEL_CONTEXT`, `DEFAULT_CONTEXT_WINDOW`), `store` (`_store_get`, `_store_set`, `ACTIVE_SESSION_KEY`, `MAX_SESSIONS`, `SESSION_KEY`), `client` (`chat_completion`), `util` (`now_iso`).
+- Produces: `context_window_for(model)`, `estimate_tokens(text)`, `estimate_message_tokens(m)`, `context_usage(history, cfg)`, `sessions_map()`, `load_session(name)`, `save_session(name, history)`, `delete_session(name)`, `_find_session(name)`, `_rename_session_in_store(old, new)`, `auto_title(text)`, `_unique_session_name(base)`, `summarize_with_llm(history, cfg)`, `_fallback_summary(history)`, `compress_history(history, cfg)`, `trim_history(history)`, `new_session_name()`.
+
+> **Ruling 9 (amended):** `compress_now` does NOT move at Task 9 — it is the only body in the sessions region that prints via the UI helpers `p_info`/`p_ok` (which move with `tui.py` at Task 11), so it stays in `alvaagent_tui.py` (it consumes `context_usage`/`compress_history`/`active_cfg`, imported back into tui). Revisit its final home at Task 14 (likely a print hook in the Runtime phase). Task 9's move range ends at `compress_history` (tui 708); the `Terminal UI` banner, `class C`, and `COLOR` (tui ~748-765) belong to the UI subsystem and do not move.
 
 - [ ] **Step 1: Create `alvaagent/sessions.py`**
 
 Move verbatim from `alvaagent_tui.py`:
-- the context/sessions block between `# ---------------- context tracking & sessions ...` and `# ---------------- skins ...` (roughly lines 2851-3110),
-- `trim_history` (line ~3776, currently in the display section — a history-management helper),
-- `new_session_name` (line ~4690, currently in the REPL section).
+- the context/sessions/auto-compression block from `# ---------------- context tracking & sessions ...` through the end of `compress_history` (current tui lines 517-708; `compress_now` at 709-745 stays behind per Ruling 9),
+- `trim_history` (current line 1433-1447, in the display section),
+- `new_session_name` (current line 2343-2345, in the REPL section).
 
 Header imports:
 
 ```python
-import json
 import re
+import secrets
 
-from alvaagent.config import active_cfg, MODEL_CONTEXT, DEFAULT_CONTEXT_WINDOW
-from alvaagent.store import (
-    _store_get, _store_set, ACTIVE_SESSION_KEY, MAX_SESSIONS, SESSION_KEY,
-)
 from alvaagent.client import chat_completion
-from alvaagent.util import now_iso, _fmt_k
+from alvaagent.config import DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT
+from alvaagent.store import (
+    ACTIVE_SESSION_KEY, MAX_SESSIONS, SESSION_KEY,
+    _store_get, _store_set,
+)
+from alvaagent.util import now_iso
 ```
 
-Check the moved bodies for any `HISTORY_KEY` / `SESSION_KEY` usage — `SESSION_KEY` is the sessions map key; keep imports consistent with store.py's constants. `summarize_with_llm` calls `chat_completion(state, ...)` — pass the `cfg`/`state` through as the original did (verbatim signatures).
+Note: `summarize_with_llm` calls `chat_completion(msgs, cfg)` — pass the `cfg` through verbatim.
 
 - [ ] **Step 2: Patch `alvaagent_tui.py`**
 
@@ -867,7 +870,7 @@ from alvaagent.sessions import (  # noqa: E402,F401
     context_window_for, estimate_tokens, estimate_message_tokens, context_usage,
     sessions_map, load_session, save_session, delete_session, _find_session,
     _rename_session_in_store, auto_title, _unique_session_name,
-    summarize_with_llm, _fallback_summary, compress_history, compress_now,
+    summarize_with_llm, _fallback_summary, compress_history,
     trim_history, new_session_name,
 )
 ```
