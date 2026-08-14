@@ -13,6 +13,11 @@ from alvaagent_tui import (  # noqa: F401
     _read_trace, _save_store, _sleep_retry, _store_get, _strip_xml,
     _trace_count, _unique_session_name, signal, subprocess, urllib, time, yaml,
 )
+from alvaagent.util import (  # noqa: F401
+    _env, now_iso, _fmt_k, _atomic_write, _looks_like_html, _raw_fetch,
+    mask_key, _parse_frontmatter, _frontmatter_load, _frontmatter_dump,
+    _mini_yaml, _mini_scalar, _finish_block,
+)
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
 # _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
