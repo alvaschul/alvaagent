@@ -140,6 +140,12 @@ class _Facade(_types.ModuleType):
             super().__setattr__(name, value)
             return
         super().__setattr__(name, value)
+        if isinstance(value, _types.ModuleType):
+            # Import-system submodule registration (e.g. setattr(alvaagent,
+            # "repl", <module alvaagent.repl>)) must not be treated as a
+            # monkeypatch: propagating it would overwrite the `repl` function
+            # re-exported into the shim and into alvaagent.repl itself.
+            return
         setattr(_Facade._tui, name, value)
         for _mname, _mod in _sys.modules.items():
             if _mname.startswith("alvaagent.") and hasattr(_mod, name):
