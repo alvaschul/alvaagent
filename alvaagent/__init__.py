@@ -29,7 +29,7 @@ if "_store" in _tui.__dict__:
         _atomic_write, _find_session, _fmt_k, _looks_like_html, _md_line,
         _normalize_state, _parse_xml_tool_calls, _permission, _raw_fetch,
         _read_trace, _save_store, _sleep_retry, _store_get, _strip_xml,
-        _trace_count, _unique_session_name, signal, urllib, time, yaml,
+        _unique_session_name, signal, urllib, time, yaml,
     )
 from alvaagent.util import (  # noqa: F401
     _env, now_iso, _fmt_k, _atomic_write, _looks_like_html, _raw_fetch,
@@ -89,6 +89,12 @@ from alvaagent.sessions import (  # noqa: F401
     _rename_session_in_store, auto_title, _unique_session_name,
     summarize_with_llm, _fallback_summary, compress_history,
     trim_history, new_session_name,
+)
+from alvaagent.agent import (  # noqa: F401
+    _TURN_TIMEOUT, _MAX_CONSEC_TOOL_FAILURES, ON_TOOL,
+    _repair_tool_pairs, _report_tool,
+    run_agent, _clean_segment, _strip_xml_blocks, _parse_xml_tool_calls,
+    _strip_xml, run_agent_stream,
 )
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
