@@ -4,6 +4,7 @@ Package layout replaces the original single-file alvaagent_tui.py. This
 facade re-exports the old flat API so `import alvaagent as pa` behaves like
 the original module.
 """
+import subprocess  # noqa: F401  (read via the facade fallback so pa.subprocess.run monkeypatches keep working)
 import sys as _sys
 
 # The eager re-export must only run against a fully loaded alvaagent_tui.
@@ -23,12 +24,12 @@ if _tui is None:
 if "_store" in _tui.__dict__:
     from alvaagent_tui import *  # noqa: F401,F403
     from alvaagent_tui import (  # noqa: F401
-        _store, _TOOLS_MODE, _APPROVED_SET, _cancel_flag,
+        _store, _APPROVED_SET, _cancel_flag,
         ON_PERMISSION, ON_TOOL, _UI, CUR_SKIN, COLOR,
         _atomic_write, _find_session, _fmt_k, _looks_like_html, _md_line,
         _normalize_state, _parse_xml_tool_calls, _permission, _raw_fetch,
         _read_trace, _save_store, _sleep_retry, _store_get, _strip_xml,
-        _trace_count, _unique_session_name, signal, subprocess, urllib, time, yaml,
+        _trace_count, _unique_session_name, signal, urllib, time, yaml,
     )
 from alvaagent.util import (  # noqa: F401
     _env, now_iso, _fmt_k, _atomic_write, _looks_like_html, _raw_fetch,
@@ -62,6 +63,19 @@ from alvaagent.skills import (  # noqa: F401
     _resolve_skill_path, _skill_read, _scan_skill_files, _skill_list_all,
     tool_skill_list, tool_skill_read, tool_skill_remove, tool_skill_save,
     tool_skill_install, tool_skill_sync_repo,
+)
+from alvaagent.tools import (  # noqa: F401
+    _PY_RUN_TIMEOUT, _PY_MAX_BYTES, _PY_MAX_CHARS, _CALC_ALLOWED,
+    _TOOLS_MODE, _CORE_TOOL_NAMES, _ADVANCED_TOOL_NAMES,
+    active_tools, _maybe_enable_full, _set_tool_mode, _sync_tool_mode,
+    tool_run_command, tool_file_read, tool_file_write, tool_file_edit,
+    tool_file_list, tool_file_search, tool_todo_list, tool_todo_add,
+    tool_todo_toggle, tool_todo_remove, tool_memory_save, tool_memory_recall,
+    tool_memory_list, tool_memory_search, tool_get_time, tool_feedback,
+    tool_improvement_set, tool_improvement_list, tool_improvement_done,
+    tool_reflect, tool_web_fetch, _safe_factorial, _calc_eval, _fmt_num,
+    tool_calculator, classify_python, tool_run_python, tool_count,
+    TOOLS, TOOL_IMPL, _TOOL_ERROR_HINTS, dispatch_tool, self_test, tool_self_test,
 )
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
