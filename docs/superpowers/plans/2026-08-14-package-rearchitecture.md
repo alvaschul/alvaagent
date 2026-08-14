@@ -1038,60 +1038,91 @@ git commit -m "refactor: extract tui.py (skins, rich/ANSI panels, agent writer, 
 
 ---
 
+> **Ruling 12 (amended):** `compress_now` must move to `alvaagent/tui.py` NOW, not at Task 14 as Ruling 9 deferred. `cmd_compress` (which moves with commands.py) calls `compress_now`, and commands.py is a leaf — it cannot import from the main file. `compress_now`'s dependencies are `context_usage`/`compress_history` (sessions), `p_info`/`p_ok`/`Spinner`/`_UI` (tui.py locals), `_fmt_k` (util) — all already available in tui.py except `compress_history`, so tui.py's sessions import gains `compress_history`. sessions.py cannot host it (needs tui → import cycle). `send_message` (main, until Task 13) also calls `compress_now`, so the main file's tui import block adds `compress_now`, and commands.py imports `compress_now` from tui. Facade write-through keeps `pa.compress_now` monkeypatching (test_tui.py:693/702) working: main binds it (updated), tui.py owns it, commands.py exposes it — all three get written.
+
+> **Ruling 12 (amended) — verified header for commands.py** (the plan's Step 1 header was aspirational): stdlib `datetime`, `json`, `os`, `urllib.error`, `urllib.request` (cmd_test does raw urllib calls); config `PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN, DATA_DIR, active_cfg, save_state`; store `_store, _store_get, _store_set, TODO_KEY, MEM_PREFIX, FEEDBACK_KEY, IMPROVEMENT_KEY, HISTORY_KEY, ACTIVE_SESSION_KEY`; permissions `classify_command, PROJECT_DIR` (NO `ask_permission` — it is a local def in the moved region; NO `_permission`/`ON_PERMISSION` — zero callers in the region); skills `tool_skill_list, tool_skill_read, tool_skill_install, tool_skill_sync_repo`; tools `_TOOLS_MODE, _ADVANCED_TOOL_NAMES, active_tools, TOOLS, tool_file_read, tool_file_write, tool_file_edit, tool_todo_list, tool_todo_add, tool_todo_toggle, tool_todo_remove, tool_memory_save, tool_memory_recall, tool_feedback, tool_improvement_set, tool_improvement_done, tool_reflect, tool_calculator`; client `SYSTEM_PROMPT, _readable_error, fetch_models`; sessions `estimate_tokens, context_usage, sessions_map, save_session`; trace `_read_trace` (only); tui `SKINS, C, col, p_info, p_err, p_ok, p_warn, set_active_skin, _UI` + `compress_now` + `import alvaagent.tui as _tui` (ask_permission reads `_tui.CUR_SKIN` — Ruling 11 qualified-read idiom); util `mask_key, _fmt_k`. Not used in the region (drop from plan header): `SKIN_NAMES`, `ALVA_VERSION`, `DEFAULT_CONTEXT_WINDOW`, `MODEL_CONTEXT`, `load_state`, `data_dir`, `tool_skill_remove/save`, `_skill_list_all`, `_set_tool_mode`, `_TOOL_MODES`, `tool_self_test`, `dispatch_tool`, `load_session`, `delete_session`, `_find_session`, `_rename_session_in_store`, `_unique_session_name`, `auto_title`, `new_session_name`, `_trace`, `_trace_count`, `CUR_SKIN`, `COLOR`, `banner`, `print_user_turn`, `render_agent_panel`, `render_status_bar`, `_md_line`, `AgentWriter`, `Spinner`, `now_iso`, `_raw_fetch`.
+
 ### Task 12: Extract `commands.py` (slash commands + prompts)
 
 **Files:**
 - Create: `alvaagent/commands.py`
-- Modify: `alvaagent_tui.py`, `alvaagent/__init__.py`
+- Modify: `alvaagent_tui.py`, `alvaagent/__init__.py`, `alvaagent/tui.py` (add `compress_now` + `compress_history` import)
 
 **Interfaces:**
 - Consumes: everything above — `config`, `store`, `permissions`, `skills`, `tools`, `client`, `sessions`, `agent`, `tui`.
-- Produces: `mask_key`? (already util), `ask`, `parse_key`, `ask_key`, `ask_permission`, `pick_model`, and every `cmd_*`: `cmd_models`, `cmd_skin`, `cmd_sessions`, `cmd_context`, `cmd_compress`, `cmd_self_test`, `cmd_help`, `cmd_config`, `cmd_provider`, `cmd_test`, `cmd_tools`, `cmd_trace`, `cmd_todos`, `cmd_todo`, `cmd_memory`, `cmd_feedback`, `cmd_skills`, `cmd_skill_category`, `cmd_reflect`, `cmd_improve`, `cmd_install_skill`, `cmd_clear`, `cmd_export`, `cmd_multi` — signatures unchanged (they already take `state`/`history`/`rest` params as today).
+- Produces: `ask`, `parse_key`, `ask_key`, `ask_permission`, `pick_model`, `_SLASH_COMMANDS`, and every `cmd_*`: `cmd_models`, `cmd_skin`, `cmd_sessions`, `cmd_context`, `cmd_compress`, `cmd_self_test`, `cmd_help`, `cmd_config`, `cmd_provider`, `cmd_test`, `cmd_tools`, `cmd_trace`, `cmd_todos`, `cmd_todo`, `cmd_memory`, `cmd_feedback`, `cmd_skills`, `cmd_skill_category`, `cmd_reflect`, `cmd_improve`, `cmd_install_skill`, `cmd_clear`, `cmd_export`, `cmd_multi` — signatures unchanged (they already take `state`/`history`/`rest` params as today). Local helpers `_check`, `_raises`, `_todo_check`, `_mem_check`, `_skill_check`, `_file_write_check`, `_file_edit_check`, `_feedback_check`, `_list_providers` stay inside commands.py.
 
 - [ ] **Step 1: Create `alvaagent/commands.py`**
 
-Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- slash commands ...` and `# ---------------- REPL ...` (roughly lines 3856-4688). This includes `ask`, `parse_key`, `ask_key`, `ask_permission`, `pick_model`, and all `cmd_*`. (`mask_key` was already moved to util in Task 2 — import it.)
+Move verbatim from `alvaagent_tui.py`: lines **203-1084** (from `def ask(` through the end of `cmd_multi`, just before the `# ---------------- REPL ----------------` marker at 1085). This includes `ask`, `parse_key`, `ask_key`, `ask_permission`, the `# ---------------- slash commands ----------------` marker, `pick_model`, `_SLASH_COMMANDS`, and all `cmd_*`. (`mask_key` is already in util — import it.)
 
-Header imports (add what the moved bodies reference):
+Header imports (VERIFIED — the plan's Step 1 header was aspirational; use these, then let pyflakes F401 refine):
 
 ```python
+import datetime
 import json
 import os
+import urllib.error
+import urllib.request
 
 from alvaagent.config import (
-    PROVIDERS, SKIN_NAMES, DEFAULT_SKIN, ALVA_VERSION, DEFAULT_CONTEXT_WINDOW,
-    MODEL_CONTEXT, active_cfg, save_state, data_dir, load_state,
+    PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN, DATA_DIR,
+    active_cfg, save_state,
 )
 from alvaagent.store import (
-    _store_get, _store_set, ACTIVE_SESSION_KEY, TODO_KEY, MEM_PREFIX,
+    _store, _store_get, _store_set, TODO_KEY, MEM_PREFIX, FEEDBACK_KEY,
+    IMPROVEMENT_KEY, HISTORY_KEY, ACTIVE_SESSION_KEY,
 )
-from alvaagent.permissions import ask_permission
+from alvaagent.permissions import classify_command, PROJECT_DIR
 from alvaagent.skills import (
-    tool_skill_list, tool_skill_read, tool_skill_remove, tool_skill_save,
-    tool_skill_install, tool_skill_sync_repo, _skill_list_all,
+    tool_skill_list, tool_skill_read, tool_skill_install, tool_skill_sync_repo,
 )
 from alvaagent.tools import (
-    tool_todo_list, tool_todo_add, tool_todo_toggle, tool_todo_remove,
-    tool_memory_save, tool_memory_recall, tool_memory_list, tool_memory_search,
-    active_tools, _set_tool_mode, _TOOLS_MODE, _TOOL_MODES, TOOLS,
-    tool_self_test, dispatch_tool,
+    _TOOLS_MODE, _ADVANCED_TOOL_NAMES, active_tools, TOOLS,
+    tool_file_read, tool_file_write, tool_file_edit, tool_todo_list,
+    tool_todo_add, tool_todo_toggle, tool_todo_remove, tool_memory_save,
+    tool_memory_recall, tool_feedback, tool_improvement_set,
+    tool_improvement_done, tool_reflect, tool_calculator,
 )
-from alvaagent.client import fetch_models
+from alvaagent.client import SYSTEM_PROMPT, _readable_error, fetch_models
 from alvaagent.sessions import (
-    sessions_map, load_session, save_session, delete_session, _find_session,
-    _rename_session_in_store, context_usage, compress_now, _unique_session_name,
-    auto_title, new_session_name,
+    estimate_tokens, context_usage, sessions_map, save_session,
 )
-from alvaagent.trace import _trace, _read_trace, _trace_count
+from alvaagent.trace import _read_trace
 from alvaagent.tui import (
-    p_info, p_err, p_ok, p_warn, col, C, CUR_SKIN, COLOR,
-    set_active_skin, banner, print_user_turn, render_agent_panel,
-    render_status_bar, _md_line, AgentWriter, Spinner,
+    compress_now, SKINS, C, col, p_info, p_err, p_ok, p_warn,
+    set_active_skin, _UI,
 )
-from alvaagent.util import mask_key, _fmt_k, now_iso, _raw_fetch
+from alvaagent.util import mask_key, _fmt_k
+import alvaagent.tui as _tui
 ```
 
-Where a moved body references bare names (e.g. `pick_model`, `_check`, `_raises`, `_todo_check`, `_mem_check`, `_skill_check`, `_file_write_check`, `_file_edit_check`, `_feedback_check`), they stay local to `commands.py`. If a body references a name that lives in another moved section, add it to the import above. `ask_permission`/`ask_key`/`pick_model` are defined in this module but `permissions.ask_permission` is the *hook* name — the hook is set in `main()` via the permissions module; the command handlers call the local `ask_permission` prompt directly. Verify the original call graph: `cmd_*` functions call `ask_permission`/`_permission` — `_permission` comes from `permissions`. If any `cmd_*` calls `ON_PERMISSION`, import it from permissions.
+`ask_permission`/`ask_key`/`pick_model`/`parse_key`/`ask` are DEFINED in this module; they are NOT in `permissions`. The permissions hook (`_perms.ON_PERMISSION = ask_permission`) is set in `main()` — it must now reference the commands-module `ask_permission`, which the main file imports by name. `ask_permission` reads `_UI` and `col` (imported) and `_tui.CUR_SKIN` (kept verbatim from Ruling 11's qualified-read form) — the `import alvaagent.tui as _tui` provides it. No `cmd_*` calls `_permission`/`ON_PERMISSION` (verified: the only `ON_PERMISSION` hit in the region is ask_permission's docstring).
+
+- [ ] **Step 2: Patch `alvaagent_tui.py`**
+
+Delete lines 203-1084 and add:
+
+```python
+# slash commands moved to alvaagent/commands.py (Task 12)
+from alvaagent.commands import (  # noqa: E402,F401
+    _SLASH_COMMANDS, ask_permission,
+    cmd_models, cmd_skin, cmd_sessions, cmd_context, cmd_compress,
+    cmd_self_test, cmd_help, cmd_config, cmd_provider, cmd_test, cmd_tools,
+    cmd_trace, cmd_memory, cmd_export, cmd_multi,
+    cmd_install_skill, cmd_improve, cmd_skills, cmd_skill_category, cmd_clear,
+)
+```
+
+This is exactly the 22 names the remaining REPL section (1085+) references (verified by grep of the dispatch at ~1239-1349, `_slash_complete` at 1122, and `main`'s hook at ~1382). Also add `compress_now` to the main file's `from alvaagent.tui import (...)` block (Ruling 12). The facade's eager list is unaffected (it pulls no cmd_* / compress_now).
+
+- [ ] **Step 3: Re-export from the facade**
+
+In `alvaagent/__init__.py`, after the `alvaagent.tui` re-export block, add a `from alvaagent.commands import (...)` block re-exporting the full surface: `ask, parse_key, ask_key, ask_permission, pick_model, _SLASH_COMMANDS, cmd_models, cmd_skin, cmd_sessions, cmd_context, cmd_compress, cmd_self_test, cmd_help, cmd_config, cmd_provider, cmd_test, cmd_tools, cmd_trace, cmd_todos, cmd_todo, cmd_memory, cmd_feedback, cmd_skills, cmd_skill_category, cmd_reflect, cmd_improve, cmd_install_skill, cmd_clear, cmd_export, cmd_multi` (mirror the generous established pattern; tests use `pa.cmd_provider`, `pa.cmd_trace`, `pa.ask_permission`, `pa.parse_key`, `pa.compress_now`).
+
+- [ ] **Step 4: Run the tests**
+
+Run: `python3 test_tui.py` — Expected: `ALL TESTS PASSED ✓` (`cmd_provider`/`cmd_trace`/`ask_permission`/`parse_key`/`compress_now`-monkeypatch checks plus all others).
 
 - [ ] **Step 2: Patch `alvaagent_tui.py`**
 
