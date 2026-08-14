@@ -55,6 +55,14 @@ from alvaagent.permissions import (  # noqa: F401
     classify_command, PROJECT_DIR, _in_project, classify_file_action,
     _APPROVED_SET, _permission, ON_PERMISSION,
 )
+from alvaagent.skills import (  # noqa: F401
+    SKILLS_DIR,
+    _SKILL_FM_RE, _SKILL_FM_DEFAULT, _VALID_FM_KEYS, _SKILL_RAW_MAX,
+    _skill_body_for_tool, _detect_category, _skill_filepath, _inside_skills,
+    _resolve_skill_path, _skill_read, _scan_skill_files, _skill_list_all,
+    tool_skill_list, tool_skill_read, tool_skill_remove, tool_skill_save,
+    tool_skill_install, tool_skill_sync_repo,
+)
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
 # _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.
