@@ -77,6 +77,12 @@ from alvaagent.tools import (  # noqa: F401
     tool_calculator, classify_python, tool_run_python, tool_count,
     TOOLS, TOOL_IMPL, _TOOL_ERROR_HINTS, dispatch_tool, self_test, tool_self_test,
 )
+from alvaagent.client import (  # noqa: F401
+    SYSTEM_PROMPT,
+    _MAX_RETRIES, _RETRY_BACKOFF, _STREAM_IDLE_LIMIT, _STREAM_POLL,
+    _readable_error, _retryable_status, _sleep_retry, _Cancelled,
+    chat_completion, chat_completion_stream, fetch_models, cancel_agent,
+)
 
 # The single file's functions read module globals (ON_PERMISSION, _TOOLS_MODE,
 # _raw_fetch, ...). The test suite monkeypatches them through `pa.<name> = ...`.

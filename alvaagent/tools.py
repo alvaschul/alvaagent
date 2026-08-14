@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.request
 
+from alvaagent.client import _STREAM_POLL
 from alvaagent.config import DATA_DIR, TOOL_MODES, save_state
 from alvaagent.permissions import PROJECT_DIR, _permission, classify_command, classify_file_action
 from alvaagent.skills import (
@@ -23,8 +24,6 @@ from alvaagent.store import (
 )
 from alvaagent.trace import _trace
 from alvaagent.util import _atomic_write, _cancel_flag
-
-_STREAM_POLL = 0.25               # cancel-check interval while polling the python child
 
 # ---------------- autonomy: shell + files + skills ----------------
 def tool_run_command(command):
