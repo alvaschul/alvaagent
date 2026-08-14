@@ -58,8 +58,11 @@ alvaagent/
                     self_test + tool_self_test
     client.py       chat_completion, chat_completion_stream, fetch_models,
                     retries/backoff, _Cancelled, stall watchdog, cancel hook
-    agent.py        run_agent, run_agent_stream, _repair_tool_pairs, trace,
+    agent.py        run_agent, run_agent_stream, _repair_tool_pairs, ON_TOOL hook,
                     turn guards (_TURN_TIMEOUT, _MAX_CONSEC_TOOL_FAILURES)
+    trace.py        leaf: _trace/_read_trace/_trace_count writing trace.log
+                    (capped JSON-lines; extracted early to avoid a tools/agent
+                    import cycle, since the tools section also traces)
     sessions.py     sessions_map, load/save/delete/rename, context_usage,
                     estimate_tokens, auto_title, compress/compress_now,
                     summarize_with_llm

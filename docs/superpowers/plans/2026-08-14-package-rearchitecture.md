@@ -28,6 +28,8 @@ alvaagent/
     __init__.py     facade: re-exports old flat API (tests do `import alvaagent as pa`)
     __main__.py     `python3 -m alvaagent` -> repl.main()
     context.py      Runtime dataclass + build_runtime()
+    trace.py        leaf: _trace, _read_trace, _trace_count, _TRACE_MAX_LINES,
+                    _TRACE_MAX_BYTES (JSON-lines agent trace, capped)
     util.py         leaf helpers: _env, now_iso, _fmt_k, _atomic_write, _raw_fetch,
                     _looks_like_html, mask_key, mini-yaml (frontmatter), yaml-optional
     config.py       leaf: data_dir, path consts, PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG,
@@ -42,7 +44,7 @@ alvaagent/
                     self_test, tool-mode selection
     client.py       chat_completion, chat_completion_stream, fetch_models, retries,
                     stall watchdog, cancel
-    agent.py        run_agent, run_agent_stream, _repair_tool_pairs, trace
+    agent.py        run_agent, run_agent_stream, _repair_tool_pairs, ON_TOOL hook
     sessions.py     sessions_map, load/save/delete/rename, context_usage,
                     estimate_tokens, auto_title, compress/compress_now, trim_history
     tui.py          SKINS, C, colors, print_user_turn, render_agent_panel,
@@ -56,7 +58,7 @@ alvaagent/
   docs/superpowers/specs/2026-08-14-package-rearchitecture-design.md
 ```
 
-Dependency direction: `util` → `config`/`store` → `permissions`/`skills` → `tools` → `client`/`agent`/`sessions` → `tui` → `commands` → `repl`.
+Dependency direction: `util` → `config` → `trace` → `store` → `permissions`/`skills` → `tools` → `client`/`agent`/`sessions` → `tui` → `commands` → `repl`.
 
 ---
 
@@ -326,7 +328,45 @@ Then update BOTH call sites in `alvaagent_tui.py` — `repl()` (`state = load_st
 
 (These two sites are rewritten in Task 13 and the Runtime phase; this keeps behavior identical in between.)
 
-- [ ] **Step 4: Re-export from the facade**
+- [ ] **Step 4: Create `alvaagent/trace.py` (Ruling 1)**
+
+`_trace` is **called from the tools section** (`_maybe_enable_full`, `_set_tool_mode`) but **defined in the agent section** — if `tools.py` imports `_trace` from `agent.py` we get a `tools ↔ agent` cycle. Fix by extracting the trace helpers to a leaf module now (they only need `json`/`os`/`TRACE_PATH`).
+
+Move from `alvaagent_tui.py` lines ~2351-2393, verbatim, into `alvaagent/trace.py`:
+
+```python
+"""JSON-lines agent trace (trace.log) — leaf module (imports config, util only)."""
+import json
+import os
+
+from alvaagent.config import TRACE_PATH
+
+_TRACE_MAX_LINES = 2000      # cap for trace.log
+_TRACE_MAX_BYTES = 1_000_000  # cap before trace.log is trimmed back
+
+
+def _trace(entry):
+    ...   # verbatim lines 2355-2374 (the `import datetime as _dt` stays inside)
+
+
+def _read_trace(limit=15):
+    ...   # verbatim lines 2377-2384
+
+
+def _trace_count():
+    ...   # verbatim lines 2387-2393
+```
+
+Delete those definitions from `alvaagent_tui.py` (keep the agent-loop body that *calls* them). Then import in `alvaagent_tui.py`:
+
+```python
+# trace moved to alvaagent/trace.py (Task 3)
+from alvaagent.trace import (  # noqa: E402,F401
+    _trace, _read_trace, _trace_count, _TRACE_MAX_LINES, _TRACE_MAX_BYTES,
+)
+```
+
+- [ ] **Step 5: Re-export from the facade**
 
 Add to `alvaagent/__init__.py`:
 
@@ -337,16 +377,19 @@ from alvaagent.config import (  # noqa: F401
     ALVA_VERSION, DEFAULT_CONTEXT_WINDOW, MODEL_CONTEXT, TOOL_MODES,
     _tool_mode_of, _skin_of, _normalize_state, load_state, save_state, active_cfg,
 )
+from alvaagent.trace import (  # noqa: F401
+    _trace, _read_trace, _trace_count, _TRACE_MAX_LINES, _TRACE_MAX_BYTES,
+)
 ```
 
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 6: Run the tests**
 
 Run: `python3 test_tui.py` — Expected: `ALL TESTS PASSED ✓`
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add alvaagent/config.py alvaagent/__init__.py alvaagent_tui.py
+git add alvaagent/config.py alvaagent/trace.py alvaagent/__init__.py alvaagent_tui.py
 git commit -m "refactor: extract config.py (paths, profiles, provider defaults, tool_mode validation)"
 ```
 
@@ -615,6 +658,7 @@ from alvaagent.skills import (
     tool_skill_install, tool_skill_sync_repo,
 )
 from alvaagent.store import _store_get, _store_set
+from alvaagent.trace import _trace            # Ruling 1: tools' _set_tool_mode/_maybe_enable_full trace
 from alvaagent.util import _raw_fetch, _atomic_write, now_iso
 ```
 
@@ -795,19 +839,20 @@ git commit -m "refactor: extract sessions.py (session store, context tracking, a
 
 ---
 
-### Task 10: Extract `agent.py` (agent loop + trace)
+### Task 10: Extract `agent.py` (agent loop, XML parsing, tool-report hook)
 
 **Files:**
 - Create: `alvaagent/agent.py`
 - Modify: `alvaagent_tui.py`, `alvaagent/__init__.py`
 
 **Interfaces:**
-- Consumes: `config` (`TRACE_PATH`, `active_cfg`, `data_dir`), `store` (`_store_get`? check bodies), `client` (`chat_completion_stream`, `_Cancelled`, `_sleep_retry`, `_cancel_flag`), `tools` (`TOOLS`, `dispatch_tool`, `TOOL_IMPL`, `active_tools`, `_maybe_enable_full`, `_TOOL_ERROR_HINTS`), `util`.
-- Produces: `_TURN_TIMEOUT`, `_MAX_CONSEC_TOOL_FAILURES`, `_TRACE_MAX_LINES`, `_TRACE_MAX_BYTES`, XML regex consts (`_XML_*`), `_repair_tool_pairs`, `_trace(event)`, `_read_trace(n)`, `_trace_count()`, `_report_tool(...)`, `run_agent(messages, cfg, ...)` (verbatim), `_clean_segment`, `_strip_xml_blocks`, `_parse_xml_tool_calls`, `_strip_xml`, `run_agent_stream(messages, cfg, ...)` (verbatim).
+- Consumes: `config` (`TRACE_PATH`, `active_cfg`, `data_dir`), `store` (`_store_get`? check bodies), `client` (`chat_completion_stream`, `_Cancelled`, `_sleep_retry`, `_cancel_flag`), `tools` (`TOOLS`, `dispatch_tool`, `TOOL_IMPL`, `active_tools`, `_maybe_enable_full`, `_TOOL_ERROR_HINTS`), `trace` (`_trace`, `_read_trace`, `_trace_count`), `util`.
+- Produces: `_TURN_TIMEOUT`, `_MAX_CONSEC_TOOL_FAILURES`, **`ON_TOOL`** (module hook — stays in this module, see Ruling 2), XML regex consts (`_XML_*`), `_repair_tool_pairs`, `_report_tool(...)`, `run_agent(messages, cfg, ...)` (verbatim), `_clean_segment`, `_strip_xml_blocks`, `_parse_xml_tool_calls`, `_strip_xml`, `run_agent_stream(messages, cfg, ...)` (verbatim).
+- Note: the trace helpers (`_trace`/`_read_trace`/`_trace_count`/`_TRACE_MAX_LINES`/`_TRACE_MAX_BYTES`) already moved to `trace.py` in Task 3 — **do not move them again**; import them.
 
 - [ ] **Step 1: Create `alvaagent/agent.py`**
 
-Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- agent loop ...` and `# ---------------- harness self-test ...` (roughly lines 2292-2682).
+Move verbatim from `alvaagent_tui.py`: the block between `# ---------------- agent loop ...` and `# ---------------- harness self-test ...` (roughly lines 2292-2682), **minus** the trace helpers already extracted in Task 3. Include `ON_TOOL = None` (line ~2297).
 
 Header imports:
 
@@ -820,10 +865,10 @@ from alvaagent.client import (
     chat_completion_stream, _Cancelled, _sleep_retry, _cancel_flag,
 )
 from alvaagent.tools import TOOLS, dispatch_tool, active_tools, _maybe_enable_full, TOOL_IMPL
-from alvaagent.store import _store_get, _store_set
+from alvaagent.trace import _trace, _read_trace, _trace_count
 ```
 
-The `_trace` functions write to `TRACE_PATH` — imported from config. `run_agent_stream` references `_cancel_flag`, `_TURN_TIMEOUT`, `_MAX_CONSEC_TOOL_FAILURES`, `dispatch_tool`, `_trace`, `_repair_tool_pairs` — all local to this module after the move. Check for `_sleep_retry` usage.
+`run_agent_stream` references `_cancel_flag`, `_TURN_TIMEOUT`, `_MAX_CONSEC_TOOL_FAILURES`, `dispatch_tool`, `_trace`, `_repair_tool_pairs` — all local to this module (or imported above) after the move. Check for `_sleep_retry` usage.
 
 - [ ] **Step 2: Patch `alvaagent_tui.py`**
 
@@ -832,12 +877,21 @@ Delete the block and add:
 ```python
 # agent loop moved to alvaagent/agent.py (Task 10)
 from alvaagent.agent import (  # noqa: E402,F401
-    _TURN_TIMEOUT, _MAX_CONSEC_TOOL_FAILURES, _TRACE_MAX_LINES, _TRACE_MAX_BYTES,
-    _repair_tool_pairs, _trace, _read_trace, _trace_count, _report_tool,
+    _TURN_TIMEOUT, _MAX_CONSEC_TOOL_FAILURES, ON_TOOL,
+    _repair_tool_pairs, _report_tool,
     run_agent, _clean_segment, _strip_xml_blocks, _parse_xml_tool_calls,
     _strip_xml, run_agent_stream,
 )
 ```
+
+**Ruling 2 (forward the ON_TOOL hook):** `main()` currently does `ON_TOOL = on_tool` (~line 5159). That now rebinds the *local imported name*, not the `agent` module's global, so the agent loop would never see it. Change it to:
+
+```python
+    import alvaagent.agent as _agent
+    _agent.ON_TOOL = on_tool
+```
+
+(`on_tool` still lives in `alvaagent_tui.py` until Task 11; the same forwarding is rewritten in `repl.main()` in Task 13.)
 
 - [ ] **Step 3: Re-export from the facade**
 
@@ -851,7 +905,7 @@ Run: `python3 test_tui.py` — Expected: `ALL TESTS PASSED ✓` (agent-loop + st
 
 ```bash
 git add alvaagent/agent.py alvaagent/__init__.py alvaagent_tui.py
-git commit -m "refactor: extract agent.py (turn loop, runaway guards, XML tool-call parsing, trace)"
+git commit -m "refactor: extract agent.py (turn loop, runaway guards, XML tool-call parsing)"
 ```
 
 ---
@@ -863,7 +917,7 @@ git commit -m "refactor: extract agent.py (turn loop, runaway guards, XML tool-c
 - Modify: `alvaagent_tui.py`, `alvaagent/__init__.py`
 
 **Interfaces:**
-- Consumes: `config` (`SKIN_NAMES`, `DEFAULT_SKIN`, `_skin_of`, `data_dir`), `agent` (`run_agent_stream`, `_trace`? check bodies), `util` (`_fmt_k`, `now_iso`? check), `sessions` (`context_usage`? check `render_status_bar`).
+- Consumes: `config` (`SKIN_NAMES`, `DEFAULT_SKIN`, `_skin_of`, `data_dir`), `agent` (`run_agent_stream`), `trace` (`_trace`? check bodies), `util` (`_fmt_k`, `now_iso`? check), `sessions` (`context_usage`? check `render_status_bar`).
 - Produces: `SKINS`, `C`, `DEFAULT_SKIN` usage, `set_active_skin(state)`, `col`, `p_info`, `p_err`, `p_ok`, `p_warn`, `_term_width`, `_hrgb`, `_fgh`, `_rsth`, `_tool_line`, `print_user_turn`, `render_agent_panel`, `_md_attr_sgr`, `_has_ansi`, `_md_line`, `_md_prefix`, `style_inline`, `AgentWriter`, `fmt_args`, `tool_summary`, `Spinner`, `tool_open`, `tool_close`, `on_tool`, `run_agent_tui(history, cfg)`, `_ANSI_RE`, `_MD_STYLE`, `_UI`, `_CON`/`Panel`/`Console`/`HORIZONTALS`, `COLOR`/`CUR_SKIN` globals, `banner(state)`, `render_status_bar(...)`.
 
 - [ ] **Step 1: Create `alvaagent/tui.py`**
@@ -885,7 +939,7 @@ from alvaagent.util import _fmt_k
 
 Carry over the optional rich import exactly as it exists today (the `try: from rich... except:` fallback with `_ShimConsole`/`_ShimPanel`/`_ShimBox`). The `CUR_SKIN` / `COLOR` globals and `_UI = {"spinner": None}` stay module-level here (Runtime phase → `rt.skin` / `rt.spinner`). `set_active_skin(state)` stays as-is (reads `_skin_of(state)`, sets the module globals).
 
-Check `run_agent_tui`'s body: it uses `AgentWriter`, `Spinner`, `run_agent_stream`, `_trace`(? if so import from agent), `tool_summary`, `_maybe_enable_full`(?) — import whatever the moved bodies reference from the modules above. `render_status_bar` uses `context_usage`/`_fmt_k` — import `context_usage` from sessions if present.
+Check `run_agent_tui`'s body: it uses `AgentWriter`, `Spinner`, `run_agent_stream`, `tool_summary` — import whatever the moved bodies reference from the modules above (if `_trace` is needed, import from `alvaagent.trace`, never from `agent`). `render_status_bar` uses `context_usage`/`_fmt_k` — import `context_usage` from sessions if present.
 
 - [ ] **Step 2: Patch `alvaagent_tui.py`**
 
@@ -903,7 +957,7 @@ from alvaagent.tui import (  # noqa: E402,F401
 )
 ```
 
-**Important:** the old `ON_TOOL = on_tool` global in `alvaagent_tui.py` was pointing at the local `on_tool` — after this move, `on_tool` comes from the import above, so the existing assignment still works. Leave it until the Runtime phase.
+**Important:** `main()`'s hook assignment (forwarded to `_agent.ON_TOOL` in Task 10) referenced the local `on_tool` — after this move, `on_tool` comes from the import above, so the assignment still works. Leave it until the Runtime phase.
 
 - [ ] **Step 3: Re-export from the facade**
 
@@ -966,7 +1020,7 @@ from alvaagent.sessions import (
     _rename_session_in_store, context_usage, compress_now, _unique_session_name,
     auto_title, new_session_name,
 )
-from alvaagent.agent import _trace, _read_trace, _trace_count
+from alvaagent.trace import _trace, _read_trace, _trace_count
 from alvaagent.tui import (
     p_info, p_err, p_ok, p_warn, col, C, CUR_SKIN, COLOR,
     set_active_skin, banner, print_user_turn, render_agent_panel,
@@ -1045,10 +1099,11 @@ from alvaagent.sessions import (
     _rename_session_in_store, compress_now, context_usage, _unique_session_name,
     auto_title, new_session_name, trim_history,
 )
-from alvaagent.agent import _trace
+from alvaagent.trace import _trace
 from alvaagent.tui import (
     set_active_skin, col, C, COLOR, CUR_SKIN, p_info, p_err, p_ok, p_warn,
     print_user_turn, render_agent_panel, render_status_bar, banner, run_agent_tui,
+    on_tool,
 )
 from alvaagent.commands import (
     cmd_help, cmd_config, cmd_provider, cmd_test, cmd_tools, cmd_trace,
@@ -1058,13 +1113,13 @@ from alvaagent.commands import (
 )
 ```
 
-Inside `main()`, the hook assignments become:
+Inside `main()`, the hook assignments become (Ruling 2: `ON_TOOL` lives in `agent.py`, not `tui`):
 
 ```python
+    import alvaagent.agent as _agent
     import alvaagent.permissions as _perms
-    import alvaagent.tui as _tui
     _perms.ON_PERMISSION = ask_permission
-    _tui.ON_TOOL = on_tool
+    _agent.ON_TOOL = on_tool
 ```
 
 `on_tool` is imported from `tui`. Verify `main()`'s signal/screen handling, `_cleanup`, `_restored`, and `banner(state)`/`repl()` calls move verbatim.
@@ -1240,6 +1295,7 @@ def cancel_agent(rt)                             # rt.cancel.set()
 # agent.py
 def run_agent(rt, messages)                      # thread rt; drop separate cfg
 def run_agent_stream(rt, messages)
+# trace.py
 def trace(rt, **event) / read_trace(rt, n) / trace_count(rt)   # was _trace/_read_trace/_trace_count
 # sessions.py
 def sessions_map(rt) / load_session(rt) / save_session(rt)
@@ -1374,6 +1430,7 @@ def check_no_cycles():
     import alvaagent.context
     import alvaagent.util
     import alvaagent.config
+    import alvaagent.trace
     import alvaagent.store
     import alvaagent.permissions
     import alvaagent.skills
