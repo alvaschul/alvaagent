@@ -24,6 +24,7 @@ import inspect
 import io
 import json
 import os
+import pty
 import readline
 import select
 import shutil
@@ -1610,6 +1611,131 @@ def test_scroll_view_empty():
     sv = ScrollView([], columns=20, rows=12)
     assert sv.page_count() == 1
     assert "⏎ return" in sv.page_text(0)
+
+
+def _pty_run(script):
+    """Run `script` in a pty child; return (pid, fd) for the parent."""
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir("/data/data/com.termux/files/home/alvaagent")
+        os.execv(sys.executable, [sys.executable, "-c", script])
+        os._exit(127)
+    os.set_blocking(fd, False)
+    return pid, fd
+
+
+def _pty_drain(fd, seconds):
+    import select
+    out = b""
+    end = time.time() + seconds
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        else:
+            time.sleep(0.05)
+    return out
+
+
+def _pty_drain_until(fd, marker, timeout):
+    """Drain fd until `marker` appears in the accumulated output."""
+    import select
+    out = b""
+    end = time.time() + timeout
+    while time.time() < end and marker not in out:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+    return out
+
+
+def _pty_wait_raw(fd, timeout):
+    """Poll the pty until the child's raw mode is active (echo off)."""
+    import termios
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if not (termios.tcgetattr(fd)[3] & termios.ECHO):
+                return True
+        except OSError:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def test_line_reader_basic():
+    script = (
+        "import os\n"
+        "import sys\n"
+        "from io import StringIO\n"
+        "from alvaagent.scrollback import StreamTee, LineReader\n"
+        "os.write(1, b'READY\\n')\n"
+        "tee = StreamTee(stream=StringIO())\n"
+        "sys.stdout = tee\n"
+        "r = LineReader(tee, [], prompt='> ')\n"
+        "line = r.read_line()\n"
+        "os.write(1, b'RESULT=' + repr(line).encode() + b'\\n')\n"
+    )
+    pid, fd = _pty_run(script)
+    out = _pty_drain_until(fd, b"READY", 8.0)
+    assert b"READY" in out, out[-500:]
+    assert _pty_wait_raw(fd, 8.0)
+    os.write(fd, b"hi there\n")
+    out += _pty_drain_until(fd, b"RESULT=", 5.0)
+    assert b"RESULT='hi there'" in out, out[-500:]
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
+def test_line_reader_eof_and_interrupt():
+    script = (
+        "import os\n"
+        "import sys\n"
+        "from io import StringIO\n"
+        "from alvaagent.scrollback import StreamTee, LineReader\n"
+        "os.write(1, b'READY\\n')\n"
+        "tee = StreamTee(stream=StringIO())\n"
+        "sys.stdout = tee\n"
+        "r = LineReader(tee, [], prompt='> ')\n"
+        "try:\n"
+        "    r.read_line()\n"
+        "    os.write(1, b'NO-RAISE\\n')\n"
+        "except EOFError:\n"
+        "    os.write(1, b'GOT-EOF\\n')\n"
+    )
+    pid, fd = _pty_run(script)
+    out = _pty_drain_until(fd, b"READY", 8.0)
+    assert b"READY" in out, out[-500:]
+    assert _pty_wait_raw(fd, 8.0)
+    os.write(fd, b"\x04")
+    out += _pty_drain_until(fd, b"GOT-EOF", 5.0)
+    assert b"GOT-EOF" in out, out[-500:]
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
 
 
 def test_cli_smoke():

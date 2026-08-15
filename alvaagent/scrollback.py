@@ -154,3 +154,201 @@ class ScrollView:
         chunk += [""] * (w - len(chunk))
         footer = "  ◀ older · page %d/%d · ▼ newer · ⏎ return  " % (page + 1, self.page_count())
         return "\n".join(chunk + [footer])
+
+
+import os
+import readline
+import termios
+import tty
+
+
+def enter_raw(fd):
+    attrs = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    return attrs
+
+
+def leave_raw(fd, attrs):
+    if attrs is not None:
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+
+
+class LineReader:
+    """Raw-mode line editor with SGR mouse scroll support.
+
+    Replaces input() at the main chat prompt. Raises EOFError on Ctrl+D
+    (empty buffer) and KeyboardInterrupt on Ctrl+C, like input().
+    """
+
+    def __init__(self, tee, history_list, prompt="> "):
+        self._tee = tee
+        self._prompt = prompt
+        self._hist = list(reversed(history_list))
+        self._hist_i = -1
+        self._draft = ""
+        self._scroll_handler = None
+        self._columns = 0
+        try:
+            self._columns = shutil.get_terminal_size().columns
+        except Exception:
+            self._columns = 80
+
+    def on_scroll(self, handler):
+        self._scroll_handler = handler
+
+    def _emit(self, s):
+        self._tee.write(s)
+
+    def _redraw(self, buf):
+        self._emit("\r\x1b[K" + self._prompt + buf)
+
+    def _push_history(self, line):
+        self._hist.insert(0, line)
+        self._hist_i = -1
+        try:
+            readline.add_history(line)
+        except Exception:
+            pass
+
+    def _read_byte(self):
+        b = os.read(0, 1)
+        return b
+
+    def _collect_escape(self):
+        """Gather a CSI/mouse sequence; return bytes or None."""
+        seq = b"\x1b"
+        for _ in range(32):
+            b = self._read_byte()
+            if not b:
+                return None
+            seq += b
+            if b in (b"M", b"m", b"A", b"B", b"C", b"D", b"~", b"H", b"F", b"Z"):
+                break
+        return seq
+
+    def read_line(self):
+        buf = ""
+        raw = enter_raw(0)
+        try:
+            while True:
+                b = self._read_byte()
+                if not b:
+                    continue
+                if b == b"\r" or b == b"\n":
+                    self._emit("\r\n")
+                    if buf:
+                        self._push_history(buf)
+                    return buf
+                if b == b"\x03":
+                    raise KeyboardInterrupt
+                if b == b"\x04":
+                    if not buf:
+                        raise EOFError
+                    self._emit("\r\n")
+                    if buf:
+                        self._push_history(buf)
+                    return buf
+                if b == b"\x7f" or b == b"\x08":
+                    if buf:
+                        buf = buf[:-1]
+                        self._redraw(buf)
+                    continue
+                if b == b"\x0c":
+                    self._redraw(buf)
+                    continue
+                if b == b"\t":
+                    if buf.startswith("/"):
+                        m = _complete(buf, 0)
+                        if m and m != buf:
+                            buf = m
+                            self._redraw(buf)
+                    continue
+                if b == b"\x1b":
+                    seq = self._collect_escape()
+                    if seq is None:
+                        continue
+                    if seq == b"\x1b[A":
+                        if self._hist_i < len(self._hist) - 1:
+                            if self._hist_i == -1:
+                                self._draft = buf
+                            self._hist_i += 1
+                            buf = self._hist[self._hist_i]
+                            self._redraw(buf)
+                    elif seq == b"\x1b[B":
+                        if self._hist_i >= 0:
+                            self._hist_i -= 1
+                            buf = self._draft if self._hist_i == -1 else self._hist[self._hist_i]
+                            self._redraw(buf)
+                    else:
+                        ev = parse_mouse(seq)
+                        if ev is not None and self._scroll_handler is not None:
+                            self._handle_mouse(ev)
+                            # restore() replays only completed lines; the prompt
+                            # is a partial line, so redraw it here.
+                            self._redraw(buf)
+                    continue
+                try:
+                    s = b.decode("utf-8")
+                except UnicodeDecodeError:
+                    s = b.decode("utf-8", "replace")
+                if s.isprintable():
+                    buf += s
+                    self._emit(s)
+        finally:
+            leave_raw(0, raw)
+
+    def _handle_mouse(self, ev):
+        h = self._scroll_handler
+        if is_wheel_up(ev):
+            h("older")
+        elif is_wheel_down(ev):
+            h("newer")
+        elif ev["kind"] == "press" and ev["row"] >= self._rows_for_scroll():
+            if ev["col"] <= 8:
+                h("older")
+            elif ev["col"] >= self._columns - 8:
+                h("newer")
+            else:
+                h("return")
+
+    def _rows_for_scroll(self):
+        try:
+            return shutil.get_terminal_size().lines
+        except Exception:
+            return 24
+
+    def run_scroll_loop(self, scroll_view, page):
+        raw = enter_raw(0)
+        try:
+            while True:
+                self._emit("\x1b[H\x1b[2J" + scroll_view.page_text(page))
+                b = self._read_byte()
+                if not b:
+                    continue
+                if b in (b"\r", b"\n", b"q"):
+                    return page
+                if b == b"\x03":
+                    raise KeyboardInterrupt
+                if b == b"\x04":
+                    return page
+                if b == b"\x1b":
+                    seq = self._collect_escape()
+                    ev = parse_mouse(seq)
+                    if ev is not None:
+                        if is_wheel_up(ev) or (ev["kind"] == "press" and ev["col"] <= 8):
+                            page = min(page + 1, scroll_view.page_count() - 1)
+                        elif is_wheel_down(ev) or (ev["kind"] == "press" and ev["col"] >= self._columns - 8):
+                            page = max(page - 1, 0)
+                        elif ev["kind"] == "press":
+                            return page
+                elif b == b"\x1b[A":
+                    page = min(page + 1, scroll_view.page_count() - 1)
+                elif b == b"\x1b[B":
+                    page = max(page - 1, 0)
+        finally:
+            leave_raw(0, raw)
+
+
+def _complete(text, state):
+    from alvaagent.repl import _slash_complete
+    return _slash_complete(text, state)
