@@ -55,11 +55,64 @@ _TMP_DIRS = []
 _server = {"proc": None}
 
 
+def _stop_server():
+    proc = _server["proc"]
+    if proc is not None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    _server["proc"] = None
+    _kill_strays()
+
+
+class _AdoptedServer:
+    """Cache placeholder for a healthy mock server we did not start (an orphan
+    from an interrupted run). poll() reports alive so the singleton keeps it
+    for the rest of the process instead of restarting it."""
+
+    def poll(self):
+        return None
+
+
+def _server_alive():
+    """True when something is already answering as a mock server on PORT."""
+    try:
+        with urllib.request.urlopen(BASE + "/models", timeout=1) as r:
+            return r.getcode() == 200
+    except Exception:
+        return False
+
+
+def _kill_strays():
+    """Best-effort: kill any mock server process from an earlier run that may
+    still hold PORT. Matches both the full script path and its basename, since
+    strays may have been launched either way (pkill ships with procps on
+    Termux; if it is missing, the adopt fallback in _mock_server covers
+    healthy strays)."""
+    for pat in (MOCK, os.path.basename(MOCK)):
+        try:
+            subprocess.run(["pkill", "-f", pat], timeout=5,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
 def _mock_server():
-    """Lazily start (or reuse) the mock LLM server singleton."""
+    """Lazily start (or reuse) the mock LLM server singleton.
+
+    Survives interrupted runs: an orphaned server from a previous process may
+    still be bound to PORT, which would make a fresh server exit immediately
+    with 'Address already in use'. Kill the port holder before starting; only
+    if that fails do we fall back to adopting whatever is already answering.
+    """
     proc = _server["proc"]
     if proc is not None and proc.poll() is None:
         return proc
+    _kill_strays()
+    if _server_alive():
+        _server["proc"] = _AdoptedServer()
+        return _server["proc"]
     proc = subprocess.Popen(
         [sys.executable, MOCK, str(PORT)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -76,16 +129,6 @@ def _mock_server():
     if not ready:
         raise RuntimeError("mock server did not become ready")
     return proc
-
-
-def _stop_server():
-    proc = _server["proc"]
-    if proc is not None:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        _server["proc"] = None
 
 
 def mkrt(data_dir=None):
@@ -1144,6 +1187,60 @@ def test_error_hints():
     assert _hint_calc.get("error") and "hint" in _hint_calc
     _hint_unknown = pa.dispatch_tool(rt, "nope", {})
     assert _hint_unknown.get("error") and "unknown tool" in _hint_unknown.get("error", "")
+
+
+def test_mock_server_recovers_stale():
+    # An interrupted run can leave an untracked mock server still bound to
+    # PORT. _mock_server must recover from that: kill the stray and start
+    # fresh (or, when the stray-killer is unavailable, adopt the healthy
+    # stray) - never raise "exited early".
+    global _kill_strays
+    _stop_server()
+
+    def _spawn_orphan():
+        return subprocess.Popen(
+            [sys.executable, MOCK, str(PORT)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def _wait_ready(p):
+        deadline = time.time() + 10
+        while time.time() < deadline and p.poll() is None:
+            rlist, _, _ = select.select([p.stdout], [], [], 0.2)
+            if rlist and "READY" in p.stdout.readline():
+                return True
+        return p.poll() is None
+
+    def _alive():
+        try:
+            with urllib.request.urlopen(BASE + "/models", timeout=1) as r:
+                return r.getcode() == 200
+        except Exception:
+            return False
+
+    # Path 1: stray-killer works -> stray killed, fresh server starts
+    _orphan = _spawn_orphan()
+    _server["proc"] = None
+    try:
+        assert _wait_ready(_orphan), "orphan failed to start"
+        _mock_server()
+        assert _alive()
+    finally:
+        _orphan.kill()
+    # Path 2: stray-killer unavailable -> healthy orphan adopted, not crashed
+    _stop_server()
+    _orphan = _spawn_orphan()
+    _server["proc"] = None
+    _orig_kill = _kill_strays
+    try:
+        assert _wait_ready(_orphan), "orphan failed to start"
+        _kill_strays = lambda: None
+        _mock_server()
+        assert _alive()
+        assert _server["proc"] is not None and _server["proc"].poll() is None
+    finally:
+        _kill_strays = _orig_kill
+        _orphan.kill()
+        _server["proc"] = None
 
 
 # ---------------- resilience: circuit breaker + timeouts -------------------
