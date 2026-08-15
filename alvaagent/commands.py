@@ -1,6 +1,8 @@
 import datetime
 import json
 import os
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 
@@ -148,7 +150,7 @@ _SLASH_COMMANDS = [
     "/sessions", "/session", "/new", "/clear", "/context", "/compress",
     "/tools", "/trace", "/todos", "/todo", "/memory", "/skills", "/skill",
     "/install_skill", "/feedback", "/reflect", "/self-test", "/improve",
-    "/multi", "/export", "/redo", "/stop", "/exit", "/quit",
+    "/multi", "/export", "/scroll", "/redo", "/stop", "/exit", "/quit",
 ]
 
 
@@ -388,6 +390,7 @@ def cmd_help():
     print("    /compress              summarize older messages to free context now")
     print("    /multi                 multi-line input ('.' on its own line submits)")
     print("    /export                save the conversation as a text file")
+    print("    /scroll                browse the conversation with a pager (q to exit)")
     print("    /redo                  re-run the last request (regenerates the answer)")
     print("    /provider [name]       list / add / switch provider profiles")
     print("    /provider rm <name>    delete a provider")
@@ -877,6 +880,63 @@ def cmd_clear(rt, history):
     p_ok("conversation cleared")
 
 
+def render_conversation(history):
+    """Render the conversation as readable plain text (shared by /export and /scroll)."""
+    lines = []
+    for m in history:
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if role == "user" and content.startswith("[summary of earlier conversation]"):
+            lines.append("## summary (compressed)")
+            lines.extend(content.splitlines())
+        elif role == "user":
+            lines.append("## you")
+            lines.extend(content.splitlines())
+        elif role == "assistant":
+            lines.append("## agent")
+            lines.extend(content.splitlines())
+        elif role == "tool":
+            lines.append("## tool (%s)" % m.get("tool_call_id", "?"))
+            lines.extend(content[:500].splitlines())
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _page(text):
+    """Show text in a pager: less -R when available, built-in paging fallback."""
+    if shutil.which("less"):
+        try:
+            subprocess.Popen(["less", "-R"], stdin=subprocess.PIPE).communicate(
+                text.encode("utf-8", "replace"))
+            return
+        except Exception:
+            pass
+    rows = shutil.get_terminal_size().lines
+    buf = text.splitlines() or [""]
+    i = 0
+    while i < len(buf):
+        for line in buf[i:i + max(1, rows - 1)]:
+            print(line)
+        i += max(1, rows - 1)
+        if i >= len(buf):
+            break
+        try:
+            v = input("  (q to quit, Enter to continue) ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if v.strip().lower() in ("q", "quit"):
+            return
+
+
+def cmd_scroll(rt, history):
+    """Browse the current conversation with a pager (q to exit)."""
+    if not history:
+        p_info("(no conversation to browse)")
+        return
+    _page(render_conversation(history))
+
+
 def cmd_export(rt, history):
     """Export the conversation as plain text."""
     if not history:
@@ -884,21 +944,9 @@ def cmd_export(rt, history):
         return
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = os.path.join(rt.data_dir, "conversation_%s.txt" % ts)
-    lines = []
-    for m in history:
-        role = m.get("role", "?")
-        content = m.get("content", "")
-        if role == "user" and content.startswith("[summary of earlier conversation]"):
-            lines.append("## summary (compressed)\n%s\n" % content)
-        elif role == "user":
-            lines.append("## you\n%s\n" % content)
-        elif role == "assistant":
-            lines.append("## agent\n%s\n" % content)
-        elif role == "tool":
-            lines.append("## tool (%s)\n%s\n" % (m.get("tool_call_id", "?"), content[:500]))
     try:
         with open(fname, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+            f.write(render_conversation(history))
         p_ok("exported to %s (%d messages)" % (fname, len(history)))
     except Exception as e:
         p_err("export failed: %s" % e)

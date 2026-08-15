@@ -1486,6 +1486,41 @@ def test_no_import_cycles():
         assert r.returncode == 0, (mod, r.stderr)
 
 
+def test_render_conversation():
+    from alvaagent.commands import render_conversation
+    assert render_conversation([]) == ""
+    hist = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi back"},
+        {"role": "user", "content": "[summary of earlier conversation] old stuff"},
+        {"role": "tool", "tool_call_id": "t1", "content": "tool out"},
+    ]
+    text = render_conversation(hist)
+    for want in ("## you", "## agent", "## summary (compressed)", "## tool (t1)"):
+        assert want in text
+    assert (text.index("hello") < text.index("hi back")
+            < text.index("old stuff") < text.index("tool out"))
+    long = render_conversation([{"role": "tool", "tool_call_id": "t", "content": "x" * 600}])
+    assert "x" * 500 in long and "x" * 501 not in long
+
+
+def test_cmd_scroll():
+    import alvaagent.commands as cmds
+    rt = mock_rt()
+    pages = []
+    orig = cmds._page
+    cmds._page = lambda t: pages.append(t)
+    try:
+        cmds.cmd_scroll(rt, [{"role": "user", "content": "hello"}])
+        assert pages and "## you" in pages[0] and "hello" in pages[0]
+        pages.clear()
+        cmds.cmd_scroll(rt, [])
+        assert pages == []
+    finally:
+        cmds._page = orig
+    assert "/scroll" in cmds._SLASH_COMMANDS
+
+
 def test_cli_smoke():
     # `python3 -m alvaagent` boots and exits cleanly on EOF stdin. Runs with
     # ALVA_DATA_DIR pointed at a temp dir so the REPL never touches the real

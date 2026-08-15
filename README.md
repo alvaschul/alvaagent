@@ -108,7 +108,7 @@ you> /sessions     # list saved conversations
 
 Slash commands: `/help /config /provider /models /test /tools /trace /todos
 /todo /memory /skin /sessions /session /new /clear /context /compress /multi
-/export /stop /exit`. `Ctrl+C` cancels a running request; Tab completes slash
+/export /scroll /stop /exit`. `Ctrl+C` cancels a running request; Tab completes slash
 commands. `/tools` lists what the model can currently see (and `/tools full` /
 `/tools core` switch the advertised set); `/trace [n]` shows the last n agent
 turns.

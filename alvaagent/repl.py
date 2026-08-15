@@ -24,6 +24,7 @@ from alvaagent.tui import (
 from alvaagent.commands import (
     _SLASH_COMMANDS, ask_permission,
     cmd_clear, cmd_compress, cmd_config, cmd_context, cmd_export, cmd_help,
+    cmd_scroll,
     cmd_improve, cmd_install_skill, cmd_memory, cmd_models, cmd_multi,
     cmd_provider, cmd_self_test, cmd_sessions, cmd_skill_category, cmd_skills,
     cmd_skin, cmd_test, cmd_tools, cmd_trace,
@@ -301,6 +302,8 @@ def repl(rt):
                 cmd_memory(rt)
             elif c == "/export":
                 cmd_export(rt, history)
+            elif c == "/scroll":
+                cmd_scroll(rt, history)
             elif c == "/stop":
                 cancel_agent(rt)
                 p_info("stopping...")
