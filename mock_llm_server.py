@@ -89,6 +89,10 @@ def build_response(messages):
 
 
 class Handler(BaseHTTPRequestHandler):
+    @staticmethod
+    def _norm(path):
+        return path.split("?", 1)[0].rstrip("/")
+
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -108,20 +112,60 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def _send_raw(self, code, content_type, body):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_HEAD(self):
+        if self._norm(self.path).endswith("/mock-head"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(b"mock head body\n")))
+            self._cors()
+            self.end_headers()
+        else:
+            self.send_error(405)
+
     def do_GET(self):
-        if self.path.rstrip("/").endswith("/models"):
+        if self._norm(self.path).endswith("/models"):
             self._send_json({"object": "list",
                              "data": [{"id": "mock-model", "object": "model"},
                                       {"id": "another-mock", "object": "model"}]})
-        elif self.path.rstrip("/").endswith("/mock-page"):
-            body = (b"<html><body><h1>Mock Page</h1>"
-                    b"<p>Hello from the offline mock server.</p></body></html>")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(body)))
+        elif self._norm(self.path).endswith("/mock-page"):
+            self._send_raw(200, "text/html",
+                           b"<html><body><h1>Mock Page</h1>"
+                           b"<p>Hello from the offline mock server.</p></body></html>")
+        elif self._norm(self.path).endswith("/mock-head"):
+            self._send_raw(200, "text/plain; charset=utf-8", b"mock head body\n")
+        elif self._norm(self.path).endswith("/mock-redirect"):
+            self.send_response(302)
+            self.send_header("Location", "/mock-page")
+            self.send_header("Content-Length", "0")
             self._cors()
             self.end_headers()
-            self.wfile.write(body)
+        elif self._norm(self.path).endswith("/mock-json"):
+            self._send_json({"status": "ok", "count": 3, "items": [1, 2, 3]})
+        elif self._norm(self.path).endswith("/mock-markdown"):
+            self._send_raw(200, "text/html",
+                           b"<html><body><h1>Mock Markdown</h1>"
+                           b"<p>Hello from the <strong>markdown</strong> page.</p>"
+                           b"<ul><li>First item</li><li>Second item</li></ul>"
+                           b"<a href=\"http://example.com\">Link Text</a>"
+                           b"</body></html>")
+        elif self._norm(self.path).endswith("/mock-search"):
+            self._send_raw(200, "text/html",
+                           b"<html><body>"
+                           b"<div class=\"result\"><a rel=\"nofollow\" href=\"http://example.com/one\">Mock Result One</a>"
+                           b"<span class=\"result-snippet\">This is the first snippet.</span></div>"
+                           b"<div class=\"result\"><a rel=\"nofollow\" href=\"http://example.com/two\">Mock Result Two</a>"
+                           b"<span class=\"result-snippet\">Second snippet here.</span></div>"
+                           b"</body></html>")
+        elif self._norm(self.path).endswith("/mock-download"):
+            self._send_raw(200, "application/octet-stream", b"\x00\x01MOCKBYTES\xff")
         else:
             self._send_json({"error": {"message": "not found"}}, 404)
 
@@ -132,12 +176,15 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._send_json({"error": {"message": "invalid JSON body"}}, 400)
             return
-        if not self.path.rstrip("/").endswith("/chat/completions"):
-            self._send_json({"error": {"message": "not found"}}, 404)
+        if self._norm(self.path).endswith("/chat/completions"):
+            messages = body.get("messages", [])
+            resp = build_response(messages)
+            self._send_json(resp)
             return
-        messages = body.get("messages", [])
-        resp = build_response(messages)
-        self._send_json(resp)
+        if self._norm(self.path).endswith("/mock-post"):
+            self._send_json({"ok": True, "echo": body})
+            return
+        self._send_json({"error": {"message": "not found"}}, 404)
 
 
 if __name__ == "__main__":

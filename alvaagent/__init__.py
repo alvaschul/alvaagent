@@ -60,6 +60,8 @@ from alvaagent.tools import (  # noqa: F401
     tool_self_test, tool_count, classify_python,
     tool_calculator, tool_run_python, tool_web_fetch, tool_get_time,
     tool_run_command,
+    tool_web_head, tool_web_json, tool_web_markdown,
+    tool_web_search, tool_web_download, tool_web_post,
     tool_file_read, tool_file_write, tool_file_edit, tool_file_list,
     tool_file_search,
     tool_todo_list, tool_todo_add, tool_todo_toggle, tool_todo_remove,

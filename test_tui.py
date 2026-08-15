@@ -151,7 +151,7 @@ def _cfg():
 # ---------------- tools -----------------------------------------------------
 
 def test_tools_registered():
-    assert len(pa.TOOLS) == 30
+    assert len(pa.TOOLS) == 36
 
 
 def test_calculator():
@@ -486,6 +486,91 @@ def test_web_fetch():
     wf = pa.tool_web_fetch(rt, BASE + "/mock-page")
     assert wf.get("ok") is True and wf.get("status") == 200
     assert "Mock Page" in wf.get("snippet", "")
+
+
+def test_web_head():
+    _mock_server()
+    rt = mock_rt()
+    _h = pa.tool_web_head(rt, BASE + "/mock-head")
+    assert _h.get("ok") is True and _h.get("status") == 200
+    assert "text/plain" in _h.get("content_type", "")
+    assert _h.get("content_length") == str(len(b"mock head body\n"))
+    # HEAD is rejected (501) -> GET fallback; redirects are followed and the
+    # final URL reported
+    _r = pa.tool_web_head(rt, BASE + "/mock-redirect")
+    assert _r.get("ok") is True and _r.get("status") == 200
+    assert _r.get("url", "").endswith("/mock-page")
+
+
+def test_web_json():
+    _mock_server()
+    rt = mock_rt()
+    _j = pa.tool_web_json(rt, BASE + "/mock-json")
+    assert _j.get("ok") is True and _j.get("status") == 200
+    assert _j.get("data", {}).get("status") == "ok"
+    _sub = pa.tool_web_json(rt, BASE + "/mock-json", "items")
+    assert _sub.get("data") == [1, 2, 3]
+    _miss = pa.tool_web_json(rt, BASE + "/mock-json", "nope")
+    assert _miss.get("ok") is False and "path" in _miss.get("error", "")
+
+
+def test_web_markdown():
+    _mock_server()
+    rt = mock_rt()
+    _m = pa.tool_web_markdown(rt, BASE + "/mock-markdown")
+    assert _m.get("ok") is True and _m.get("status") == 200
+    md = _m.get("markdown", "")
+    assert "# Mock Markdown" in md
+    assert "[Link Text](http://example.com)" in md
+    assert "**markdown**" in md
+
+
+def test_web_search():
+    _mock_server()
+    rt = mock_rt()
+    _orig_req = tools_mod._web_req
+
+    def _local_req(url, **kw):
+        url = url.replace("https://lite.duckduckgo.com/lite/?q=",
+                          BASE + "/mock-search?q=")
+        return _orig_req(url, **kw)
+
+    tools_mod._web_req = _local_req
+    try:
+        _s = pa.tool_web_search(rt, "mock query")
+        assert _s.get("ok") is True and _s.get("count") == 2
+        first = _s.get("results", [])[0]
+        assert first.get("title") == "Mock Result One"
+        assert first.get("url") == "http://example.com/one"
+        assert "first snippet" in first.get("snippet", "")
+        # num_results caps the returned list
+        _one = pa.tool_web_search(rt, "mock query", 1)
+        assert len(_one.get("results", [])) == 1
+    finally:
+        tools_mod._web_req = _orig_req
+
+
+def test_web_download():
+    _mock_server()
+    rt = mock_rt()
+    dest = os.path.join(rt.data_dir, "dl.bin")
+    _d = pa.tool_web_download(rt, BASE + "/mock-download", dest)
+    assert _d.get("ok") is True and _d.get("bytes") == len(b"\x00\x01MOCKBYTES\xff")
+    with open(dest, "rb") as f:
+        assert f.read() == b"\x00\x01MOCKBYTES\xff"
+
+
+def test_web_post():
+    _mock_server()
+    rt = mock_rt()
+    rt.on_permission = lambda desc: True
+    _p = pa.tool_web_post(rt, BASE + "/mock-post", {"hello": "world"})
+    assert _p.get("ok") is True and _p.get("status") == 200
+    assert _p.get("response", {}).get("echo", {}).get("hello") == "world"
+    # headless default denies outbound POSTs
+    _deny = mkrt()
+    _pd = pa.tool_web_post(_deny, BASE + "/mock-post", {})
+    assert _pd.get("ok") is False and "permission" in _pd.get("error", "")
 
 
 def test_fetch_models():
@@ -1224,6 +1309,8 @@ def test_tiered_tools():
         _core_names = {t["function"]["name"] for t in _core}
         assert 0 < len(_core) < len(pa.TOOLS)
         assert "run_command" in _core_names and "calculator" in _core_names
+        assert "web_search" in _core_names and "web_head" in _core_names
+        assert "web_download" not in _core_names and "web_post" not in _core_names
         assert "skill_list" not in _core_names and "self_test" not in _core_names
         rt.tool_mode = "full"
         assert len(pa.visible(rt)) == len(pa.TOOLS)

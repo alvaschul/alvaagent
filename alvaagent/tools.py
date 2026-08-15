@@ -10,7 +10,10 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 
 from alvaagent.client import _STREAM_POLL
 from alvaagent.config import TOOL_MODES, save_state
@@ -357,6 +360,330 @@ def tool_web_fetch(rt, url):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
 
+def _web_req(url, method=None, data=None, headers=None, timeout=20):
+    """Build an http(s) request, or raise ValueError on non-http URLs."""
+    url = str(url).strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("only http/https URLs are allowed")
+    hdrs = {"User-Agent": "alvaagent-tui/1.0", "Accept-Encoding": "identity"}
+    if headers:
+        hdrs.update(headers)
+    return urllib.request.Request(url, data=data, method=method, headers=hdrs)
+
+
+def tool_web_head(rt, url):
+    """Fetch only the response headers of a URL (status, content-type, size,
+    final URL after redirects) without downloading the body."""
+    try:
+        req = _web_req(url, method="HEAD")
+        try:
+            resp = urllib.request.urlopen(req, timeout=20)
+        except urllib.error.HTTPError:
+            # some servers reject HEAD with 405/501; retry as GET but never
+            # read the body - we only need the headers
+            resp = urllib.request.urlopen(_web_req(url), timeout=20)
+        with resp:
+            status = int(resp.getcode())
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+        return {
+            "ok": status < 400, "status": status,
+            "content_type": headers.get("content-type", ""),
+            "content_length": headers.get("content-length", ""),
+            "url": resp.geturl(),
+            "headers": headers,
+        }
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def _json_get(obj, path):
+    """Extract a dotted path from a JSON structure ('items.0.title')."""
+    cur = obj
+    for part in str(path).split("."):
+        part = part.strip()
+        if not part:
+            continue
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        elif isinstance(cur, list) and part.isdigit():
+            cur = cur[int(part)]
+        else:
+            raise KeyError(part)
+    return cur
+
+
+def tool_web_json(rt, url, path=None):
+    """GET a URL and parse its body as JSON, optionally extracting a dotted path."""
+    try:
+        req = _web_req(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            status = int(r.getcode())
+            raw = r.read(1000000).decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        if path:
+            data = _json_get(data, path)
+        snippet = json.dumps(data, indent=2, ensure_ascii=False)
+        if len(snippet) > 2500:
+            snippet = snippet[:2500] + "\n... [truncated]"
+        return {"ok": True, "status": status, "data": data, "snippet": snippet}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "response is not valid JSON: %s" % raw[:200]}
+    except KeyError:
+        return {"ok": False, "error": "path not found in JSON: %s" % path}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+class _MarkdownParser(HTMLParser):
+    """Tolerant HTML -> markdown-ish text converter (stdlib only)."""
+
+    _BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}
+    _HEADING = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
+
+    def __init__(self):
+        super().__init__()
+        self.out = []
+        self._skip = 0
+        self._pre = False
+        self._a_href = None
+        self._list = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in ("script", "style", "noscript", "head", "title"):
+            self._skip += 1
+        elif tag == "pre":
+            self._pre = True
+            self.out.append("\n```\n")
+        elif tag == "code":
+            if not self._pre:
+                self.out.append("`")
+        elif tag in self._HEADING:
+            self.out.append("\n\n" + "#" * self._HEADING[tag] + " ")
+        elif tag in ("ul", "ol"):
+            self._list += 1
+            self.out.append("\n")
+        elif tag == "li":
+            self.out.append("\n" + "  " * self._list + "- ")
+        elif tag == "blockquote":
+            self.out.append("\n> ")
+        elif tag == "table":
+            self.out.append("\n")
+        elif tag == "a":
+            self._a_href = dict(attrs).get("href", "")
+            if self._a_href:
+                self.out.append("[")
+        elif tag in ("strong", "b"):
+            self.out.append("**")
+        elif tag in ("em", "i"):
+            self.out.append("*")
+        elif tag == "img":
+            src = dict(attrs).get("src", "")
+            alt = dict(attrs).get("alt", "")
+            if src:
+                self.out.append("[%s](%s)" % (alt or src, src))
+        elif tag in self._BLOCK:
+            self.out.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("script", "style", "noscript", "head", "title"):
+            self._skip = max(0, self._skip - 1)
+        elif tag == "pre":
+            self._pre = False
+            self.out.append("\n```\n")
+        elif tag == "code":
+            if not self._pre:
+                self.out.append("`")
+        elif tag == "a":
+            if self._a_href:
+                self.out.append("](%s)" % self._a_href)
+            self._a_href = None
+        elif tag in ("strong", "b"):
+            self.out.append("**")
+        elif tag in ("em", "i"):
+            self.out.append("*")
+        elif tag in ("ul", "ol"):
+            self._list = max(0, self._list - 1)
+            self.out.append("\n")
+        elif tag in self._BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if self._pre:
+            self.out.append(data)
+        elif data.strip():
+            self.out.append(data)
+
+    def render(self):
+        text = "".join(self.out)
+        return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", text)).strip()
+
+
+def tool_web_markdown(rt, url):
+    """Fetch a page and convert its HTML to readable markdown."""
+    try:
+        req = _web_req(url)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            status = int(r.getcode())
+            raw = r.read(500000).decode("utf-8", errors="replace")
+        md = _MarkdownParser()
+        md.feed(raw)
+        text = md.render()
+        if len(text) > 8000:
+            text = text[:8000] + "\n... [truncated]"
+        return {"ok": True, "status": status, "chars": len(text), "markdown": text}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+class _SearchParser(HTMLParser):
+    """Extract title/url/snippet triples from DuckDuckGo-lite result HTML."""
+
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._cur = None
+        self._in_title = False
+        self._in_snippet = False
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        a = dict(attrs)
+        if tag == "a":
+            href = a.get("href", "")
+            if href.startswith("http"):
+                if self._cur is not None and not self._in_snippet:
+                    self._finalize()
+                if self._cur is None:
+                    self._cur = {"title": "", "url": href, "snippet": ""}
+                    self._in_title = True
+                    self._buf = []
+        elif tag in ("td", "span") and "result-snippet" in a.get("class", "").split():
+            self._in_snippet = True
+            self._buf = []
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "a" and self._in_title:
+            self._cur["title"] = re.sub(r"\s+", " ", "".join(self._buf)).strip()
+            self._in_title = False
+            self._buf = []
+        elif tag in ("td", "span") and self._in_snippet:
+            self._cur["snippet"] = re.sub(r"\s+", " ", "".join(self._buf)).strip()
+            self._finalize()
+
+    def handle_data(self, data):
+        if self._in_title or self._in_snippet:
+            self._buf.append(data)
+
+    def _finalize(self):
+        if self._cur is not None:
+            self.results.append(self._cur)
+            self._cur = None
+            self._in_snippet = False
+            self._buf = []
+
+    def close(self):
+        self._finalize()
+        super().close()
+
+
+def tool_web_search(rt, query, num_results=5):
+    """Search the web via DuckDuckGo lite (no API key). Returns result triples."""
+    query = str(query or "").strip()
+    if not query:
+        return {"ok": False, "error": "empty query"}
+    try:
+        q = urllib.parse.quote_plus(query)
+        req = _web_req("https://lite.duckduckgo.com/lite/?q=" + q, headers={"Accept": "text/html"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read(500000).decode("utf-8", errors="replace")
+        parser = _SearchParser()
+        parser.feed(raw)
+        parser.close()
+        results = parser.results[:max(0, int(num_results))]
+        return {"ok": True, "query": query, "count": len(results), "results": results}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def tool_web_download(rt, url, path, max_bytes=20 * 1024 * 1024):
+    """Download a URL's bytes to a local file (size-capped, permission-gated)."""
+    path = str(path or "").strip()
+    if not path:
+        return {"ok": False, "error": "empty path"}
+    try:
+        req = _web_req(url)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if classify_file_action(rt, path) == "ask" and not request_permission(rt, "download to file: %s" % path):
+        return {"ok": False, "error": "permission denied by user"}
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            status = int(r.getcode())
+            if status >= 400:
+                return {"ok": False, "status": status, "error": "HTTP %d" % status}
+            data = r.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return {"ok": False, "error": "response exceeds %d byte cap" % max_bytes}
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        tmp = path + ".tmp-%d" % os.getpid()
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        return {"ok": True, "path": path, "bytes": len(data), "status": status}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def tool_web_post(rt, url, data=None):
+    """POST a JSON body to a URL (permission-gated) and parse the response."""
+    try:
+        req = _web_req(url)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not request_permission(rt, "POST to %s" % url):
+        return {"ok": False, "error": "permission denied by user"}
+    try:
+        payload = json.dumps(data if data is not None else {}).encode("utf-8")
+        req = urllib.request.Request(
+            req.full_url, data=payload, method="POST",
+            headers={"User-Agent": "alvaagent-tui/1.0",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            status = int(r.getcode())
+            raw = r.read(500000).decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            parsed = None
+        return {"ok": status < 400, "status": status,
+                "response": parsed if parsed is not None else raw[:2000]}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
 def _safe_factorial(n):
     n = int(n)
     if n < 0 or n > 10000:
@@ -577,6 +904,46 @@ TOOLS = [
             "url": {"type": "string", "description": "The URL to fetch"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
+        "name": "web_head",
+        "description": "Fetch only the HTTP headers of a URL (status code, content-type, content-length, final URL after redirects) without downloading the body. Cheap availability checks and link validation.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "The URL to inspect"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "web_json",
+        "description": "GET a URL and parse its body as JSON (REST/OpenAI-compatible APIs). Returns pretty-printed data; use the path parameter to extract a nested field like 'data.items' or 'items.0.title'.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "The API URL to fetch"},
+            "path": {"type": "string", "description": "Optional dotted path into the JSON structure"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "web_markdown",
+        "description": "Fetch a web page and convert its HTML to readable markdown (headings, links, lists, bold, code preserved). Better than web_fetch for articles and docs pages.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "The URL to fetch"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web via DuckDuckGo (no API key required). Returns the top result titles, URLs and snippets. Use when an answer needs current or external information you don't already have.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "The search query"},
+            "num_results": {"type": "integer", "description": "How many results to return (default 5)"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "web_download",
+        "description": "Download a URL to a local file (binary-safe, capped at 20MB). Writes inside the project folder are allowed; elsewhere asks the user. For images, archives, scripts.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "The URL to download"},
+            "path": {"type": "string", "description": "Absolute destination file path"}},
+            "required": ["url", "path"]}}},
+    {"type": "function", "function": {
+        "name": "web_post",
+        "description": "Send an HTTP POST with a JSON body to a URL (asks the user for permission) and return the parsed response. For interacting with APIs that need a request body.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "The URL to POST to"},
+            "data": {"type": "object", "description": "JSON-serializable object to send as the request body"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
         "name": "get_time",
         "description": "Get the current date and time on the user's device. Use this whenever a task depends on 'now' (timestamps, file ages, scheduling, relative dates like 'tomorrow'). Do not guess the current date from memory.",
         "parameters": {"type": "object", "properties": {}}}},
@@ -745,7 +1112,8 @@ TOOLS = [
 # `/tools` keystroke away. The mode lives on the Runtime (rt.tool_mode) and is
 # persisted via config.json under "tool_mode".
 _CORE_TOOL_NAMES = {
-    "calculator", "run_python", "web_fetch", "get_time",
+    "calculator", "run_python", "web_fetch", "web_head", "web_json",
+    "web_markdown", "web_search", "get_time",
     "memory_save", "memory_recall", "memory_search",
     "todo_add", "todo_list", "todo_toggle",
     "run_command", "file_read", "file_write", "file_list", "file_edit",
@@ -753,6 +1121,7 @@ _CORE_TOOL_NAMES = {
 
 _ADVANCED_TOOL_NAMES = {
     "memory_list", "todo_remove", "file_search",
+    "web_download", "web_post",
     "feedback", "improvement_set", "improvement_list", "improvement_done",
     "self_test", "reflect",
     "skill_list", "skill_read", "skill_save", "skill_remove",
@@ -816,6 +1185,24 @@ class Tools:
 
     def web_fetch(self, args):
         return tool_web_fetch(self.rt, args.get("url"))
+
+    def web_head(self, args):
+        return tool_web_head(self.rt, args.get("url"))
+
+    def web_json(self, args):
+        return tool_web_json(self.rt, args.get("url"), args.get("path"))
+
+    def web_markdown(self, args):
+        return tool_web_markdown(self.rt, args.get("url"))
+
+    def web_search(self, args):
+        return tool_web_search(self.rt, args.get("query"), args.get("num_results"))
+
+    def web_download(self, args):
+        return tool_web_download(self.rt, args.get("url"), args.get("path"))
+
+    def web_post(self, args):
+        return tool_web_post(self.rt, args.get("url"), args.get("data"))
 
     def get_time(self, args):
         return tool_get_time()
@@ -904,6 +1291,12 @@ class Tools:
 
 _TOOL_ERROR_HINTS = {
     "web_fetch": "hint: the URL is unreachable or the site blocks bots; try a different/mobile URL, or run_command('curl -sL <url>') as a fallback",
+    "web_head": "hint: the URL is unreachable or rejects HEAD; try web_fetch to inspect the body",
+    "web_json": "hint: the endpoint returned non-JSON or an error status; check the URL and try web_head first",
+    "web_markdown": "hint: the URL is unreachable; fall back to web_fetch for a plain text version",
+    "web_search": "hint: the search backend is unreachable or blocked; retry, or fall back to web_fetch of a known URL",
+    "web_download": "hint: the URL is unreachable, exceeds the size cap, or the path needs permission; try a smaller URL or a path inside the project folder",
+    "web_post": "hint: the endpoint failed or rejected the request; check the URL and payload, then try again",
     "run_command": "hint: the command was blocked or failed; retry a read-only variant, or ask the user to approve/run it themselves",
     "file_read": "hint: check the absolute path exists and is readable (file_search finds the right path)",
     "file_write": "hint: the path may be outside the project or unwritable; try a path inside the project folder",

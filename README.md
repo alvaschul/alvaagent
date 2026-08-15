@@ -14,8 +14,9 @@ Built for Termux, runs offline-friendly, and survives flaky mobile connections.
 ## Features
 - **Python TUI** (`alvaagent_tui.py` shim → `alvaagent/` package) — stdlib only,
   no dependencies to install.
-- **30 tools** (curated for the model): calculator, sandboxed run_python,
-  web_fetch, get_time, memory save/recall/search/list, todos, shell, file
+- **36 tools** (curated for the model): calculator, sandboxed run_python,
+  web_fetch/web_head/web_json/web_markdown/web_search/web_download/web_post,
+  get_time, memory save/recall/search/list, todos, shell, file
   read/write/edit/list/search, skill save/read/list/remove/install/sync,
   feedback/improvement/reflect, self_test.
 - **Skills from anywhere**: `skill_install` pulls a single skill from a URL
@@ -24,8 +25,8 @@ Built for Termux, runs offline-friendly, and survives flaky mobile connections.
   gated) and imports every `.md` with folder names as categories. Try it in
   chat ("install this repo") or with `/skills install <url>` /
   `/skills sync <repo>`.
-- **Tiered tool selection**: by default the model only sees a curated 15-tool
-  CORE set (computation, memory, todos, shell, files) — not all 30 at once, so
+- **Tiered tool selection**: by default the model only sees a curated 19-tool
+  CORE set (computation, web, memory, todos, shell, files) — not all 36 at once, so
   it mis-picks tools less and answers faster. Advanced meta-tools (skills,
   self-improvement, self_test, reflect) stay one keystroke away:
   `/tools full` advertises everything, `/tools core` reverts, and any advanced
