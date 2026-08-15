@@ -1521,6 +1521,52 @@ def test_cmd_scroll():
     assert "/scroll" in cmds._SLASH_COMMANDS
 
 
+def test_stream_tee_capture():
+    from alvaagent.scrollback import StreamTee
+    from io import StringIO
+    sink = StringIO()
+    tee = StreamTee(stream=sink)
+    tee.write("hello\n")
+    tee.write("\x1b[38;5;45mcolored\x1b[0m line\n")
+    tee.write("partial")
+    assert tee.captured_lines() == ["hello", "\x1b[38;5;45mcolored\x1b[0m line"]
+    assert tee.partial_line() == "partial"
+    assert sink.getvalue() == "hello\n\x1b[38;5;45mcolored\x1b[0m line\npartial"
+
+
+def test_stream_tee_filters_private_modes():
+    from alvaagent.scrollback import StreamTee
+    from io import StringIO
+    sink = StringIO()
+    tee = StreamTee(stream=sink)
+    tee.write("\x1b[?1049h")
+    tee.write("\x1b[?1002h")
+    tee.write("\n")
+    tee.write("banner\n")
+    assert tee.captured_lines() == ["banner"]
+
+
+def test_stream_tee_restore_replays():
+    from alvaagent.scrollback import StreamTee
+    from io import StringIO
+    sink = StringIO()
+    tee = StreamTee(stream=sink)
+    tee.write("line one\nline two\n")
+    tee.restore()
+    out = sink.getvalue()
+    assert "\x1b[2J\x1b[H" in out
+    assert out.count("line one\nline two\n") == 2
+
+
+def test_stream_tee_bounded():
+    from alvaagent.scrollback import StreamTee
+    from io import StringIO
+    tee = StreamTee(stream=StringIO(), max_lines=3)
+    for i in range(6):
+        tee.write("line%d\n" % i)
+    assert tee.captured_lines() == ["line3", "line4", "line5"]
+
+
 def test_cli_smoke():
     # `python3 -m alvaagent` boots and exits cleanly on EOF stdin. Runs with
     # ALVA_DATA_DIR pointed at a temp dir so the REPL never touches the real
