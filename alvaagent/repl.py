@@ -189,12 +189,15 @@ def repl(rt):
     # last completed turn, for /redo (session-scoped so it can't leak across
     # a /session switch)
     rt.last_turn = {"session": None, "text": None, "pre": None}
+    # one tee for the whole run: the screen shown when swiping is what has
+    # actually been printed THIS run (never the resumed past session)
+    global _TEE
+    _TEE = StreamTee()
+    _TEE.install()
+    _reader = None
     while True:
         try:
             prompt = _prompt(rt)
-            global _TEE
-            _TEE = StreamTee()
-            _TEE.install()
             _reader = LineReader(_TEE, _history_file_lines(), prompt=prompt)
             _reader.on_scroll(lambda d: _handle_scroll(d, rt, _reader))
             line = _reader.read_line()
@@ -360,7 +363,7 @@ def repl(rt):
 
 def _handle_scroll(direction, rt, reader):
     """Enter the scroll view; restore the live screen when it exits."""
-    sv = ScrollView(list(rt.history))
+    sv = ScrollView.from_lines(_TEE.captured_lines() if _TEE is not None else [])
     if not sv.total_lines():
         return
     reader.run_scroll_loop(sv, sv.page_count() - 1)

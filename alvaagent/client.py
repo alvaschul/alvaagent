@@ -243,12 +243,18 @@ def chat_completion_stream(rt, messages, config, tools=None):
                 if rt.cancel.is_set():
                     resp.close()
                     raise _Cancelled()
-                rlist, _, _ = select.select([sock], [], [], _STREAM_POLL)
+                try:
+                    rlist, _, _ = select.select([sock], [], [], _STREAM_POLL)
+                except OSError:
+                    rlist = []  # connection already consumed/closed: EOF
+                    break
                 if rlist:
                     break
                 if time.monotonic() - last_byte_at > _STREAM_IDLE_LIMIT:
                     resp.close()
                     raise RuntimeError("LLM stream stalled (no data for %ds)" % _STREAM_IDLE_LIMIT)
+            if not rlist:
+                break  # socket gone (body fully consumed): nothing left to read
         elif rt.cancel.is_set():
             resp.close()
             raise _Cancelled()

@@ -149,6 +149,16 @@ class ScrollView:
         self.rows = rows if rows is not None else size.lines
         self.lines = lines_for_history(history, self.columns)
 
+    @classmethod
+    def from_lines(cls, lines, columns=None, rows=None):
+        """Build a paged view over already-rendered screen lines."""
+        size = shutil.get_terminal_size()
+        sv = cls.__new__(cls)
+        sv.columns = columns if columns is not None else size.columns
+        sv.rows = rows if rows is not None else size.lines
+        sv.lines = list(lines)
+        return sv
+
     def window(self):
         return max(1, self.rows - 2)
 

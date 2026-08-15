@@ -895,6 +895,19 @@ def test_plain_json_fallback():
             urllib.request.urlopen = _orig_urlopen
 
 
+def test_stream_plain_json_real_socket():
+    # A real socket answering with a plain JSON body (the mock ignores
+    # "stream": true). Reading the full Content-Length body closes the
+    # connection, so the client must treat the dead socket as EOF instead of
+    # selecting on it (which raised OSError EBADF -> "Bad file descriptor").
+    rt = mock_rt()
+    cfg = dict(rt.cfg)
+    cfg["base_url"] = BASE + "/v1"
+    events = list(client_mod.chat_completion_stream(
+        rt, [{"role": "user", "content": "hi [plain]"}], cfg))
+    assert events == [("PLAIN_OK this is a direct answer, no tools were used.", None)], events
+
+
 # ---------------- UX: dead turns -------------------------------------------
 
 def test_dead_turn_no_ghost_messages():
@@ -1844,27 +1857,60 @@ def test_scroll_loop_paging():
         pass
 
 
+def test_scroll_from_lines():
+    # ScrollView.from_lines pages already-rendered screen lines verbatim
+    # (no conversation wrapping) - the source the swipe view is built from.
+    script = (
+        "import os\n"
+        "import sys\n"
+        "from alvaagent.scrollback import StreamTee, LineReader, ScrollView\n"
+        "tee = StreamTee()\n"
+        "sys.stdout = tee\n"
+        "r = LineReader(tee, [], prompt='> ')\n"
+        "sv = ScrollView.from_lines(['line %d' % i for i in range(20)], columns=40, rows=10)\n"
+        "assert sv.total_lines() == 20, sv.total_lines()\n"
+        "assert sv.page_count() == 3, sv.page_count()\n"
+        "assert 'line 0' in sv.page_text(0), sv.page_text(0)\n"
+        "assert 'line 17' not in sv.page_text(0), sv.page_text(0)\n"
+        "os.write(1, b'DONE\\n')\n"
+    )
+    pid, fd = _pty_run(script)
+    out = _pty_drain_until(fd, b"DONE", 8.0)
+    assert b"DONE" in out, out[-300:]
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
 def test_scroll_e2e():
-    # Boot the real app with a seeded session, feed a wheel-up (swipe up)
-    # event, expect the scroll view with older content, then Enter to
-    # return to live, then /exit.
+    # Boot the real app against the offline mock server with a seeded PAST
+    # session, send one real message so the screen holds this run's content,
+    # then feed a wheel-up (swipe up) event: the scroll view must page through
+    # exactly what was printed THIS run - never the seeded past session.
+    # Enter returns to live, then /exit.
     data_dir = tempfile.mkdtemp(prefix="alva_scrolle2e_")
     _TMP_DIRS.append(data_dir)
     store = {
         "alvaagent.sessions": {
-            "test": {"name": "test", "created": "2026-08-15T00:00:00",
+            "past": {"name": "past", "created": "2026-08-15T00:00:00",
                      "updated": "2026-08-15T00:00:00",
                      "messages": [
-                         {"role": "user", "content": "old question"},
-                         {"role": "assistant", "content": "old answer"},
-                         {"role": "user", "content": "new question"},
-                         {"role": "assistant", "content": "new answer"},
+                         {"role": "user", "content": "PAST_SESSION_CONTENT_XXX"},
                      ]}
         },
-        "alvaagent.active_session": "test",
+        "alvaagent.active_session": "default",
     }
     with open(os.path.join(data_dir, "store.json"), "w") as f:
         json.dump(store, f)
+    with open(os.path.join(data_dir, "config.json"), "w") as f:
+        json.dump({"provider": "mock", "base_url": BASE + "/v1",
+                   "api_key": "test-key", "model": "mock-model",
+                   "temperature": 0.5}, f)
     env = dict(os.environ)
     env["ALVA_DATA_DIR"] = data_dir
     pid, fd = pty.fork()
@@ -1877,10 +1923,16 @@ def test_scroll_e2e():
     try:
         out += _pty_drain_until(fd, b"> ", 15.0)
         assert b"> " in out, out[-400:]  # prompt live
+        assert b"PAST_SESSION_CONTENT_XXX" not in out, out[-400:]
+        os.write(fd, b"hello [plain]\n")  # a real turn against the mock server
+        out += _pty_drain_until(fd, b"PLAIN_OK", 20.0)
+        assert b"PLAIN_OK" in out, out[-800:]  # answer streamed onto the screen
+        out += _pty_drain_until(fd, b"> ", 10.0)  # live prompt after the turn
         os.write(fd, b"\x1b[<64;1;1M")  # wheel up == swipe up on Termux
         out += _pty_drain(fd, 3.0)
-        assert b"old question" in out, out[-800:]
-        assert b"old answer" in out, out[-800:]
+        assert b"hello [plain]" in out, out[-800:]  # user turn printed this run
+        assert b"PLAIN_OK" in out, out[-800:]       # streamed answer printed this run
+        assert b"PAST_SESSION_CONTENT_XXX" not in out, out[-800:]  # not past history
         os.write(fd, b"\r")             # Enter: return to live
         out += _pty_drain_until(fd, b"> ", 4.0)
         assert b"> " in out[-400:], out[-400:]  # live prompt restored
