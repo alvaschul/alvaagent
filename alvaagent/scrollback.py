@@ -61,3 +61,32 @@ class StreamTee:
         for line in self._lines:
             self._orig.write(line + "\n")
         self._orig.flush()
+
+
+MOUSE_ENABLE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+MOUSE_DISABLE = "\x1b[?1000l\x1b[?1002l\x1b[?1006l"
+
+
+def parse_mouse(esc):
+    """Parse an SGR mouse sequence into a dict, or return None."""
+    if isinstance(esc, str):
+        esc = esc.encode("utf-8")
+    if not esc.startswith(b"\x1b[<") or esc[-1:] not in (b"M", b"m"):
+        return None
+    body = esc[3:-1]
+    if not body or not all(c in b"0123456789;" for c in body):
+        return None
+    parts = [int(p) for p in body.split(b";")]
+    if len(parts) != 3:
+        return None
+    button, col, row = parts
+    return {"button": button, "col": col, "row": row,
+            "kind": "press" if esc[-1:] == b"M" else "release"}
+
+
+def is_wheel_up(ev):
+    return bool(ev) and ev["button"] == WHEEL_UP
+
+
+def is_wheel_down(ev):
+    return bool(ev) and ev["button"] == WHEEL_DOWN

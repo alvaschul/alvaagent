@@ -1567,6 +1567,20 @@ def test_stream_tee_bounded():
     assert tee.captured_lines() == ["line3", "line4", "line5"]
 
 
+def test_mouse_parse():
+    from alvaagent.scrollback import (parse_mouse, is_wheel_up, is_wheel_down)
+    up = parse_mouse(b"\x1b[<64;20;5M")
+    assert up == {"button": 64, "col": 20, "row": 5, "kind": "press"}
+    assert is_wheel_up(up) and not is_wheel_down(up)
+    down = parse_mouse(b"\x1b[<65;20;5M")
+    assert is_wheel_down(down)
+    rel = parse_mouse(b"\x1b[<0;1;1m")
+    assert rel["kind"] == "release" and rel["button"] == 0
+    assert parse_mouse(b"garbage") is None
+    assert parse_mouse(b"\x1b[<64;x;5M") is None
+    assert parse_mouse(b"\x1b[<64;20;5X") is None
+
+
 def test_cli_smoke():
     # `python3 -m alvaagent` boots and exits cleanly on EOF stdin. Runs with
     # ALVA_DATA_DIR pointed at a temp dir so the REPL never touches the real
