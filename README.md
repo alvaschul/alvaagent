@@ -111,7 +111,9 @@ Slash commands: `/help /config /provider /models /test /tools /trace /todos
 /export /scroll /stop /exit`. `Ctrl+C` cancels a running request; Tab completes slash
 commands. `/tools` lists what the model can currently see (and `/tools full` /
 `/tools core` switch the advertised set); `/trace [n]` shows the last n agent
-turns.
+turns. Touch-swipe (or mouse-wheel) up while at the prompt opens a scroll view
+of the conversation inside the same screen; swipe down or press Enter to return
+to the live chat.
 **Command history persists across restarts** (up-arrow recalls previous inputs) —
 stored in `.alvaagent/cmd_history.txt`.
 

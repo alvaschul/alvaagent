@@ -1738,6 +1738,60 @@ def test_line_reader_eof_and_interrupt():
         pass
 
 
+def test_scroll_e2e():
+    # Boot the real app with a seeded session, feed a wheel-up (swipe up)
+    # event, expect the scroll view with older content, then Enter to
+    # return to live, then /exit.
+    data_dir = tempfile.mkdtemp(prefix="alva_scrolle2e_")
+    _TMP_DIRS.append(data_dir)
+    store = {
+        "alvaagent.sessions": {
+            "test": {"name": "test", "created": "2026-08-15T00:00:00",
+                     "updated": "2026-08-15T00:00:00",
+                     "messages": [
+                         {"role": "user", "content": "old question"},
+                         {"role": "assistant", "content": "old answer"},
+                         {"role": "user", "content": "new question"},
+                         {"role": "assistant", "content": "new answer"},
+                     ]}
+        },
+        "alvaagent.active_session": "test",
+    }
+    with open(os.path.join(data_dir, "store.json"), "w") as f:
+        json.dump(store, f)
+    env = dict(os.environ)
+    env["ALVA_DATA_DIR"] = data_dir
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir("/data/data/com.termux/files/home/alvaagent")
+        os.execve(sys.executable, [sys.executable, "-m", "alvaagent"], env)
+        os._exit(127)
+    os.set_blocking(fd, False)
+    out = b""
+    try:
+        out += _pty_drain_until(fd, b"> ", 15.0)
+        assert b"> " in out, out[-400:]  # prompt live
+        os.write(fd, b"\x1b[<64;1;1M")  # wheel up == swipe up on Termux
+        out += _pty_drain(fd, 3.0)
+        assert b"old question" in out, out[-800:]
+        assert b"old answer" in out, out[-800:]
+        os.write(fd, b"\r")             # Enter: return to live
+        out += _pty_drain_until(fd, b"> ", 4.0)
+        assert b"> " in out[-400:], out[-400:]  # live prompt restored
+        os.write(fd, b"/exit\n")
+        out += _pty_drain_until(fd, b"bye", 5.0)
+        assert b"bye" in out, out[-400:]
+    finally:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except OSError:
+            pass
+
+
 def test_cli_smoke():
     # `python3 -m alvaagent` boots and exits cleanly on EOF stdin. Runs with
     # ALVA_DATA_DIR pointed at a temp dir so the REPL never touches the real

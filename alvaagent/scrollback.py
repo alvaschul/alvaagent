@@ -198,6 +198,10 @@ class LineReader:
 
     def _emit(self, s):
         self._tee.write(s)
+        try:
+            self._tee.flush()
+        except Exception:
+            pass
 
     def _redraw(self, buf):
         self._emit("\r\x1b[K" + self._prompt + buf)
@@ -228,7 +232,13 @@ class LineReader:
 
     def read_line(self):
         buf = ""
-        raw = enter_raw(0)
+        try:
+            raw = enter_raw(0)
+        except (OSError, termios.error):
+            # Not a tty (piped/redirected stdin): fall back to input() so the
+            # REPL still works headlessly.
+            return input(self._prompt)
+        self._emit(self._prompt)
         try:
             while True:
                 b = self._read_byte()

@@ -31,6 +31,8 @@ from alvaagent.commands import (
 )
 from alvaagent.util import _fmt_k
 import alvaagent.tui as _tui
+from alvaagent.scrollback import (StreamTee, LineReader, ScrollView,
+                                  MOUSE_ENABLE, MOUSE_DISABLE)
 # ---------------- REPL ----------------
 
 
@@ -64,6 +66,25 @@ def save_completion_history():
         readline.write_history_file(HISTORY_PATH)
     except Exception:
         pass
+
+
+_TEE = None
+
+
+def _history_file_lines():
+    """Load persisted input history as plain lines (for the LineReader)."""
+    lines = []
+    try:
+        if os.path.exists(HISTORY_PATH):
+            with open(HISTORY_PATH, encoding="utf-8") as f:
+                lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+    except Exception:
+        pass
+    return lines
+
+
+def _prompt(rt):
+    return col(_tui.CUR_SKIN["accent"], "> ") if COLOR else "> "
 
 
 def _slash_complete(text, state):
@@ -170,8 +191,13 @@ def repl(rt):
     rt.last_turn = {"session": None, "text": None, "pre": None}
     while True:
         try:
-            prompt = col(_tui.CUR_SKIN["accent"], "> ") if COLOR else "> "
-            line = input(prompt)
+            prompt = _prompt(rt)
+            global _TEE
+            _TEE = StreamTee()
+            _TEE.install()
+            _reader = LineReader(_TEE, _history_file_lines(), prompt=prompt)
+            _reader.on_scroll(lambda d: _handle_scroll(d, rt, _reader))
+            line = _reader.read_line()
         except EOFError:
             print()
             save_completion_history()
@@ -332,6 +358,16 @@ def repl(rt):
     print(col(C.DIM, "bye"))
 
 
+def _handle_scroll(direction, rt, reader):
+    """Enter the scroll view; restore the live screen when it exits."""
+    sv = ScrollView(list(rt.history))
+    if not sv.total_lines():
+        return
+    reader.run_scroll_loop(sv, sv.page_count() - 1)
+    if _TEE is not None:
+        _TEE.restore()
+
+
 def main():
     rt = build_runtime()
     rt.on_permission = lambda desc: ask_permission(rt, desc)  # interactive y/N for risky actions
@@ -348,6 +384,7 @@ def main():
             return
         _restored.set()
         try:
+            sys.stdout.write(MOUSE_DISABLE)
             sys.stdout.write("\x1b[?1049l")
             sys.stdout.write("\n")
             sys.stdout.flush()
@@ -379,6 +416,8 @@ def main():
     sys.stdout.flush()
     try:
         banner(rt)
+        sys.stdout.write(MOUSE_ENABLE)
+        sys.stdout.flush()
         repl(rt)
     finally:
         _cleanup()
