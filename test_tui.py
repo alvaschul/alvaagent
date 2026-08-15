@@ -1568,6 +1568,18 @@ def test_stream_tee_bounded():
     assert tee.captured_lines() == ["line3", "line4", "line5"]
 
 
+def test_stream_tee_write_direct_not_captured():
+    from alvaagent.scrollback import StreamTee
+    from io import StringIO
+    sink = StringIO()
+    tee = StreamTee(stream=sink)
+    tee.write("live\n")
+    tee.write_direct("scroll page\n")
+    tee.write("after\n")
+    assert tee.captured_lines() == ["live", "after"]
+    assert sink.getvalue() == "live\nscroll page\nafter\n"
+
+
 def test_mouse_parse():
     from alvaagent.scrollback import (parse_mouse, is_wheel_up, is_wheel_down)
     up = parse_mouse(b"\x1b[<64;20;5M")
@@ -1728,6 +1740,89 @@ def test_line_reader_eof_and_interrupt():
     os.write(fd, b"\x04")
     out += _pty_drain_until(fd, b"GOT-EOF", 5.0)
     assert b"GOT-EOF" in out, out[-500:]
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
+def test_line_reader_x10_noleak():
+    # Termux can deliver X10 mouse events: \x1bM + 3 bytes. The reader must
+    # consume the whole sequence so no trailing bytes leak into the input
+    # echo as printable garbage.
+    script = (
+        "import os\n"
+        "import sys\n"
+        "from alvaagent.scrollback import StreamTee, LineReader\n"
+        "os.write(1, b'READY\\n')\n"
+        "tee = StreamTee(stream=sys.stdout)\n"
+        "sys.stdout = tee\n"
+        "r = LineReader(tee, [], prompt='> ')\n"
+        "line = r.read_line()\n"
+        "os.write(1, b'RESULT=' + repr(line).encode() + b'\\n')\n"
+        "os.write(1, b'CAP=' + repr(tee.captured_lines()).encode() + b'\\n')\n"
+    )
+    pid, fd = _pty_run(script)
+    out = _pty_drain_until(fd, b"READY", 8.0)
+    assert b"READY" in out, out[-500:]
+    assert _pty_wait_raw(fd, 8.0)
+    os.write(fd, b"\x1bM\x61\x20\x21")  # X10 sequence ending in 'a', ' ', '!'
+    os.write(fd, b"ok\n")
+    out += _pty_drain_until(fd, b"CAP=", 5.0)
+    assert b"RESULT='ok'" in out, out[-500:]
+    assert b"a !" not in out, out[-500:]  # leaked bytes would be echoed
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
+def test_scroll_loop_paging():
+    # Wheel up (swipe up) moves to older pages, wheel down to newer pages,
+    # Enter returns to live; the footer page number must track the motion.
+    script = (
+        "import os\n"
+        "import sys\n"
+        "from alvaagent.scrollback import StreamTee, LineReader, ScrollView\n"
+        "tee = StreamTee()\n"
+        "sys.stdout = tee\n"
+        "r = LineReader(tee, [], prompt='> ')\n"
+        "hist = []\n"
+        "for i in range(30):\n"
+        "    hist.append({'role': 'user', 'content': 'question %d' % i})\n"
+        "    hist.append({'role': 'assistant', 'content': 'answer %d' % i})\n"
+        "sv = ScrollView(hist, columns=40, rows=12)\n"
+        "r.run_scroll_loop(sv, sv.page_count() - 1)\n"
+        "os.write(1, b'DONE\\n')\n"
+    )
+    pid, fd = _pty_run(script)
+    assert _pty_wait_raw(fd, 8.0)
+
+    def page_num(buf):
+        return int(buf.rsplit(b"page ", 1)[-1].split(b"/", 1)[0])
+
+    out = _pty_drain(fd, 1.5)
+    p0 = page_num(out)
+    assert p0 >= 2, out[-300:]
+    os.write(fd, b"\x1b[<64;1;1M")  # wheel up == swipe up -> older
+    out += _pty_drain(fd, 1.0)
+    p1 = page_num(out)
+    assert p1 == p0 - 1, (p0, p1, out[-300:])
+    os.write(fd, b"\x1b[<65;1;1M")  # wheel down == swipe down -> newer
+    out += _pty_drain(fd, 1.0)
+    p2 = page_num(out)
+    assert p2 == p1 + 1, (p1, p2, out[-300:])
+    os.write(fd, b"\r")
+    out += _pty_drain_until(fd, b"DONE", 3.0)
+    assert b"DONE" in out, out[-300:]
     try:
         os.kill(pid, 15)
     except OSError:

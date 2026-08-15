@@ -49,6 +49,13 @@ class StreamTee:
     def flush(self):
         self._orig.flush()
 
+    def write_direct(self, s):
+        """Write to the underlying stream without capturing (scroll views)."""
+        if isinstance(s, bytes):
+            s = s.decode("utf-8", "replace")
+        self._orig.write(s)
+        self._orig.flush()
+
     def captured_lines(self):
         return list(self._lines)
 
@@ -219,15 +226,38 @@ class LineReader:
         return b
 
     def _collect_escape(self):
-        """Gather a CSI/mouse sequence; return bytes or None."""
+        """Gather a complete escape sequence; return bytes or None.
+
+        Handles CSI (\\x1b[...final), X10 mouse (\\x1bM + 3 bytes), SS3
+        (\\x1bO + 1 byte) and bare \\x1b+char so no trailing bytes can leak
+        back into the printable-echo path.
+        """
         seq = b"\x1b"
-        for _ in range(32):
-            b = self._read_byte()
-            if not b:
+        b = self._read_byte()
+        if not b:
+            return None
+        seq += b
+        if b == b"M":                       # X10 mouse: 3 more bytes
+            for _ in range(3):
+                nb = self._read_byte()
+                if not nb:
+                    break
+                seq += nb
+            return seq
+        if b == b"O":                       # SS3 (application keypad)
+            nb = self._read_byte()
+            if nb:
+                seq += nb
+            return seq
+        if b != b"[":
+            return seq                      # Alt+key or bare escape
+        for _ in range(31):                 # CSI until the final byte
+            nb = self._read_byte()
+            if not nb:
                 return None
-            seq += b
-            if b in (b"M", b"m", b"A", b"B", b"C", b"D", b"~", b"H", b"F", b"Z"):
-                break
+            seq += nb
+            if 0x40 <= nb[0] <= 0x7e:
+                return seq
         return seq
 
     def read_line(self):
@@ -238,8 +268,9 @@ class LineReader:
             # Not a tty (piped/redirected stdin): fall back to input() so the
             # REPL still works headlessly.
             return input(self._prompt)
-        self._emit(self._prompt)
+        self._emit(MOUSE_ENABLE)
         try:
+            self._emit(self._prompt)
             while True:
                 b = self._read_byte()
                 if not b:
@@ -305,33 +336,22 @@ class LineReader:
                     buf += s
                     self._emit(s)
         finally:
+            self._emit(MOUSE_DISABLE)
             leave_raw(0, raw)
 
     def _handle_mouse(self, ev):
         h = self._scroll_handler
+        if ev["kind"] != "press" or (ev["button"] & 32):
+            return
         if is_wheel_up(ev):
             h("older")
-        elif is_wheel_down(ev):
-            h("newer")
-        elif ev["kind"] == "press" and ev["row"] >= self._rows_for_scroll():
-            if ev["col"] <= 8:
-                h("older")
-            elif ev["col"] >= self._columns - 8:
-                h("newer")
-            else:
-                h("return")
-
-    def _rows_for_scroll(self):
-        try:
-            return shutil.get_terminal_size().lines
-        except Exception:
-            return 24
 
     def run_scroll_loop(self, scroll_view, page):
         raw = enter_raw(0)
+        last = scroll_view.page_count() - 1
         try:
             while True:
-                self._emit("\x1b[H\x1b[2J" + scroll_view.page_text(page))
+                self._tee.write_direct("\x1b[H\x1b[2J" + scroll_view.page_text(page))
                 b = self._read_byte()
                 if not b:
                     continue
@@ -343,18 +363,33 @@ class LineReader:
                     return page
                 if b == b"\x1b":
                     seq = self._collect_escape()
+                    if seq == b"\x1b[A":
+                        page = max(page - 1, 0)
+                        continue
+                    if seq == b"\x1b[B":
+                        page = min(page + 1, last)
+                        continue
                     ev = parse_mouse(seq)
                     if ev is not None:
-                        if is_wheel_up(ev) or (ev["kind"] == "press" and ev["col"] <= 8):
-                            page = min(page + 1, scroll_view.page_count() - 1)
-                        elif is_wheel_down(ev) or (ev["kind"] == "press" and ev["col"] >= self._columns - 8):
+                        btn = ev["button"]
+                        motion = bool(btn & 32)
+                        if ev["kind"] != "press" or motion:
+                            continue
+                        if btn == WHEEL_UP:
                             page = max(page - 1, 0)
-                        elif ev["kind"] == "press":
-                            return page
-                elif b == b"\x1b[A":
-                    page = min(page + 1, scroll_view.page_count() - 1)
-                elif b == b"\x1b[B":
-                    page = max(page - 1, 0)
+                        elif btn == WHEEL_DOWN:
+                            if page >= last:
+                                return page
+                            page = min(page + 1, last)
+                        elif btn == 0:
+                            if ev["row"] >= scroll_view.rows - 1 and ev["col"] <= 8:
+                                page = max(page - 1, 0)
+                            elif ev["row"] >= scroll_view.rows - 1 and ev["col"] >= scroll_view.columns - 8:
+                                if page >= last:
+                                    return page
+                                page = min(page + 1, last)
+                            else:
+                                return page
         finally:
             leave_raw(0, raw)
 

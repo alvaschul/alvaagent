@@ -32,7 +32,7 @@ from alvaagent.commands import (
 from alvaagent.util import _fmt_k
 import alvaagent.tui as _tui
 from alvaagent.scrollback import (StreamTee, LineReader, ScrollView,
-                                  MOUSE_ENABLE, MOUSE_DISABLE)
+                                  MOUSE_DISABLE)
 # ---------------- REPL ----------------
 
 
@@ -416,8 +416,6 @@ def main():
     sys.stdout.flush()
     try:
         banner(rt)
-        sys.stdout.write(MOUSE_ENABLE)
-        sys.stdout.flush()
         repl(rt)
     finally:
         _cleanup()
