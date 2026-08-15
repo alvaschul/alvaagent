@@ -1581,6 +1581,37 @@ def test_mouse_parse():
     assert parse_mouse(b"\x1b[<64;20;5X") is None
 
 
+def test_scroll_view_wrap():
+    from alvaagent.scrollback import wrap_to
+    assert wrap_to("one two three four", 10) == ["one two", "three four"]
+    long_word = "x" * 30
+    assert wrap_to("a " + long_word, 10) == ["a", long_word[:10], long_word[10:20], long_word[20:30]]
+
+
+def test_scroll_view_pages():
+    from alvaagent.scrollback import ScrollView
+    history = [{"role": "user", "content": "hello"},
+               {"role": "assistant", "content": "a" * 60}]
+    sv = ScrollView(history, columns=20, rows=12)
+    assert sv.window() == 10
+    assert sv.total_lines() > 0
+    assert sv.page_count() >= 1
+    page0 = sv.page_text(0)
+    assert "## you" in page0
+    assert "hello" in page0
+    assert "page 1/%d" % sv.page_count() in page0
+    assert "◀ older" in page0 and "▼ newer" in page0 and "⏎ return" in page0
+    lines = page0.split("\n")
+    assert len(lines) == sv.window() + 1
+
+
+def test_scroll_view_empty():
+    from alvaagent.scrollback import ScrollView
+    sv = ScrollView([], columns=20, rows=12)
+    assert sv.page_count() == 1
+    assert "⏎ return" in sv.page_text(0)
+
+
 def test_cli_smoke():
     # `python3 -m alvaagent` boots and exits cleanly on EOF stdin. Runs with
     # ALVA_DATA_DIR pointed at a temp dir so the REPL never touches the real
