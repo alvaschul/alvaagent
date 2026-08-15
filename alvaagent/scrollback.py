@@ -75,9 +75,13 @@ MOUSE_DISABLE = "\x1b[?1000l\x1b[?1002l\x1b[?1006l"
 
 
 def parse_mouse(esc):
-    """Parse an SGR mouse sequence into a dict, or return None."""
+    """Parse an SGR or X10 mouse sequence into a dict, or return None."""
     if isinstance(esc, str):
         esc = esc.encode("utf-8")
+    if esc.startswith(b"\x1b[M") and len(esc) == 6:
+        button, col, row = esc[3] - 32, esc[4] - 32, esc[5] - 32
+        return {"button": button, "col": col, "row": row,
+                "kind": "release" if button == 3 else "press"}
     if not esc.startswith(b"\x1b[<") or esc[-1:] not in (b"M", b"m"):
         return None
     body = esc[3:-1]
@@ -228,7 +232,7 @@ class LineReader:
     def _collect_escape(self):
         """Gather a complete escape sequence; return bytes or None.
 
-        Handles CSI (\\x1b[...final), X10 mouse (\\x1bM + 3 bytes), SS3
+        Handles CSI (\\x1b[...final), X10 mouse (\\x1b[M + 3 bytes), SS3
         (\\x1bO + 1 byte) and bare \\x1b+char so no trailing bytes can leak
         back into the printable-echo path.
         """
@@ -237,13 +241,6 @@ class LineReader:
         if not b:
             return None
         seq += b
-        if b == b"M":                       # X10 mouse: 3 more bytes
-            for _ in range(3):
-                nb = self._read_byte()
-                if not nb:
-                    break
-                seq += nb
-            return seq
         if b == b"O":                       # SS3 (application keypad)
             nb = self._read_byte()
             if nb:
@@ -251,7 +248,18 @@ class LineReader:
             return seq
         if b != b"[":
             return seq                      # Alt+key or bare escape
-        for _ in range(31):                 # CSI until the final byte
+        nxt = self._read_byte()             # first byte after CSI '['
+        if not nxt:
+            return None
+        seq += nxt
+        if nxt == b"M":                     # X10 mouse: 3 more bytes
+            for _ in range(3):
+                nb = self._read_byte()
+                if not nb:
+                    break
+                seq += nb
+            return seq
+        for _ in range(30):                 # CSI until the final byte
             nb = self._read_byte()
             if not nb:
                 return None

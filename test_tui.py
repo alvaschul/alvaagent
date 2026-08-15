@@ -1592,6 +1592,13 @@ def test_mouse_parse():
     assert parse_mouse(b"garbage") is None
     assert parse_mouse(b"\x1b[<64;x;5M") is None
     assert parse_mouse(b"\x1b[<64;20;5X") is None
+    x10up = parse_mouse(b"\x1b[M\x60\x21\x21")  # X10 wheel up @ (1,1)
+    assert x10up == {"button": 64, "col": 1, "row": 1, "kind": "press"}
+    assert is_wheel_up(x10up)
+    x10down = parse_mouse(b"\x1b[M\x61\x21\x21")  # X10 wheel down @ (1,1)
+    assert is_wheel_down(x10down)
+    x10release = parse_mouse(b"\x1b[M\x23\x21\x21")  # X10 button 3 = release
+    assert x10release["kind"] == "release"
 
 
 def test_scroll_view_wrap():
@@ -1751,9 +1758,9 @@ def test_line_reader_eof_and_interrupt():
 
 
 def test_line_reader_x10_noleak():
-    # Termux can deliver X10 mouse events: \x1bM + 3 bytes. The reader must
-    # consume the whole sequence so no trailing bytes leak into the input
-    # echo as printable garbage.
+    # Termux falls back to X10 mouse events (ESC [ M + 3 bytes) when SGR
+    # (1006) is not in effect. The reader must consume the whole sequence so
+    # no trailing bytes leak into the input echo as printable garbage.
     script = (
         "import os\n"
         "import sys\n"
@@ -1762,19 +1769,23 @@ def test_line_reader_x10_noleak():
         "tee = StreamTee(stream=sys.stdout)\n"
         "sys.stdout = tee\n"
         "r = LineReader(tee, [], prompt='> ')\n"
+        "hits = []\n"
+        "r.on_scroll(hits.append)\n"
         "line = r.read_line()\n"
         "os.write(1, b'RESULT=' + repr(line).encode() + b'\\n')\n"
+        "os.write(1, b'HITS=' + repr(hits).encode() + b'\\n')\n"
         "os.write(1, b'CAP=' + repr(tee.captured_lines()).encode() + b'\\n')\n"
     )
     pid, fd = _pty_run(script)
     out = _pty_drain_until(fd, b"READY", 8.0)
     assert b"READY" in out, out[-500:]
     assert _pty_wait_raw(fd, 8.0)
-    os.write(fd, b"\x1bM\x61\x20\x21")  # X10 sequence ending in 'a', ' ', '!'
+    os.write(fd, b"\x1b[M\x60\x21\x21")  # X10 wheel up @ (1,1); leaks '`', '!', '!'
     os.write(fd, b"ok\n")
     out += _pty_drain_until(fd, b"CAP=", 5.0)
     assert b"RESULT='ok'" in out, out[-500:]
-    assert b"a !" not in out, out[-500:]  # leaked bytes would be echoed
+    assert b"!`" not in out and b"`!" not in out, out[-500:]
+    assert b"HITS=['older']" in out, out[-500:]  # wheel-up triggered a scroll
     try:
         os.kill(pid, 15)
     except OSError:
