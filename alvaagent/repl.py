@@ -338,10 +338,9 @@ def main():
     rt.on_tool = lambda t_id, n, a, r, s: on_tool(rt, t_id, n, a, r, s)  # live tool-progress blocks
     setup_completion()
 
-    # Guarantee screen restoration even on SIGTERM / OOM kill / crash.
-    # SIGTERM and SIGINT both route through _cleanup so the alternate-screen
-    # escape always lands; without this, `kill` from another session leaves the
-    # stale TUI buffer on screen (the issue the user hit).
+    # _cleanup is idempotent and always runs (even on SIGTERM / OOM / crash) so
+    # the shell prompt is left on a clean line; the guard event makes repeated
+    # cleanup from signal + finally harmless.
     _restored = threading.Event()
 
     def _cleanup(signum=None, frame=None):
