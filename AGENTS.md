@@ -8,8 +8,11 @@ globals are banned except `tui.py`'s current-skin (`CUR_SKIN`).
 
 ## Commands
 - **Run all tests**: `python3 test_tui.py`. Not pytest — it's a flat script
-  that runs every check sequentially, spawns `mock_llm_server.py` (port 8210)
-  itself, and uses per-test temp data dirs. Success = `ALL TESTS PASSED ✓`.
+  that runs every check sequentially, starts its own mock server on an
+  OS-assigned loopback port, and uses per-test temp data dirs. The server is
+  stopped and reaped at cleanup. Success = `ALL TESTS PASSED ✓`.
+- **CI**: `.github/workflows/tests.yml` runs Python `compileall`, `bash -n` on
+  both launchers, and the full test script for pushes and pull requests.
 - **In-app checks**: `/self-test` (offline, no network) and `/test` (hits the
   active provider's `/models`).
 - **Launch**: `python3 alvaagent_tui.py`, `python3 -m alvaagent`,

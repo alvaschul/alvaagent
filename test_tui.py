@@ -14,8 +14,8 @@ standalone via a bundled runner:
 
 Runtimes are fully isolated: every test builds its own Runtime through
 `mkrt()` (a fresh temp data dir) so stores, config, skills and trace logs can
-never collide. The mock LLM server is started lazily on first use and reused
-for the whole process.
+never collide. The mock LLM server is started lazily on an OS-assigned port,
+owned by this process, reused for the suite, and stopped during cleanup.
 """
 import atexit
 import builtins
@@ -31,17 +31,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
-
-PORT = 8210
-BASE = "http://127.0.0.1:%d" % PORT
-MOCK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mock_llm_server.py")
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PORT = None
+BASE = None
+MOCK = os.path.join(ROOT, "mock_llm_server.py")
 
 import alvaagent as pa
+from alvaagent import _PY_MAX_CHARS
 import alvaagent.agent as agent_mod
 import alvaagent.client as client_mod
+import alvaagent.commands as commands_mod
 import alvaagent.config as config_mod
 import alvaagent.skills as skills_mod
 import alvaagent.tools as tools_mod
@@ -51,84 +55,70 @@ import alvaagent.util as util_mod
 repl_mod = sys.modules["alvaagent.repl"]
 
 # ---------------- helpers ---------------------------------------------------
-
 _TMP_DIRS = []
 _server = {"proc": None}
 
 
 def _stop_server():
+    global PORT, BASE
     proc = _server["proc"]
     if proc is not None:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()
     _server["proc"] = None
-    _kill_strays()
-
-
-class _AdoptedServer:
-    """Cache placeholder for a healthy mock server we did not start (an orphan
-    from an interrupted run). poll() reports alive so the singleton keeps it
-    for the rest of the process instead of restarting it."""
-
-    def poll(self):
-        return None
-
-
-def _server_alive():
-    """True when something is already answering as a mock server on PORT."""
-    try:
-        with urllib.request.urlopen(BASE + "/models", timeout=1) as r:
-            return r.getcode() == 200
-    except Exception:
-        return False
-
-
-def _kill_strays():
-    """Best-effort: kill any mock server process from an earlier run that may
-    still hold PORT. Matches both the full script path and its basename, since
-    strays may have been launched either way (pkill ships with procps on
-    Termux; if it is missing, the adopt fallback in _mock_server covers
-    healthy strays)."""
-    for pat in (MOCK, os.path.basename(MOCK)):
-        try:
-            subprocess.run(["pkill", "-f", pat], timeout=5,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+    PORT = None
+    BASE = None
 
 
 def _mock_server():
-    """Lazily start (or reuse) the mock LLM server singleton.
-
-    Survives interrupted runs: an orphaned server from a previous process may
-    still be bound to PORT, which would make a fresh server exit immediately
-    with 'Address already in use'. Kill the port holder before starting; only
-    if that fails do we fall back to adopting whatever is already answering.
-    """
+    """Lazily start and reuse an owned mock server on an OS-assigned port."""
+    global PORT, BASE
     proc = _server["proc"]
     if proc is not None and proc.poll() is None:
         return proc
-    _kill_strays()
-    if _server_alive():
-        _server["proc"] = _AdoptedServer()
-        return _server["proc"]
+    if proc is not None:
+        _stop_server()
     proc = subprocess.Popen(
-        [sys.executable, MOCK, str(PORT)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        [sys.executable, MOCK, "0"], cwd=ROOT,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     _server["proc"] = proc
-    ready = False
-    deadline = time.time() + 10
-    while time.time() < deadline and proc.poll() is None:
+    port = None
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and proc.poll() is None:
         rlist, _, _ = select.select([proc.stdout], [], [], 0.2)
-        if rlist and "READY" in proc.stdout.readline():
-            ready = True
-            break
-    if proc.poll() is not None:
-        raise RuntimeError("mock server exited early")
-    if not ready:
-        raise RuntimeError("mock server did not become ready")
+        if rlist:
+            line = proc.stdout.readline()
+            if line.startswith("READY port="):
+                try:
+                    port = int(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+                if port:
+                    break
+    if port is None:
+        detail = ""
+        if proc.poll() is not None and proc.stdout is not None:
+            detail = proc.stdout.read().strip()
+        _stop_server()
+        message = "mock server exited before reporting its port" if detail else "mock server did not become ready"
+        if detail:
+            message += ": " + detail[-500:]
+        raise RuntimeError(message)
+    PORT = port
+    BASE = "http://127.0.0.1:%d" % PORT
     return proc
 
 
@@ -142,6 +132,7 @@ def mkrt(data_dir=None):
 
 def mock_rt(data_dir=None):
     """A runtime pointed at the offline mock LLM server."""
+    _mock_server()
     rt = mkrt(data_dir)
     rt.cfg = pa._normalize_state(
         {"provider": "mock", "base_url": BASE + "/v1",
@@ -188,7 +179,7 @@ class _Resp:
 
 
 def _cfg():
-    return {"base_url": "http://x/v1", "api_key": "k", "model": "m",
+    return {"base_url": "http://127.0.0.1/v1", "api_key": "k", "model": "m",
             "temperature": 0.5}
 
 
@@ -638,6 +629,495 @@ def test_provider_profiles():
     assert st2["active"] == "b"
 
 
+class _ProviderTestTTY:
+    def isatty(self):
+        return True
+
+
+def _run_provider_add(rt, answers, discover=None, probe_results=None):
+    """Run the wizard with controlled prompts; the fixture key is never emitted."""
+    fake_key = "provider-test-fixture-only"
+    answer_iter = iter(answers)
+    output = io.StringIO()
+    old_input = builtins.input
+    old_getpass = commands_mod.getpass.getpass
+    old_stdin = sys.stdin
+    old_discover = commands_mod.fetch_models
+    old_probe = commands_mod._test_provider_model
+    probes = []
+
+    def fake_input(prompt=""):
+        print(prompt, end="")
+        try:
+            return next(answer_iter)
+        except StopIteration:
+            raise AssertionError("provider wizard requested an unexpected answer")
+
+    def fake_getpass(prompt=""):
+        print(prompt, end="")
+        return fake_key
+
+    def fake_probe(base_url, api_key, model):
+        probes.append(model)
+        if not probe_results:
+            return True, "ok"
+        result = probe_results.pop(0)
+        return result
+
+    builtins.input = fake_input
+    commands_mod.getpass.getpass = fake_getpass
+    sys.stdin = _ProviderTestTTY()
+    if discover is not None:
+        commands_mod.fetch_models = discover
+    if probe_results is not None:
+        commands_mod._test_provider_model = fake_probe
+    try:
+        with contextlib.redirect_stdout(output):
+            commands_mod.cmd_provider(rt, "add")
+    finally:
+        builtins.input = old_input
+        commands_mod.getpass.getpass = old_getpass
+        sys.stdin = old_stdin
+        commands_mod.fetch_models = old_discover
+        commands_mod._test_provider_model = old_probe
+    return output.getvalue(), probes
+
+
+def _assert_fixture_key_not_echoed(output):
+    if "provider-test-fixture-only" in output:
+        raise AssertionError("hidden API-key input was echoed")
+
+
+def test_ask_key_compat_wrapper_uses_hidden_input():
+    old_stdin = sys.stdin
+    old_getpass = commands_mod.getpass.getpass
+    prompts = []
+    commands_mod.getpass.getpass = lambda prompt: prompts.append(prompt) or "none"
+    sys.stdin = _ProviderTestTTY()
+    try:
+        result = pa.ask_key("provider-test-fixture-only")
+    finally:
+        sys.stdin = old_stdin
+        commands_mod.getpass.getpass = old_getpass
+    assert result == ""
+    assert len(prompts) == 1 and "input hidden" in prompts[0]
+
+
+def _run_config_key_edit(key_answer):
+    rt = mkrt()
+    cfg = pa.active_cfg(rt)
+    cfg.update(base_url="https://provider.example/v1",
+               api_key="provider-test-fixture-only", model="model-one")
+    answers = iter(["", "", "0.7", "0", "y"])
+    output = io.StringIO()
+    old_input, old_stdin = builtins.input, sys.stdin
+    old_getpass = commands_mod.getpass.getpass
+    old_discover = commands_mod.fetch_models
+
+    def fake_input(prompt=""):
+        print(prompt, end="")
+        return next(answers)
+
+    def fake_getpass(prompt=""):
+        print(prompt, end="")
+        return key_answer
+
+    builtins.input = fake_input
+    commands_mod.getpass.getpass = fake_getpass
+    commands_mod.fetch_models = lambda _rt, _base, _key: ["model-one"]
+    sys.stdin = _ProviderTestTTY()
+    try:
+        with contextlib.redirect_stdout(output):
+            commands_mod.cmd_config(rt)
+    finally:
+        builtins.input, sys.stdin = old_input, old_stdin
+        commands_mod.getpass.getpass = old_getpass
+        commands_mod.fetch_models = old_discover
+    return rt, output.getvalue()
+
+
+def test_config_hidden_key_blank_keeps_current():
+    rt, output = _run_config_key_edit("")
+    _assert_fixture_key_not_echoed(output)
+    assert pa.active_cfg(rt)["api_key"]
+
+
+def test_config_hidden_key_none_clears_current():
+    rt, output = _run_config_key_edit("none")
+    _assert_fixture_key_not_echoed(output)
+    assert not pa.active_cfg(rt)["api_key"]
+
+
+def test_config_hidden_key_refuses_non_tty_without_changes():
+    rt = mkrt()
+    cfg = pa.active_cfg(rt)
+    cfg.update(base_url="https://provider.example/v1",
+               api_key="provider-test-fixture-only", model="model-one")
+    old_input, old_stdin = builtins.input, sys.stdin
+    old_getpass = commands_mod.getpass.getpass
+    output = io.StringIO()
+
+    def fake_input(prompt=""):
+        print(prompt, end="")
+        return ""
+
+    def unexpected_getpass(_prompt=""):
+        raise AssertionError("non-TTY config must not read a key")
+
+    builtins.input = fake_input
+    commands_mod.getpass.getpass = unexpected_getpass
+    sys.stdin = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            commands_mod.cmd_config(rt)
+    finally:
+        builtins.input, sys.stdin = old_input, old_stdin
+        commands_mod.getpass.getpass = old_getpass
+    _assert_fixture_key_not_echoed(output.getvalue())
+    assert "no key was read" in output.getvalue()
+    assert pa.active_cfg(rt)["api_key"]
+    assert pa.active_cfg(rt)["model"] == "model-one"
+
+
+def test_config_rejects_external_http_before_key_prompt():
+    rt = mkrt()
+    cfg = pa.active_cfg(rt)
+    cfg.update(base_url="https://provider.example/v1",
+               api_key="provider-test-fixture-only", model="model-one")
+    old_input, old_stdin = builtins.input, sys.stdin
+    old_getpass = commands_mod.getpass.getpass
+    output = io.StringIO()
+
+    def fake_input(prompt=""):
+        print(prompt, end="")
+        return "http://provider.example/v1"
+
+    def unexpected_getpass(_prompt=""):
+        raise AssertionError("remote HTTP must be rejected before key entry")
+
+    builtins.input = fake_input
+    commands_mod.getpass.getpass = unexpected_getpass
+    sys.stdin = _ProviderTestTTY()
+    try:
+        with contextlib.redirect_stdout(output):
+            commands_mod.cmd_config(rt)
+    finally:
+        builtins.input, sys.stdin = old_input, old_stdin
+        commands_mod.getpass.getpass = old_getpass
+    text = output.getvalue()
+    _assert_fixture_key_not_echoed(text)
+    assert "HTTPS is required" in text
+    assert pa.active_cfg(rt)["base_url"] == "https://provider.example/v1"
+    assert pa.active_cfg(rt)["api_key"]
+
+
+def test_provider_url_requires_https_except_local_http():
+    assert client_mod.provider_url_error("https://provider.example/v1") is None
+    for local_url in ("http://localhost:11434/v1", "http://127.0.0.1:12345/v1",
+                      "http://[::1]:12345/v1", "http://192.168.1.20:8000/v1",
+                      "http://llm.local/v1"):
+        assert client_mod.provider_url_error(local_url) is None
+    assert "HTTPS is required" in client_mod.provider_url_error("http://provider.example/v1")
+    assert "must not contain credentials" in client_mod.provider_url_error(
+        "https://user:pass@provider.example/v1")
+
+    rt = mkrt()
+    opened = []
+    old_open = client_mod._open_provider_request
+    client_mod._open_provider_request = lambda req, timeout: opened.append(req.full_url)
+    try:
+        try:
+            client_mod.fetch_models(rt, "http://provider.example/v1", "local-dummy-key")
+            rejected = False
+        except RuntimeError as exc:
+            rejected = "HTTPS is required" in str(exc)
+    finally:
+        client_mod._open_provider_request = old_open
+    assert rejected and not opened
+
+
+def test_provider_add_rejects_external_http_custom_endpoint():
+    rt = mkrt()
+    answers = iter(["custom", "cleartext", "http://provider.example/v1"])
+    output = io.StringIO()
+    old_input, old_stdin = builtins.input, sys.stdin
+    old_getpass = commands_mod.getpass.getpass
+
+    def fake_input(prompt=""):
+        print(prompt, end="")
+        return next(answers)
+
+    def unexpected_getpass(_prompt=""):
+        raise AssertionError("insecure endpoint must be rejected before key entry")
+
+    builtins.input = fake_input
+    commands_mod.getpass.getpass = unexpected_getpass
+    sys.stdin = _ProviderTestTTY()
+    try:
+        with contextlib.redirect_stdout(output):
+            commands_mod.cmd_provider(rt, "add")
+    finally:
+        builtins.input, sys.stdin = old_input, old_stdin
+        commands_mod.getpass.getpass = old_getpass
+    assert "HTTPS is required" in output.getvalue()
+    assert "cleartext" not in rt.cfg["profiles"]
+
+
+def test_provider_cross_origin_redirect_does_not_forward_bearer():
+    received_auth = []
+
+    class DestinationHandler(BaseHTTPRequestHandler):
+        def _reply(self, payload):
+            received_auth.append(self.headers.get("Authorization"))
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._reply({"object": "list", "data": [{"id": "model-one"}]})
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self._reply({"choices": [{"message": {"content": "ok"}}]})
+
+        def log_message(self, *_args):
+            pass
+
+    destination = ThreadingHTTPServer(("127.0.0.1", 0), DestinationHandler)
+    destination_base = "http://127.0.0.1:%d" % destination.server_port
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def _redirect(self):
+            self.send_response(302)
+            self.send_header("Location", destination_base + self.path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            self._redirect()
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self._redirect()
+
+        def log_message(self, *_args):
+            pass
+
+    source = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    source_base = "http://127.0.0.1:%d/v1" % source.server_port
+    servers = (destination, source)
+    threads = [threading.Thread(target=server.serve_forever, daemon=True)
+               for server in servers]
+    for thread in threads:
+        thread.start()
+    rt = mkrt()
+    try:
+        try:
+            client_mod.fetch_models(rt, source_base, "local-dummy-key")
+            discovery_rejected = False
+        except RuntimeError as exc:
+            discovery_rejected = "HTTP 302" in str(exc)
+        passed, reason = commands_mod._test_provider_model(
+            source_base, "local-dummy-key", "model-one")
+        assert discovery_rejected
+        assert not passed and reason == "HTTP 302"
+        assert received_auth == []
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
+
+
+def test_provider_requests_work_over_loopback_http():
+    received_auth = []
+
+    class ProviderHandler(BaseHTTPRequestHandler):
+        def _reply(self, payload):
+            received_auth.append(bool(self.headers.get("Authorization")))
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._reply({"object": "list", "data": [{"id": "local-model"}]})
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self._reply({"choices": [{"message": {"content": "ok"}}]})
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = "http://127.0.0.1:%d/v1" % server.server_port
+    rt = mkrt()
+    try:
+        models = client_mod.fetch_models(rt, base_url, "local-dummy-key")
+        passed, reason = commands_mod._test_provider_model(
+            base_url, "local-dummy-key", "local-model")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert models == ["local-model"]
+    assert passed and reason == "ok"
+    assert received_auth == [True, True]
+
+
+def test_provider_add_guided_success_and_masked_key():
+    rt = mkrt()
+    output, _ = _run_provider_add(
+        rt, ["custom", "saved-active", "https://provider.example/v1", "0", "yes"],
+        discover=lambda _rt, _base, _key: ["model-one"],
+        probe_results=[(True, "ok")])
+    _assert_fixture_key_not_echoed(output)
+    assert rt.cfg["active"] == "saved-active"
+    assert pa.active_cfg(rt)["base_url"] == "https://provider.example/v1"
+    assert pa.active_cfg(rt)["model"] == "model-one"
+    assert pa.active_cfg(rt)["api_key"]
+    with open(os.path.join(rt.data_dir, "config.json"), encoding="utf-8") as saved_file:
+        saved = json.load(saved_file)
+    assert saved["active"] == "saved-active"
+    assert saved["profiles"]["saved-active"] == pa.active_cfg(rt)
+    assert "provider profile 'saved-active' saved and now active" in output
+
+
+def test_provider_add_early_cancel_leaves_config_unchanged():
+    rt = mkrt()
+    rt.cfg["profiles"]["existing"] = dict(pa.DEFAULT_CFG)
+    rt.cfg["profiles"]["existing"].update(
+        model="existing-model", api_key="existing-key")
+    rt.cfg["active"] = "existing"
+    pa.save_state(rt)
+    before_cfg = json.loads(json.dumps(rt.cfg))
+    with open(os.path.join(rt.data_dir, "config.json"), encoding="utf-8") as saved_file:
+        before_file = json.load(saved_file)
+
+    output, probes = _run_provider_add(rt, ["cancel"], probe_results=[(True, "ok")])
+
+    assert rt.cfg == before_cfg
+    with open(os.path.join(rt.data_dir, "config.json"), encoding="utf-8") as saved_file:
+        assert json.load(saved_file) == before_file
+    assert probes == []
+    assert "provider setup cancelled; settings and active provider were not changed" in output
+
+
+def test_provider_add_decline_charge_saves_nothing():
+    rt = mkrt()
+    pa.save_state(rt)
+    before_cfg = json.loads(json.dumps(rt.cfg))
+    with open(os.path.join(rt.data_dir, "config.json"), encoding="utf-8") as saved_file:
+        before_file = json.load(saved_file)
+
+    output, probes = _run_provider_add(
+        rt, ["openai", "declined", "0", "no"],
+        discover=lambda _rt, _base, _key: ["model-one"], probe_results=[])
+
+    assert rt.cfg == before_cfg
+    with open(os.path.join(rt.data_dir, "config.json"), encoding="utf-8") as saved_file:
+        assert json.load(saved_file) == before_file
+    assert rt.cfg["active"] == before_cfg["active"]
+    assert "declined" not in rt.cfg["profiles"]
+    assert probes == []
+    assert "may incur a usage charge" in output
+    assert "provider setup cancelled; settings and active provider were not changed" in output
+
+
+def test_provider_add_refuses_echoing_non_tty():
+    rt = mkrt()
+    answers = iter(["openai", "non-tty"])
+    output = io.StringIO()
+    old_input, old_stdin = builtins.input, sys.stdin
+
+    def fake_input(prompt=""):
+        print(prompt, end="")
+        return next(answers)
+
+    builtins.input = fake_input
+    sys.stdin = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            commands_mod.cmd_provider(rt, "add")
+    finally:
+        builtins.input, sys.stdin = old_input, old_stdin
+    assert "no key was read" in output.getvalue()
+    assert "non-tty" not in rt.cfg["profiles"]
+
+
+def test_provider_add_discovery_failure_manual_model():
+    rt = mkrt()
+
+    def fail_discovery(_rt, _base, _key):
+        raise RuntimeError("fixture error")
+
+    output, probes = _run_provider_add(
+        rt, ["custom", "manual", "https://provider.example/v1", "m", "manual-model", "yes"],
+        discover=fail_discovery, probe_results=[(True, "ok")])
+    _assert_fixture_key_not_echoed(output)
+    assert "model discovery failed" in output
+    assert "saved and now active" in output
+    assert probes == ["manual-model"]
+    assert pa.active_cfg(rt)["model"] == "manual-model"
+
+
+def test_provider_add_test_retry_then_save():
+    rt = mkrt()
+    results = [(False, "HTTP 401"), (True, "ok")]
+    output, probes = _run_provider_add(
+        rt, ["openai", "retry-profile", "0", "yes", "r", "yes"],
+        discover=lambda _rt, _base, _key: ["model-one"],
+        probe_results=results)
+    _assert_fixture_key_not_echoed(output)
+    assert "connection test failed (HTTP 401); profile was not saved" in output
+    assert "saved and now active" in output
+    assert probes == ["model-one", "model-one"]
+    assert rt.cfg["active"] == "retry-profile"
+
+
+def test_provider_add_failed_manual_model_does_not_save():
+    rt = mkrt()
+    results = [(False, "HTTP 400"), (False, "HTTP 400")]
+    output, probes = _run_provider_add(
+        rt, ["openai", "not-saved", "0", "yes", "m", "other-model", "yes", "c"],
+        discover=lambda _rt, _base, _key: ["model-one"],
+        probe_results=results)
+    _assert_fixture_key_not_echoed(output)
+    assert "connection test failed" in output
+    assert "connection test passed" not in output
+    assert "profile saved" not in output
+    assert "not-saved" not in rt.cfg["profiles"]
+    assert rt.cfg["active"] != "not-saved"
+    assert probes == ["model-one", "other-model"]
+
+
+def test_provider_add_save_failure_not_reported_as_saved():
+    rt = mkrt()
+    old_save = commands_mod.save_state
+    commands_mod.save_state = lambda _rt: None
+    try:
+        output, _ = _run_provider_add(
+            rt, ["openai", "write-failed", "0", "yes"],
+            discover=lambda _rt, _base, _key: ["model-one"],
+            probe_results=[(True, "ok")])
+    finally:
+        commands_mod.save_state = old_save
+    _assert_fixture_key_not_echoed(output)
+    assert "connection test passed, but the profile could not be saved" in output
+    assert "provider profile saved" not in output
+    assert "write-failed" not in rt.cfg["profiles"]
+    assert rt.cfg["active"] != "write-failed"
+
+
 # ---------------- context tracking -----------------------------------------
 
 def test_context_tracking():
@@ -827,20 +1307,20 @@ def test_chunked_sse():
         "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"
         "data: [DONE]\n\n"
     )
-    _orig_urlopen = urllib.request.urlopen
-    urllib.request.urlopen = lambda req, timeout=180: _FakeResp(fake_sse)
+    _orig_provider_open = client_mod._open_provider_request
+    client_mod._open_provider_request = lambda req, timeout=180: _FakeResp(fake_sse)
     try:
         cfg_s = _cfg()
         out = "".join(c for c, _ in pa.chat_completion_stream(
             rt, [{"role": "user", "content": "hi"}], cfg_s))
         assert out == "Hello world"
     finally:
-        urllib.request.urlopen = _orig_urlopen
+        client_mod._open_provider_request = _orig_provider_open
 
 
 def test_tool_call_ids():
     rt = mkrt()
-    _orig_urlopen = urllib.request.urlopen
+    _orig_provider_open = client_mod._open_provider_request
     cfg_s = _cfg()
     # id must not be concatenated across repeated deltas
     id_sse = (
@@ -850,26 +1330,26 @@ def test_tool_call_ids():
         "\"function\":{\"arguments\":\"{\\\"expression\\\":\\\"2+2\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
     )
-    urllib.request.urlopen = lambda req, timeout=180: _FakeResp(id_sse)
+    client_mod._open_provider_request = lambda req, timeout=180: _FakeResp(id_sse)
     try:
         _events = list(pa.chat_completion_stream(rt, [{"role": "user", "content": "calc"}], cfg_s))
         _tc = [tc for _, tcs in _events for tc in (tcs or [])]
         assert len(_tc) == 1 and _tc[0]["id"] == "call_abc"
     finally:
-        urllib.request.urlopen = _orig_urlopen
+        client_mod._open_provider_request = _orig_provider_open
     # no id in stream -> stable synthetic id
     noid_sse = (
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,"
         "\"function\":{\"name\":\"calculator\",\"arguments\":\"{\\\"expression\\\":\\\"1\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
     )
-    urllib.request.urlopen = lambda req, timeout=180: _FakeResp(noid_sse)
+    client_mod._open_provider_request = lambda req, timeout=180: _FakeResp(noid_sse)
     try:
         _events = list(pa.chat_completion_stream(rt, [{"role": "user", "content": "calc"}], cfg_s))
         _tc = [tc for _, tcs in _events for tc in (tcs or [])]
         assert len(_tc) == 1 and _tc[0]["id"] == "call_0"
     finally:
-        urllib.request.urlopen = _orig_urlopen
+        client_mod._open_provider_request = _orig_provider_open
 
 
 def test_plain_json_fallback():
@@ -877,7 +1357,7 @@ def test_plain_json_fallback():
     # the stream reader must parse the body instead of crashing.
     rt = mkrt()
     cfg_s = _cfg()
-    _orig_urlopen = urllib.request.urlopen
+    _orig_provider_open = client_mod._open_provider_request
     _plain_msg = {"choices": [{"message": {"role": "assistant",
                                            "content": "plain-json-reply"},
                                "finish_reason": "stop"}]}
@@ -885,14 +1365,14 @@ def test_plain_json_fallback():
                           ("pretty", json.dumps(_plain_msg, indent=2))):
         def _fake_plain(req, timeout=180, _b=_body):
             return _FakeResp(_b)
-        urllib.request.urlopen = _fake_plain
+        client_mod._open_provider_request = _fake_plain
         try:
             _events = list(pa.chat_completion_stream(
                 rt, [{"role": "user", "content": "hi"}], cfg_s))
             _text = "".join(c for c, _ in _events)
             assert _text == "plain-json-reply", "plain-JSON (%s) fallback" % _label
         finally:
-            urllib.request.urlopen = _orig_urlopen
+            client_mod._open_provider_request = _orig_provider_open
 
 
 def test_stream_plain_json_real_socket():
@@ -981,7 +1461,7 @@ def test_dead_turn_no_ghost_messages():
 def test_retry_backoff():
     rt = mkrt()
     _orig_sleep = client_mod._sleep_retry
-    _orig_urlopen = urllib.request.urlopen
+    _orig_provider_open = client_mod._open_provider_request
     client_mod._sleep_retry = lambda a: None
     _attempts = [0]
     _good = json.dumps({"choices": [{"message": {"role": "assistant", "content": "retried-ok"}}]}).encode("utf-8")
@@ -992,19 +1472,19 @@ def test_retry_backoff():
             raise urllib.error.URLError("transient outage")
         return _Resp(200, _good)
 
-    urllib.request.urlopen = _flaky
+    client_mod._open_provider_request = _flaky
     try:
         _d = pa.chat_completion(rt, [{"role": "user", "content": "hi"}], _cfg())
         assert _attempts[0] == 3 and _d["choices"][0]["message"]["content"] == "retried-ok"
     finally:
-        urllib.request.urlopen = _orig_urlopen
+        client_mod._open_provider_request = _orig_provider_open
     _attempts[0] = 0
 
     def _perm(req, timeout=180):
         _attempts[0] += 1
         return _Resp(400, json.dumps({"error": {"message": "nope"}}).encode("utf-8"))
 
-    urllib.request.urlopen = _perm
+    client_mod._open_provider_request = _perm
     try:
         try:
             pa.chat_completion(rt, [{"role": "user", "content": "hi"}], _cfg())
@@ -1013,7 +1493,7 @@ def test_retry_backoff():
             _raised = True
         assert _raised and _attempts[0] == 1
     finally:
-        urllib.request.urlopen = _orig_urlopen
+        client_mod._open_provider_request = _orig_provider_open
         client_mod._sleep_retry = _orig_sleep
 
 
@@ -1089,7 +1569,11 @@ def test_markdown_ansi():
         assert "\x1b[1;3m" in _rend5
     finally:
         tui_mod.COLOR = _old_color
-    assert pa._md_line("**raw**", pa.SKINS["midnight"])[0] == "**raw**"
+    tui_mod.COLOR = False
+    try:
+        assert pa._md_line("**raw**", pa.SKINS["midnight"])[0] == "**raw**"
+    finally:
+        tui_mod.COLOR = _old_color
 
     _old_color2 = tui_mod.COLOR
     try:
@@ -1121,7 +1605,7 @@ def test_markdown_ansi():
 def test_xml_stream_end_to_end():
     # end-to-end: an XML tool_call stream gets executed and fed back
     rt = mock_rt()
-    _orig_urlopen = urllib.request.urlopen
+    _orig_provider_open = client_mod._open_provider_request
     _xml_sse = (
         'data: {"choices":[{"delta":{"content":"Let me compute:\\n<tool_call>\\n<function=calculator>\\n'
         '<parameter=expression>6*7</parameter>\\n</function>\\n</tool_call>\\n"}}]}\n\n'
@@ -1137,7 +1621,7 @@ def test_xml_stream_end_to_end():
         _xml_attempt[0] += 1
         return _FakeResp(_xml_sse if _xml_attempt[0] == 1 else _ans_sse)
 
-    urllib.request.urlopen = _fake_xml_urlopen
+    client_mod._open_provider_request = _fake_xml_urlopen
     try:
         _evs = list(pa.run_agent_stream(rt, [{"role": "user", "content": "calc"}]))
         _ts = [e for k, e in _evs if k == "tool_start"]
@@ -1149,7 +1633,7 @@ def test_xml_stream_end_to_end():
             and _te[0]["result"].get("result") == 42
         assert _dn["content"] == "The answer is 42." and "tool_call" not in _dn["content"]
     finally:
-        urllib.request.urlopen = _orig_urlopen
+        client_mod._open_provider_request = _orig_provider_open
 
 
 def test_spinner():
@@ -1203,58 +1687,23 @@ def test_error_hints():
     assert _hint_unknown.get("error") and "unknown tool" in _hint_unknown.get("error", "")
 
 
-def test_mock_server_recovers_stale():
-    # An interrupted run can leave an untracked mock server still bound to
-    # PORT. _mock_server must recover from that: kill the stray and start
-    # fresh (or, when the stray-killer is unavailable, adopt the healthy
-    # stray) - never raise "exited early".
-    global _kill_strays
-    _stop_server()
-
-    def _spawn_orphan():
-        return subprocess.Popen(
-            [sys.executable, MOCK, str(PORT)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-    def _wait_ready(p):
-        deadline = time.time() + 10
-        while time.time() < deadline and p.poll() is None:
-            rlist, _, _ = select.select([p.stdout], [], [], 0.2)
-            if rlist and "READY" in p.stdout.readline():
-                return True
-        return p.poll() is None
-
-    def _alive():
-        try:
-            with urllib.request.urlopen(BASE + "/models", timeout=1) as r:
-                return r.getcode() == 200
-        except Exception:
-            return False
-
-    # Path 1: stray-killer works -> stray killed, fresh server starts
-    _orphan = _spawn_orphan()
-    _server["proc"] = None
+def test_mock_server_lifecycle():
+    first = _mock_server()
     try:
-        assert _wait_ready(_orphan), "orphan failed to start"
-        _mock_server()
-        assert _alive()
+        assert first is _mock_server()
+        assert PORT and BASE == "http://127.0.0.1:%d" % PORT
+        with urllib.request.urlopen(BASE + "/models", timeout=2) as response:
+            assert response.getcode() == 200
+            assert json.loads(response.read())['data'][0]['id'] == "mock-model"
+
+        _stop_server()
+        assert first.poll() is not None
+        second = _mock_server()
+        assert second is not first and second.poll() is None
+        with urllib.request.urlopen(BASE + "/models", timeout=2) as response:
+            assert response.getcode() == 200
     finally:
-        _orphan.kill()
-    # Path 2: stray-killer unavailable -> healthy orphan adopted, not crashed
-    _stop_server()
-    _orphan = _spawn_orphan()
-    _server["proc"] = None
-    _orig_kill = _kill_strays
-    try:
-        assert _wait_ready(_orphan), "orphan failed to start"
-        _kill_strays = lambda: None
-        _mock_server()
-        assert _alive()
-        assert _server["proc"] is not None and _server["proc"].poll() is None
-    finally:
-        _kill_strays = _orig_kill
-        _orphan.kill()
-        _server["proc"] = None
+        _stop_server()
 
 
 # ---------------- resilience: circuit breaker + timeouts -------------------
@@ -1332,9 +1781,9 @@ def test_stream_breaker():
         return _FakeResp(_fail_sse)
 
     _orig_dispatch = agent_mod.dispatch_tool
-    _orig_urlopen = urllib.request.urlopen
+    _orig_provider_open = client_mod._open_provider_request
     agent_mod.dispatch_tool = _fail_dispatch
-    urllib.request.urlopen = _fail_urlopen
+    client_mod._open_provider_request = _fail_urlopen
     try:
         _evs = list(pa.run_agent_stream(rt, [{"role": "user", "content": "loop"}]))
         _dn = [e for k, e in _evs if k == "done"][0]
@@ -1342,7 +1791,7 @@ def test_stream_breaker():
         assert len(_sse_calls) == agent_mod._MAX_CONSEC_TOOL_FAILURES
     finally:
         agent_mod.dispatch_tool = _orig_dispatch
-        urllib.request.urlopen = _orig_urlopen
+        client_mod._open_provider_request = _orig_provider_open
     assert any("circuit_breaker" in ln for ln in pa.read_trace(rt, 50))
 
 
@@ -1359,54 +1808,94 @@ def test_stream_timeout():
         _sse_calls.append(1)
         return _FakeResp(_fail_sse)
 
-    _orig_urlopen = urllib.request.urlopen
+    _orig_provider_open = client_mod._open_provider_request
     _orig_timeout = agent_mod._TURN_TIMEOUT
     agent_mod._TURN_TIMEOUT = 0
-    urllib.request.urlopen = _fail_urlopen
+    client_mod._open_provider_request = _fail_urlopen
     try:
         _evs = list(pa.run_agent_stream(rt, [{"role": "user", "content": "slow"}]))
         _dn = [e for k, e in _evs if k == "done"][0]
         assert "time budget" in str(_dn.get("content", ""))
         assert len(_sse_calls) == 0
     finally:
-        urllib.request.urlopen = _orig_urlopen
+        client_mod._open_provider_request = _orig_provider_open
         agent_mod._TURN_TIMEOUT = _orig_timeout
     assert any("timeout" in ln for ln in pa.read_trace(rt, 50))
 
 
-# ---------------- run_python: sandboxed subprocess tool --------------------
+# ---------------- run_python: bounded AST interpreter ----------------------
 
 def test_run_python():
     rt = mock_rt()
-    _rp = pa.dispatch_tool(rt, "run_python", {"code": "print(6*7)"})
-    assert _rp.get("ok") is True and "42" in _rp.get("output", "")
-    _rp2 = pa.dispatch_tool(rt, "run_python", {"code": "import os; print(os.getcwd())"})
-    assert _rp2.get("ok") is False and "permission" in _rp2.get("error", "")
-    assert pa.classify_python("x = [i*i for i in range(10)]") == "allow"
-    assert pa.classify_python("import shutil; shutil.rmtree('/x')") == "ask"
-    assert pa.classify_python("open('/sdcard/x', 'w')") == "ask"
-    assert pa.classify_python("print(eval('2+2'))") == "ask"
-    # infinite loop: killed by the timeout (not a hung agent)
-    _orig_py_to = tools_mod._PY_RUN_TIMEOUT
-    tools_mod._PY_RUN_TIMEOUT = 1
+    launches = []
+    permissions = []
+    _orig_popen = tools_mod.subprocess.Popen
+    _orig_run = tools_mod.subprocess.run
+    _orig_permission = tools_mod.request_permission
+
+    def _blocked_launcher(*args, **kwargs):
+        launches.append((args, kwargs))
+        raise AssertionError("run_python must not use a process launcher")
+
+    def _unexpected_permission(*args, **kwargs):
+        permissions.append((args, kwargs))
+        return True
+
+    tools_mod.subprocess.Popen = _blocked_launcher
+    tools_mod.subprocess.run = _blocked_launcher
+    tools_mod.request_permission = _unexpected_permission
     try:
-        _t0 = time.monotonic()
-        _rp3 = pa.dispatch_tool(rt, "run_python", {"code": "while True: pass"})
-        _dt3 = time.monotonic() - _t0
-        assert _rp3.get("ok") is False and "timed out" in _rp3.get("error", "") and _dt3 < 15
+        _rp = pa.dispatch_tool(rt, "run_python", {"code": "print(6*7)"})
+        assert _rp.get("ok") is True and _rp.get("output") == "42\n"
+
+        _transform = (
+            "nums = [n*n for n in range(5)]\n"
+            "total = 0\n"
+            "for n in nums:\n"
+            "    if n % 2 == 0:\n"
+            "        total += n\n"
+            "print(nums)\n"
+            "print(total)"
+        )
+        _rp2 = pa.dispatch_tool(rt, "run_python", {"code": _transform})
+        assert _rp2.get("ok") is True
+        assert _rp2.get("output") == "[0, 1, 4, 9, 16]\n20\n"
+        _rp3 = pa.dispatch_tool(rt, "run_python", {
+            "code": "rows = {'a': 3, 'b': 4}\nprint(rows['a'] + rows['b'])"})
+        assert _rp3.get("ok") is True and _rp3.get("output") == "7\n"
+        assert pa.classify_python("x = [i*i for i in range(10)]") == "allow"
+
+        rejected = (
+            "import os; print(os.getcwd())",
+            "open('/sdcard/x', 'w')",
+            "print(eval('2+2'))",
+            "print((1).__class__)",
+            "while condition: pass",
+            "__import__('os')",
+        )
+        for code in rejected:
+            assert pa.classify_python(code) == "deny", code
+            result = pa.dispatch_tool(rt, "run_python", {"code": code})
+            assert result.get("ok") is False, (code, result)
+        assert launches == []
+        assert permissions == []
+
+        _over_limit = pa.dispatch_tool(rt, "run_python", {
+            "code": "items = [0] * 1001"})
+        assert _over_limit.get("ok") is False
+        _over_budget = pa.dispatch_tool(rt, "run_python", {
+            "code": "for x in range(100):\n    for y in range(100):\n        z = x + y"})
+        assert _over_budget.get("ok") is False
+        _large_output = pa.dispatch_tool(rt, "run_python", {
+            "code": "print('a' * 9000)"})
+        assert _large_output.get("ok") is True
+        assert len(_large_output.get("output", "")) <= _PY_MAX_CHARS
+        assert "... (truncated)" in _large_output.get("output", "")
+        assert launches == []
     finally:
-        tools_mod._PY_RUN_TIMEOUT = _orig_py_to
-    # output flood: killed by the byte cap
-    _orig_py_max = tools_mod._PY_MAX_BYTES
-    tools_mod._PY_MAX_BYTES = 1024
-    try:
-        _rp4 = pa.dispatch_tool(rt, "run_python", {"code": "print('x' * 100000)"})
-        assert _rp4.get("ok") is False and "cap" in _rp4.get("error", "")
-    finally:
-        tools_mod._PY_MAX_BYTES = _orig_py_max
-    # stdout truncation for sane-but-large outputs
-    _rp5 = pa.dispatch_tool(rt, "run_python", {"code": "print('a' * 9000)"})
-    assert _rp5.get("ok") is True and "... (truncated)" in _rp5.get("output", "")
+        tools_mod.subprocess.Popen = _orig_popen
+        tools_mod.subprocess.run = _orig_run
+        tools_mod.request_permission = _orig_permission
 
 
 # ---------------- tiered tool selection ------------------------------------
@@ -1454,7 +1943,7 @@ def test_cmd_trace():
 
 _FACADE_SURFACE = (
     "Runtime", "build_runtime", "Tools", "dispatch_tool", "TOOLS",
-    "SKINS", "AgentWriter", "Spinner",
+    "SKINS", "AgentWriter", "Spinner", "_PY_MAX_CHARS",
     "chat_completion", "chat_completion_stream", "run_agent", "run_agent_stream",
     "classify_command", "classify_python", "load_session", "main",
     "context_usage", "compress_history", "sessions_map", "read_trace",
@@ -1488,7 +1977,7 @@ def test_no_import_cycles():
                   ("import alvaagent_tui", "import alvaagent")):
         code = "import sys\n" + "\n".join(order) + "\nprint('OK')\n"
         r = subprocess.run([sys.executable, "-c", code],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, cwd=ROOT)
         assert r.returncode == 0 and "OK" in r.stdout, r.stderr
     for mod in ("alvaagent.context", "alvaagent.config", "alvaagent.store",
                 "alvaagent.permissions", "alvaagent.sessions", "alvaagent.trace",
@@ -1496,7 +1985,7 @@ def test_no_import_cycles():
                 "alvaagent.agent", "alvaagent.tui", "alvaagent.commands",
                 "alvaagent.repl", "alvaagent.util"):
         r = subprocess.run([sys.executable, "-c", "import %s" % mod],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, cwd=ROOT)
         assert r.returncode == 0, (mod, r.stderr)
 
 
@@ -1649,7 +2138,7 @@ def _pty_run(script):
     """Run `script` in a pty child; return (pid, fd) for the parent."""
     pid, fd = pty.fork()
     if pid == 0:
-        os.chdir("/data/data/com.termux/files/home/alvaagent")
+        os.chdir(ROOT)
         os.execv(sys.executable, [sys.executable, "-c", script])
         os._exit(127)
     os.set_blocking(fd, False)
@@ -1705,6 +2194,43 @@ def _pty_wait_raw(fd, timeout):
             return False
         time.sleep(0.05)
     return False
+
+
+def test_hidden_api_key_pty_no_echo():
+    # Exercise the real getpass/TTY path with a dummy value only. The child
+    # calls the prompt helper directly; it never contacts a provider.
+    script = (
+        "import os\n"
+        "from alvaagent.commands import _ask_hidden_api_key\n"
+        "value = _ask_hidden_api_key()\n"
+        "os.write(1, b'\\nKEY_ACCEPTED\\n' if value == 'dummy-pty-key' else b'\\nKEY_REJECTED\\n')\n"
+    )
+    pid, fd = _pty_run(script)
+    status = None
+    try:
+        out = _pty_drain_until(fd, b"API key (input hidden;", 8.0)
+        assert b"API key (input hidden;" in out, "hidden-key prompt did not appear"
+        assert _pty_wait_raw(fd, 8.0), "PTY did not disable input echo"
+        os.write(fd, b"dummy-pty-key\n")
+        out += _pty_drain_until(fd, b"KEY_ACCEPTED", 8.0)
+        assert b"KEY_ACCEPTED" in out, "hidden-key prompt did not accept the input"
+        assert b"dummy-pty-key" not in out, "dummy key appeared in PTY output"
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, "PTY child failed"
+    finally:
+        if status is None:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def test_line_reader_basic():
@@ -1893,6 +2419,7 @@ def test_scroll_e2e():
     # then feed a wheel-up (swipe up) event: the scroll view must page through
     # exactly what was printed THIS run - never the seeded past session.
     # Enter returns to live, then /exit.
+    _mock_server()
     data_dir = tempfile.mkdtemp(prefix="alva_scrolle2e_")
     _TMP_DIRS.append(data_dir)
     store = {
@@ -1915,7 +2442,7 @@ def test_scroll_e2e():
     env["ALVA_DATA_DIR"] = data_dir
     pid, fd = pty.fork()
     if pid == 0:
-        os.chdir("/data/data/com.termux/files/home/alvaagent")
+        os.chdir(ROOT)
         os.execve(sys.executable, [sys.executable, "-m", "alvaagent"], env)
         os._exit(127)
     os.set_blocking(fd, False)
@@ -1960,7 +2487,7 @@ def test_cli_smoke():
     _env["ALVA_DATA_DIR"] = _tmp
     r = subprocess.run([sys.executable, "-m", "alvaagent"],
                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                       timeout=30, env=_env)
+                       timeout=30, env=_env, cwd=ROOT)
     assert r.returncode == 0, (r.returncode, r.stdout[-500:], r.stderr[-500:])
 
 
@@ -1994,8 +2521,10 @@ def _on_exit():
         pass
 
 
+atexit.register(_on_exit)
+
+
 if __name__ == "__main__":
-    atexit.register(_on_exit)
     try:
         _mock_server()
         print("[mock server ready]")

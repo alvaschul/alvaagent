@@ -14,9 +14,10 @@ Behavior:
   * Any request whose latest user message     -> plain text answer, no tools.
     contains "[plain]"
 
-Usage:  python3 mock_llm_server.py [port]     (default port: 8001)
+Usage:  python3 mock_llm_server.py [port]     (default: 8001; 0 = OS-assigned)
 """
 import json
+import signal
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -89,6 +90,9 @@ def build_response(messages):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
     @staticmethod
     def _norm(path):
         return path.split("?", 1)[0].rstrip("/")
@@ -189,8 +193,12 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    PORT = server.server_port
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     print("READY port=%d" % PORT, flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        server.server_close()
