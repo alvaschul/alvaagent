@@ -58,7 +58,7 @@ git clone https://github.com/alvaschul/alvaagent.git
 cd alvaagent
 
 # 3. (optional) make `alvaagent` runnable from anywhere — like hermes
-ln -sf "$PWD/alvaagent" /data/data/com.termux/files/usr/bin/alvaagent
+ln -sf "$PWD/alvaagent.sh" /data/data/com.termux/files/usr/bin/alvaagent
 
 # 4. Run
 alvaagent            # if you did step 3
