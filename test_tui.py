@@ -3031,12 +3031,40 @@ def test_notes_uncertain_provider_request_is_never_repeated_on_resume():
     saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
     assert saved["status"] == "stopped" and saved["provider_status"] == "succeeded"
     assert len(calls) == 1
-    assert "previous result is uncertain" in " ".join(resumed.split())
+    assert "The provider may already have received the selected notes. The result is unknown; no automatic retry will happen." in " ".join(resumed.split())
     assert "./notes/" in resumed and "one.md" in resumed and "content snapshot" in resumed
     active_cfg = notes_mod.active_cfg(reloaded_rt)
     assert saved["consent_provider_binding"] == notes_mod._provider_binding(
         active_cfg.get("provider") or "default", active_cfg)
     assert saved["consent_snapshot_sha256"] == state["content_snapshot_sha256"]
+    assert not os.path.exists(os.path.join(root, "summary.md"))
+
+
+def test_notes_ctrl_c_unknown_outcome_copy_is_precise():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    calls = []
+    old_provider_call = notes_mod._provider_call
+
+    def interrupt_after_dispatch(runtime, state, *args):
+        calls.append(1)
+        state["provider_status"] = "sent_outcome_unknown"
+        state["stage"] = "summarizing"
+        raise KeyboardInterrupt()
+
+    notes_mod._provider_call = interrupt_after_dispatch
+    try:
+        output, _ = _notes_run(rt, root, ["1", "y", "", "s"])
+    finally:
+        notes_mod._provider_call = old_provider_call
+
+    saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+    normalized = " ".join(output.split())
+    assert calls == [1]
+    assert saved["status"] == "stopped" and saved["provider_status"] == "sent_outcome_unknown"
+    assert "The provider may already have received the selected notes. The result is unknown; no automatic retry will happen." in normalized
+    assert "Interrupted after dispatch. Any late provider result will be ignored." in normalized
+    assert "the provider may still receive" not in output
     assert not os.path.exists(os.path.join(root, "summary.md"))
 
 
