@@ -434,6 +434,20 @@ def _emit(text, indent="  "):
         print(indent + line)
 
 
+def _emit_endpoint(endpoint):
+    parsed = urllib.parse.urlsplit(endpoint)
+    authority = "%s://%s" % (parsed.scheme, parsed.netloc)
+    path = parsed.path
+    content_width = _width() - 2
+    if len("endpoint: " + authority + path) <= content_width:
+        _emit("endpoint: " + authority + path)
+        return
+    _emit("endpoint:")
+    _emit(authority, indent="    ")
+    if path:
+        _emit(path, indent="    ")
+
+
 def _ask(prompt):
     try:
         return builtins.input(prompt).strip()
@@ -474,7 +488,7 @@ def _review_scope(names):
     return value is not None and value.lower() in ("y", "yes")
 
 
-def _canonical_provider_endpoint(cfg):
+def _provider_endpoint_parts(cfg):
     base = str(cfg.get("base_url") or "").strip()
     try:
         parsed = urllib.parse.urlsplit(base)
@@ -482,8 +496,7 @@ def _canonical_provider_endpoint(cfg):
         port = parsed.port
     except (TypeError, ValueError):
         raise NotesSummaryError("provider endpoint is not configured safely")
-    if (not parsed.scheme or not hostname or parsed.query or parsed.fragment
-            or provider_url_error(base)):
+    if not parsed.scheme or not hostname:
         raise NotesSummaryError("provider endpoint is not configured safely")
     scheme = parsed.scheme.lower()
     try:
@@ -496,6 +509,21 @@ def _canonical_provider_endpoint(cfg):
     authority = host_authority + port_suffix
     endpoint = urllib.parse.urlunsplit((scheme, authority, parsed.path.rstrip("/"), "", ""))
     display_host = host_authority + port_suffix
+    return endpoint, display_host, parsed, base
+
+
+def _sanitized_endpoint_for_display(cfg):
+    try:
+        endpoint, display_host, _, _ = _provider_endpoint_parts(cfg)
+        return endpoint, display_host
+    except NotesSummaryError:
+        return "", ""
+
+
+def _canonical_provider_endpoint(cfg):
+    endpoint, display_host, parsed, base = _provider_endpoint_parts(cfg)
+    if parsed.query or parsed.fragment or provider_url_error(base):
+        raise NotesSummaryError("provider endpoint is not configured safely")
     return endpoint, display_host
 
 
@@ -519,12 +547,15 @@ def _show_provider_consent(rt, state):
     base = str(cfg.get("base_url") or "").strip()
     endpoint = ""
     host = ""
+    display_endpoint, display_host = _sanitized_endpoint_for_display(cfg)
     try:
         endpoint, host = _canonical_provider_endpoint(cfg)
     except NotesSummaryError:
-        pass
+        host = display_host
     _emit("provider: %s%s" % (provider_name, (" (" + host + ")") if host else ""))
     _emit("model: %s" % model)
+    if display_endpoint:
+        _emit_endpoint(display_endpoint)
     binding = None
     if endpoint and cfg.get("model"):
         binding = _provider_binding(provider_name, cfg)
@@ -742,7 +773,7 @@ def _mark_request_not_sent(rt, state, status="stopped"):
         return
     _emit("ALVA / Request not sent")
     if prior_outcome_unknown:
-        _emit("No new request was made; the previous provider outcome remains uncertain.")
+        _emit("This new request was not sent. The earlier result is still unknown.")
     else:
         _emit("No provider request was made. Resume to review and consent again.")
 
@@ -1168,6 +1199,10 @@ def _poll_inflight_control():
     return None
 
 
+def _open_dispatch_gate(gate):
+    gate.set()
+
+
 def _provider_request_with_controls(rt, state, messages, config, provider_name):
     _emit("ALVA / Sending notes")
     _emit("provider: %s" % provider_name)
@@ -1209,6 +1244,12 @@ def _provider_request_with_controls(rt, state, messages, config, provider_name):
     events = queue.Queue()
     may_dispatch = threading.Event()
     abort_before_dispatch = threading.Event()
+    checkpointed_previous = None
+
+    def dispatch_authorized():
+        # A finally-path release is always marked abort-first and therefore
+        # cannot be mistaken for permission to transmit.
+        return may_dispatch.is_set() and not abort_before_dispatch.is_set()
 
     def dispatch_gate():
         events.put(("dispatch_ready", None))
@@ -1228,13 +1269,12 @@ def _provider_request_with_controls(rt, state, messages, config, provider_name):
 
     thread = threading.Thread(target=worker, name="alva-notes-provider", daemon=True)
     thread.start()
-    dispatched = False
     _emit("Waiting before dispatch")
     try:
         while True:
             action = _poll_inflight_control()
             if action:
-                raise _ProviderStopped(action, dispatched)
+                raise _ProviderStopped(action, dispatch_authorized())
             try:
                 kind, payload = events.get(timeout=0.08)
             except queue.Empty:
@@ -1254,28 +1294,41 @@ def _provider_request_with_controls(rt, state, messages, config, provider_name):
                     state["provider_status"] = previous_status
                     state["last_provider_binding"] = previous_binding
                     raise _ProviderAttemptFailed(type(exc).__name__, False)
-                dispatched = True
-                may_dispatch.set()
-                _emit("Request sent; waiting…")
+                checkpointed_previous = (previous_status, previous_binding)
+                _open_dispatch_gate(may_dispatch)
+                if not dispatch_authorized():
+                    raise _ProviderAttemptFailed("dispatch gate did not open", False)
+                _emit("Request authorized; waiting…")
                 _emit("p + Enter to pause · s + Enter to stop")
             elif kind == "result":
                 # If Stop arrived with the response, discard it and keep the
                 # durable unknown-outcome checkpoint; never save a draft.
                 action = _poll_inflight_control()
                 if action:
-                    raise _ProviderStopped(action, dispatched)
-                if not dispatched:
+                    raise _ProviderStopped(action, dispatch_authorized())
+                if not dispatch_authorized():
                     raise _ProviderAttemptFailed("response before dispatch", False)
                 return payload, None, True
             elif kind == "error":
-                raise _ProviderAttemptFailed(payload, dispatched)
+                raise _ProviderAttemptFailed(payload, dispatch_authorized())
     except KeyboardInterrupt:
-        raise _ProviderStopped("paused", dispatched)
+        raise _ProviderStopped("paused", dispatch_authorized())
+    except (_ProviderStopped, _ProviderAttemptFailed):
+        raise
+    except Exception as exc:
+        raise _ProviderAttemptFailed(type(exc).__name__, dispatch_authorized())
     finally:
-        transport.cancel()
-        if not dispatched:
+        gate_authorized = dispatch_authorized()
+        if not may_dispatch.is_set():
             abort_before_dispatch.set()
             may_dispatch.set()
+        if not gate_authorized and checkpointed_previous is not None:
+            state["provider_status"], state["last_provider_binding"] = checkpointed_previous
+            try:
+                _save_state(rt, state)
+            except BaseException:
+                pass
+        transport.cancel()
         thread.join(timeout=0.75)
 
 
@@ -1466,20 +1519,15 @@ def _run_state(rt, state, allow_uncertain_review=False):
                     _mark_request_not_sent(rt, state, exc.action)
                 return
             except _ProviderAttemptFailed as exc:
-                if exc.dispatched or state.get("provider_status") == "sent_outcome_unknown":
+                if exc.dispatched:
                     _mark_provider_uncertain(rt, state, "the request ended without a usable result")
                     if _offer_uncertain_recovery():
                         _run_state(rt, state, allow_uncertain_review=True)
                 else:
                     _mark_request_not_sent(rt, state, "paused")
                 return
-            except NotesSummaryError as exc:
-                if state.get("provider_status") == "sent_outcome_unknown":
-                    _mark_provider_uncertain(rt, state, str(exc))
-                    if _offer_uncertain_recovery():
-                        _run_state(rt, state, allow_uncertain_review=True)
-                else:
-                    _mark_request_not_sent(rt, state, "paused")
+            except NotesSummaryError:
+                _mark_request_not_sent(rt, state, "paused")
                 return
             _phase("summarize", "summary saved to a private local draft")
             if not _pause_for_next(rt, state, "write"):

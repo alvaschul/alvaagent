@@ -3073,6 +3073,159 @@ def test_notes_pre_dispatch_checkpoint_failure_is_not_sent():
     assert not any(t.name == "alva-notes-provider" and t.is_alive() for t in threading.enumerate())
 
 
+def test_notes_closed_dispatch_gate_fault_is_not_sent_and_resumable():
+    def start_server():
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(0.1)
+        accepted = threading.Event()
+        closed = threading.Event()
+        stop = threading.Event()
+        request_bytes = bytearray()
+        connections = []
+
+        def serve():
+            connection = None
+            try:
+                while not stop.is_set():
+                    try:
+                        connection, _ = listener.accept()
+                        break
+                    except socket.timeout:
+                        continue
+                if connection is None:
+                    return
+                connections.append(connection)
+                connection.settimeout(0.1)
+                accepted.set()
+                while not stop.is_set():
+                    try:
+                        chunk = connection.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        closed.set()
+                        return
+                    if not chunk:
+                        closed.set()
+                        return
+                    request_bytes.extend(chunk)
+            except OSError:
+                closed.set()
+            finally:
+                listener.close()
+
+        server_thread = threading.Thread(target=serve, name="notes-gate-test-server", daemon=True)
+        server_thread.start()
+        port = listener.getsockname()[1]
+
+        def cleanup():
+            stop.set()
+            try:
+                listener.close()
+            except OSError:
+                pass
+            for connection in connections:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+            server_thread.join(timeout=2.0)
+
+        return ("http://127.0.0.1:%d/v1" % port, accepted, closed,
+                request_bytes, server_thread, cleanup)
+
+    old_gate = notes_mod._open_dispatch_gate
+    old_save = notes_mod._save_state
+    old_poll = notes_mod._poll_inflight_control
+    old_stdin = notes_mod.sys.stdin
+    notes_mod._poll_inflight_control = lambda: None
+    notes_mod.sys.stdin = _NotesFakeTTY()
+    try:
+        cases = (
+            ("fresh", "not_requested", KeyboardInterrupt),
+            ("prior-uncertain", "sent_outcome_unknown", RuntimeError),
+        )
+        for case_name, prior_status, fault_type in cases:
+            root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+            rt = _notes_test_runtime()
+            provider_name = rt.cfg["active"]
+            cfg = rt.cfg["profiles"][provider_name]
+            endpoint, accepted, closed, request_bytes, server_thread, cleanup = start_server()
+            cfg["base_url"] = endpoint
+            prior_binding = (
+                notes_mod._provider_binding(provider_name, cfg)
+                if prior_status == "sent_outcome_unknown" else None)
+            attempt_history = []
+
+            def record_attempt_save(runtime, state):
+                result = old_save(runtime, state)
+                if state.get("stage") == "summarizing":
+                    attempt_history.append((state.get("provider_status"),
+                                            state.get("last_provider_binding")))
+                return result
+
+            notes_mod._save_state = record_attempt_save
+            if prior_status == "sent_outcome_unknown":
+                old_cwd = os.getcwd()
+                try:
+                    os.chdir(root)
+                    _, hashes = notes_mod._read_selected(root, ["one.md"])
+                finally:
+                    os.chdir(old_cwd)
+                state = notes_mod._new_state(root, ["one.md"], hashes)
+                state.update({
+                    "status": "stopped", "provider_status": prior_status,
+                    "provider_name": provider_name, "model": cfg["model"],
+                    "stage": "ready_to_summarize", "last_provider_binding": prior_binding,
+                })
+                notes_mod._save_state(rt, state)
+
+            def fail_before_gate_open(gate, selected_fault=fault_type):
+                assert not gate.is_set()
+                assert attempt_history and attempt_history[-1][0] == "sent_outcome_unknown"
+                if selected_fault is KeyboardInterrupt:
+                    raise KeyboardInterrupt()
+                raise RuntimeError("synthetic fault before dispatch gate open")
+
+            notes_mod._open_dispatch_gate = fail_before_gate_open
+            answers = ["1", "y", "", "s"] if prior_status == "not_requested" else ["r", "", "s"]
+            action = "" if prior_status == "not_requested" else "resume"
+            try:
+                output, _ = _notes_run(rt, root, answers, action)
+                assert accepted.wait(2.0), "%s never reached the closed gate" % case_name
+                assert closed.wait(2.0), "%s left the loopback connection open" % case_name
+            finally:
+                notes_mod._open_dispatch_gate = old_gate
+                cleanup()
+
+            saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+            assert request_bytes == b"", (case_name, request_bytes)
+            assert not server_thread.is_alive(), case_name
+            assert not any(t.name == "alva-notes-provider" and t.is_alive()
+                           for t in threading.enumerate()), case_name
+            assert saved["status"] == "paused" and saved["provider_status"] == prior_status, (case_name, saved)
+            assert saved["stage"] == "ready_to_summarize" and saved["files"] == ["one.md"]
+            assert saved["last_provider_binding"] == prior_binding
+            assert saved["consent_provider_binding"] is None and saved["consent_snapshot_sha256"] is None
+            assert attempt_history[-1] == (prior_status, prior_binding), (case_name, attempt_history)
+            assert "Request not sent" in output
+            if prior_status == "not_requested":
+                assert "No provider request was made" in " ".join(output.split())
+            else:
+                normalized = " ".join(output.split())
+                assert "This new request was not sent. The earlier result is still unknown." in normalized
+                assert "the request ended without a usable result" not in output
+                assert "ALVA / Result uncertain" not in output
+    finally:
+        notes_mod._open_dispatch_gate = old_gate
+        notes_mod._save_state = old_save
+        notes_mod._poll_inflight_control = old_poll
+        notes_mod.sys.stdin = old_stdin
+
+
 def test_notes_config_drift_requires_fresh_consent_and_never_falls_back():
     root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
     rt = _notes_test_runtime()
@@ -3173,6 +3326,45 @@ def test_notes_endpoint_fingerprint_preserves_explicit_zero_port():
     default_cfg = {"base_url": "https://provider.invalid/v1", "model": "synthetic-model", "api_key": "KEY_A"}
     explicit_cfg = {"base_url": endpoint, "model": "synthetic-model", "api_key": "KEY_A"}
     assert notes_mod._provider_binding("default", default_cfg) != notes_mod._provider_binding("default", explicit_cfg)
+
+
+def test_notes_endpoint_display_is_canonical_redacted_and_40_columns():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    old_width = notes_mod.shutil.get_terminal_size
+    notes_mod._single_provider_completion = lambda *a, **k: calls.append((a, k))
+    notes_mod.shutil.get_terminal_size = lambda fallback: os.terminal_size((40, 24))
+    try:
+        rt = _notes_test_runtime()
+        provider_name = rt.cfg["active"]
+        rt.cfg["profiles"][provider_name]["base_url"] = (
+            "HTTPS://Provider.Example:8443/api/custom/base/")
+        valid_output, _ = _notes_run(rt, root, ["1", "y", "", "n"])
+
+        unsafe_rt = _notes_test_runtime()
+        unsafe_name = unsafe_rt.cfg["active"]
+        unsafe_rt.cfg["profiles"][unsafe_name]["base_url"] = (
+            "https://SYNTHETIC_USER:SYNTHETIC_CREDENTIAL@Provider.Example:8443/"
+            "api/custom/base?token=SYNTHETIC_QUERY#SYNTHETIC_FRAGMENT")
+        unsafe_output, _ = _notes_run(unsafe_rt, root, ["1", "y", "", "n"])
+    finally:
+        notes_mod._single_provider_completion = old_provider
+        notes_mod.shutil.get_terminal_size = old_width
+
+    expected_wrap = (
+        "  endpoint:\n"
+        "    https://provider.example:8443\n"
+        "    /api/custom/base")
+    for output in (valid_output, unsafe_output):
+        assert expected_wrap in output, output
+        assert max(map(len, output.splitlines())) <= 40, output
+        assert "SYNTHETIC_TEST_KEY" not in output
+    for secret in ("SYNTHETIC_USER", "SYNTHETIC_CREDENTIAL", "SYNTHETIC_QUERY",
+                   "SYNTHETIC_FRAGMENT"):
+        assert secret not in unsafe_output, unsafe_output
+    assert "provider is not configured for a request" in " ".join(unsafe_output.split())
+    assert calls == []
 
 
 def test_notes_post_dispatch_failure_stays_uncertain_and_is_not_retried():
