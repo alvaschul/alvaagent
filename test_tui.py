@@ -28,6 +28,7 @@ import pty
 import readline
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,7 @@ import alvaagent.skills as skills_mod
 import alvaagent.tools as tools_mod
 import alvaagent.tui as tui_mod
 import alvaagent.util as util_mod
+import alvaagent.notes_summary as notes_mod
 
 repl_mod = sys.modules["alvaagent.repl"]
 
@@ -2489,6 +2491,1349 @@ def test_cli_smoke():
                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
                        timeout=30, env=_env, cwd=ROOT)
     assert r.returncode == 0, (r.returncode, r.stdout[-500:], r.stderr[-500:])
+
+
+def _notes_test_root(files=None):
+    root = tempfile.mkdtemp(prefix="alva_notes_task_")
+    _TMP_DIRS.append(root)
+    os.mkdir(os.path.join(root, "notes"))
+    for name, content in (files if files is not None else {"one.md": "SYNTHETIC_NOTE"}).items():
+        path = os.path.join(root, "notes", name)
+        raw = content if isinstance(content, bytes) else content.encode("utf-8")
+        with open(path, "wb") as stream:
+            stream.write(raw)
+    return root
+
+
+def _notes_test_runtime():
+    rt = mkrt()
+    rt.cfg = config_mod._normalize_state({
+        "provider": "synthetic-test-provider",
+        "base_url": "https://provider.invalid/v1",
+        "api_key": "SYNTHETIC_TEST_KEY",
+        "model": "synthetic-model",
+        "temperature": 0.2,
+    })
+    rt.history = [
+        {"role": "user", "content": "UNRELATED_CHAT_HISTORY_SENTINEL"},
+        {"role": "tool", "content": "UNRELATED_PRIOR_TOOL_OUTPUT_SENTINEL"},
+    ]
+    rt.store["test.unrelated_tool_result"] = "UNRELATED_STORED_TOOL_OUTPUT"
+    return rt
+
+
+def _notes_run(rt, root, answers=(), action=""):
+    old_cwd = os.getcwd()
+    old_input = notes_mod.builtins.input
+    answers = iter(answers)
+    prompts = []
+    out = io.StringIO()
+
+    def fake_input(prompt=""):
+        prompts.append(prompt)
+        try:
+            return next(answers)
+        except StopIteration:
+            raise AssertionError("unexpected notes workflow input prompt: %s" % prompt)
+
+    try:
+        os.chdir(root)
+        notes_mod.builtins.input = fake_input
+        with contextlib.redirect_stdout(out):
+            notes_mod.cmd_notes(rt, action)
+    finally:
+        notes_mod.builtins.input = old_input
+        os.chdir(old_cwd)
+    return out.getvalue(), prompts
+
+
+def _notes_run_with_pty_control(rt, root, answers, entered, control="s", action=""):
+    import fcntl
+    import struct
+    import termios
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
+    slave_stream = os.fdopen(slave, "r", buffering=1, encoding="utf-8")
+    old_stdin = notes_mod.sys.stdin
+    old_columns, old_lines = os.environ.get("COLUMNS"), os.environ.get("LINES")
+    notes_mod.sys.stdin = slave_stream
+    os.environ["COLUMNS"] = "40"
+    os.environ["LINES"] = "24"
+    result = {}
+
+    def run_task():
+        try:
+            result["value"] = _notes_run(rt, root, answers, action)
+        except BaseException as exc:
+            result["error"] = exc
+
+    task = threading.Thread(target=run_task, name="notes-pty-task", daemon=True)
+    started = time.monotonic()
+    task.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not entered.is_set() and task.is_alive() and time.monotonic() < deadline:
+            entered.wait(0.02)
+        if not entered.is_set():
+            raise AssertionError("synthetic stall was not reached before PTY control input")
+        os.write(master, (control + "\n").encode("ascii"))
+        task.join(timeout=5.0)
+        if task.is_alive():
+            raise AssertionError("notes task did not respond to real PTY control input")
+        if "error" in result:
+            raise result["error"]
+        output, prompts = result["value"]
+        return output, prompts, time.monotonic() - started
+    finally:
+        if task.is_alive():
+            try:
+                os.write(master, b"s\n")
+            except OSError:
+                pass
+            task.join(timeout=1.0)
+        notes_mod.sys.stdin = old_stdin
+        if old_columns is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = old_columns
+        if old_lines is None:
+            os.environ.pop("LINES", None)
+        else:
+            os.environ["LINES"] = old_lines
+        slave_stream.close()
+        os.close(master)
+
+
+def _notes_fake_provider(response, calls=None):
+    def fake(messages, cfg, before_dispatch=None, cancel_handle=None):
+        if before_dispatch:
+            before_dispatch()
+        if calls is not None:
+            calls.append((messages, cfg))
+        return response
+    return fake
+
+
+def _notes_start_stall_server(mode):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.1)
+    entered = threading.Event()
+    peer_closed = threading.Event()
+    stop = threading.Event()
+    request_count = [0]
+    connections = []
+
+    def serve():
+        conn = None
+        try:
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                    break
+                except socket.timeout:
+                    continue
+            if conn is None:
+                return
+            connections.append(conn)
+            conn.settimeout(0.1)
+            if mode == "tls":
+                entered.set()
+            else:
+                data = bytearray()
+                while b"\r\n\r\n" not in data and not stop.is_set():
+                    try:
+                        chunk = conn.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        return
+                    data.extend(chunk)
+                header, _, body = bytes(data).partition(b"\r\n\r\n")
+                length = 0
+                for line in header.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1].strip())
+                body = bytearray(body)
+                while len(body) < length and not stop.is_set():
+                    try:
+                        chunk = conn.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        return
+                    body.extend(chunk)
+                request_count[0] += 1
+                if mode == "body":
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                entered.set()
+            while not stop.is_set():
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    peer_closed.set()
+                    return
+        except OSError:
+            peer_closed.set()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=serve, name="synthetic-provider-server", daemon=True)
+    thread.start()
+    scheme = "https" if mode == "tls" else "http"
+    base = "%s://127.0.0.1:%d/v1" % (scheme, listener.getsockname()[1])
+
+    def cleanup():
+        stop.set()
+        try:
+            listener.close()
+        except OSError:
+            pass
+        for conn in connections:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        thread.join(timeout=2)
+
+    return base, entered, peer_closed, request_count, thread, cleanup
+
+
+class _NotesFakeTTY:
+    def isatty(self):
+        return True
+
+    def readline(self):
+        return ""
+
+
+def test_notes_provider_request_bypasses_environment_proxies():
+    class ProviderHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.server.requests += 1
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = json.dumps({"choices": [{"message": {"content": "Synthetic direct response."}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.server.requests += 1
+            self.send_error(502, "synthetic proxy should not receive this request")
+
+        def log_message(self, *args):
+            pass
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+    provider.requests = 0
+    proxy.requests = 0
+    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    provider_thread.start()
+    proxy_thread.start()
+    proxy_url = "http://127.0.0.1:%d" % proxy.server_address[1]
+    proxy_names = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                   "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
+    saved_env = {name: os.environ.get(name) for name in proxy_names}
+    try:
+        for name in proxy_names[:6]:
+            os.environ[name] = proxy_url
+        os.environ["NO_PROXY"] = ""
+        os.environ["no_proxy"] = ""
+        assert urllib.request.getproxies().get("http") == proxy_url
+        assert not urllib.request.proxy_bypass("127.0.0.1")
+        result = notes_mod._single_provider_completion(
+            notes_mod._task_messages([("one.md", "SYNTHETIC_NOTE")]),
+            {
+                "base_url": "http://127.0.0.1:%d/v1" % provider.server_address[1],
+                "api_key": "SYNTHETIC_PROVIDER_KEY",
+                "model": "synthetic-model",
+                "temperature": 0.2,
+            },
+        )
+        assert result == "Synthetic direct response."
+        assert provider.requests == 1 and proxy.requests == 0
+    finally:
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        provider.shutdown()
+        proxy.shutdown()
+        provider.server_close()
+        proxy.server_close()
+        provider_thread.join(timeout=2)
+        proxy_thread.join(timeout=2)
+
+
+def test_notes_provider_response_is_streamed_with_hard_2mib_cap():
+    class OversizedResponse:
+        def __init__(self, declared_length=None):
+            self.declared_length = declared_length
+            self.returned = 0
+            self.max_requested = 0
+            self.read_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def getheader(self, name):
+            return str(self.declared_length) if name.lower() == "content-length" and self.declared_length is not None else None
+
+        def read(self, size=-1):
+            assert size is not None and size >= 0, "response reader used an unbounded read"
+            self.read_calls += 1
+            self.max_requested = max(self.max_requested, size)
+            remaining = notes_mod._MAX_OUTPUT_BYTES + 1 - self.returned
+            count = min(size, remaining)
+            self.returned += count
+            return b"x" * count
+
+    response = OversizedResponse()
+    old_open = notes_mod._open_provider_once
+    notes_mod._open_provider_once = lambda *args, **kwargs: response
+    try:
+        try:
+            notes_mod._single_provider_completion(
+                notes_mod._task_messages([("one.md", "SYNTHETIC_NOTE")]),
+                {"base_url": "https://provider.invalid/v1", "api_key": "SYNTHETIC_KEY",
+                 "model": "synthetic-model", "temperature": 0.2},
+            )
+            raise AssertionError("oversized provider response was accepted")
+        except notes_mod.NotesSummaryError as exc:
+            assert "provider response exceeds the 2 MiB safety limit" in str(exc)
+    finally:
+        notes_mod._open_provider_once = old_open
+    assert response.returned == notes_mod._MAX_OUTPUT_BYTES + 1
+    assert response.max_requested <= 65536
+    assert response.read_calls <= (notes_mod._MAX_OUTPUT_BYTES // 65536) + 2
+
+    advertised = OversizedResponse(declared_length=notes_mod._MAX_OUTPUT_BYTES + 1)
+    old_open = notes_mod._open_provider_once
+    notes_mod._open_provider_once = lambda *args, **kwargs: advertised
+    try:
+        try:
+            notes_mod._single_provider_completion(
+                notes_mod._task_messages([("one.md", "SYNTHETIC_NOTE")]),
+                {"base_url": "https://provider.invalid/v1", "api_key": "SYNTHETIC_KEY",
+                 "model": "synthetic-model", "temperature": 0.2},
+            )
+            raise AssertionError("oversized declared provider response was accepted")
+        except notes_mod.NotesSummaryError as exc:
+            assert "provider response exceeds the 2 MiB safety limit" in str(exc)
+    finally:
+        notes_mod._open_provider_once = old_open
+    assert advertised.returned == 0 and advertised.read_calls == 0
+
+
+def test_notes_task_scoped_payload_and_40_column_flow():
+    long_name = "a" * 72 + ".md"
+    root = _notes_test_root({
+        long_name: "SYNTHETIC_SELECTED_NOTE_ONLY",
+        "z-unselected.md": "SYNTHETIC_UNSELECTED_NOTE_SENTINEL",
+    })
+    rt = _notes_test_runtime()
+    calls = []
+
+    def fake_provider(messages, cfg, before_dispatch=None, cancel_handle=None):
+        if before_dispatch:
+            before_dispatch()
+        calls.append((messages, cfg))
+        return "Synthetic summary of selected note."
+
+    old_provider = notes_mod._single_provider_completion
+    old_width = notes_mod.shutil.get_terminal_size
+    notes_mod._single_provider_completion = fake_provider
+    notes_mod.shutil.get_terminal_size = lambda fallback: os.terminal_size((40, 24))
+    try:
+        output, prompts = _notes_run(rt, root, ["1", "y", "", "s", "", ""])
+    finally:
+        notes_mod._single_provider_completion = old_provider
+        notes_mod.shutil.get_terminal_size = old_width
+
+    assert len(calls) == 1
+    messages, cfg = calls[0]
+    assert len(messages) == 2
+    assert [m["role"] for m in messages] == ["system", "user"]
+    payload = "\n".join(m["content"] for m in messages)
+    assert "SYNTHETIC_SELECTED_NOTE_ONLY" in payload
+    assert "SYNTHETIC_UNSELECTED_NOTE_SENTINEL" not in payload
+    assert "UNRELATED_CHAT_HISTORY_SENTINEL" not in payload
+    assert "UNRELATED_PRIOR_TOOL_OUTPUT_SENTINEL" not in payload
+    assert "UNRELATED_STORED_TOOL_OUTPUT" not in payload
+    assert cfg["api_key"] == "SYNTHETIC_TEST_KEY"
+    assert open(os.path.join(root, "summary.md"), encoding="utf-8").read() == "Synthetic summary of selected note.\n"
+    assert "complete" in output and "[find]" in output and "[summarize]" in output
+    assert "[write]" in output and "[verify]" in output
+    normalized_output = " ".join(output.split())
+    assert "Sends the task prompt and only these selected file contents. No prior chat or tool results are sent." in normalized_output
+    assert "Type s + Enter to send; o = offline; n = cancel" in normalized_output
+    assert "sending may incur provider usage charges" in normalized_output
+    assert "[Send these files]" not in output and "[Stay offline]" not in output
+    assert max(map(len, output.splitlines())) <= 40, output
+    assert all(len(prompt) <= 40 for prompt in prompts), prompts
+    checkpoint = open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), "rb").read()
+    assert b"SYNTHETIC_TEST_KEY" not in checkpoint
+    assert b"SYNTHETIC_SELECTED_NOTE_ONLY" not in checkpoint
+    assert b"UNRELATED_CHAT_HISTORY_SENTINEL" not in checkpoint
+    assert not any(name.startswith(".notes-summary-") and name.endswith(".draft")
+                   for name in os.listdir(rt.data_dir))
+    assert len(tools_mod.TOOLS) == 36  # no broad tool catalog changes
+
+
+def test_notes_decline_and_offline_send_zero_requests():
+    old_provider = notes_mod._single_provider_completion
+    calls = []
+    notes_mod._single_provider_completion = lambda *a, **k: calls.append((a, k))
+    try:
+        for choice, expected in (("n", "declined"), ("o", "offline_unavailable")):
+            root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+            rt = _notes_test_runtime()
+            output, _ = _notes_run(rt, root, ["1", "y", "", choice])
+            state = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+            assert state["status"] == expected, (state, output)
+            assert "no provider request was sent" in " ".join(output.split()), output
+    finally:
+        notes_mod._single_provider_completion = old_provider
+    assert calls == [], calls
+
+
+def test_notes_overwrite_decline_and_approval_are_exact_target_only():
+    old_provider = notes_mod._single_provider_completion
+    notes_mod._single_provider_completion = _notes_fake_provider("Synthetic replacement.")
+    try:
+        for answer in ("n", "y"):
+            root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+            with open(os.path.join(root, "summary.md"), "w", encoding="utf-8") as stream:
+                stream.write("ORIGINAL_TARGET_SENTINEL")
+            rt = _notes_test_runtime()
+            answers = ["1", "y", "", "s", "", answer]
+            if answer == "y":
+                answers.append("")  # continue from write to verification
+            output, _ = _notes_run(rt, root, answers)
+            target = open(os.path.join(root, "summary.md"), encoding="utf-8").read()
+            if answer == "n":
+                assert target == "ORIGINAL_TARGET_SENTINEL"
+                assert "overwrite declined" in output
+            else:
+                assert target == "Synthetic replacement.\n"
+                assert "verified ./summary.md" in output
+            assert not os.path.exists(os.path.join(root, "notes", "summary.md"))
+    finally:
+        notes_mod._single_provider_completion = old_provider
+
+
+def test_notes_stop_resume_before_and_after_atomic_write():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    provider_calls = []
+    replace_calls = []
+    old_provider = notes_mod._single_provider_completion
+    old_replace = notes_mod._atomic_replace
+
+    fake_provider = _notes_fake_provider("Synthetic resumable summary.", provider_calls)
+
+    def count_replace(*args, **kwargs):
+        replace_calls.append(1)
+        return old_replace(*args, **kwargs)
+
+    notes_mod._single_provider_completion = fake_provider
+    notes_mod._atomic_replace = count_replace
+    try:
+        output, _ = _notes_run(rt, root, ["1", "y", "", "s", "s"])
+        state = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+        assert state["status"] == "stopped" and state["stage"] == "ready_to_write"
+        draft_path = notes_mod._draft_path(rt, state["task_id"])
+        assert os.stat(draft_path).st_mode & 0o777 == 0o600
+        assert not os.path.exists(os.path.join(root, "summary.md"))
+        _notes_run(rt, root, [""], "resume")
+        assert open(os.path.join(root, "summary.md"), encoding="utf-8").read() == "Synthetic resumable summary.\n"
+        assert len(provider_calls) == 1 and len(replace_calls) == 1
+
+        root2 = _notes_test_root({"one.md": "SYNTHETIC_NOTE_2"})
+        rt2 = _notes_test_runtime()
+        output2, _ = _notes_run(rt2, root2, ["1", "y", "", "s", "", "s"])
+        state2 = json.loads(open(os.path.join(rt2.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+        assert state2["status"] == "stopped" and state2["stage"] == "verify"
+        before = open(os.path.join(root2, "summary.md"), "rb").read()
+        _notes_run(rt2, root2, [], "resume")
+        after = open(os.path.join(root2, "summary.md"), "rb").read()
+        assert after == before
+        assert len(provider_calls) == 2 and len(replace_calls) == 2
+        assert "checkpoint saved" in output and "checkpoint saved" in output2
+    finally:
+        notes_mod._single_provider_completion = old_provider
+        notes_mod._atomic_replace = old_replace
+
+
+def test_notes_uncertain_provider_request_is_never_repeated_on_resume():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        _, hashes = notes_mod._read_selected(root, ["one.md"])
+    finally:
+        os.chdir(old_cwd)
+    state = notes_mod._new_state(root, ["one.md"], hashes)
+    state["provider_status"] = "sent_outcome_unknown"
+    state["provider_name"] = "synthetic-test-provider"
+    state["model"] = "synthetic-model"
+    state["stage"] = "ready_to_summarize"
+    state["status"] = "stopped"
+    notes_mod._save_state(rt, state)
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    notes_mod._single_provider_completion = _notes_fake_provider("Fresh synthetic summary.", calls)
+    try:
+        output, _ = _notes_run(rt, root, ["l"], "resume")
+        saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+        assert saved["status"] == "stopped" and saved["provider_status"] == "sent_outcome_unknown"
+        assert saved["stage"] == "ready_to_summarize" and saved["files"] == ["one.md"]
+        assert saved["content_snapshot_sha256"] == state["content_snapshot_sha256"]
+        assert calls == []
+
+        # Reload from the same private data directory, then explicitly review,
+        # recheck, and consent to one fresh request for the same exact snapshot.
+        reloaded_rt = _notes_test_runtime()
+        reloaded_rt.data_dir = rt.data_dir
+        resumed, _ = _notes_run(reloaded_rt, root, ["r", "", "s", "s"], "resume")
+    finally:
+        notes_mod._single_provider_completion = old_provider
+    saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+    assert saved["status"] == "stopped" and saved["provider_status"] == "succeeded"
+    assert len(calls) == 1
+    assert "The provider may already have received the selected notes. The result is unknown; no automatic retry will happen." in " ".join(resumed.split())
+    assert "./notes/" in resumed and "one.md" in resumed and "content snapshot" in resumed
+    active_cfg = notes_mod.active_cfg(reloaded_rt)
+    assert saved["consent_provider_binding"] == notes_mod._provider_binding(
+        active_cfg.get("provider") or "default", active_cfg)
+    assert saved["consent_snapshot_sha256"] == state["content_snapshot_sha256"]
+    assert not os.path.exists(os.path.join(root, "summary.md"))
+
+
+def test_notes_ctrl_c_unknown_outcome_copy_is_precise():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    calls = []
+    old_provider_call = notes_mod._provider_call
+
+    def interrupt_after_dispatch(runtime, state, *args):
+        calls.append(1)
+        state["provider_status"] = "sent_outcome_unknown"
+        state["stage"] = "summarizing"
+        raise KeyboardInterrupt()
+
+    notes_mod._provider_call = interrupt_after_dispatch
+    try:
+        output, _ = _notes_run(rt, root, ["1", "y", "", "s"])
+    finally:
+        notes_mod._provider_call = old_provider_call
+
+    saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+    normalized = " ".join(output.split())
+    assert calls == [1]
+    assert saved["status"] == "stopped" and saved["provider_status"] == "sent_outcome_unknown"
+    assert "The provider may already have received the selected notes. The result is unknown; no automatic retry will happen." in normalized
+    assert "Interrupted after dispatch. Any late provider result will be ignored." in normalized
+    assert "the provider may still receive" not in output
+    assert not os.path.exists(os.path.join(root, "summary.md"))
+
+
+def test_notes_pre_dispatch_checkpoint_failure_is_not_sent():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    old_save = notes_mod._save_state
+    old_poll = notes_mod._poll_inflight_control
+    old_stdin = notes_mod.sys.stdin
+
+    def fail_dispatch_checkpoint(runtime, state):
+        if state.get("provider_status") == "sent_outcome_unknown":
+            raise PermissionError("synthetic checkpoint write failure")
+        return old_save(runtime, state)
+
+    notes_mod._single_provider_completion = _notes_fake_provider("must not be sent", calls)
+    notes_mod._save_state = fail_dispatch_checkpoint
+    notes_mod._poll_inflight_control = lambda: None
+    notes_mod.sys.stdin = _NotesFakeTTY()
+    try:
+        output, _ = _notes_run(rt, root, ["1", "y", "", "s"])
+    finally:
+        notes_mod._single_provider_completion = old_provider
+        notes_mod._save_state = old_save
+        notes_mod._poll_inflight_control = old_poll
+        notes_mod.sys.stdin = old_stdin
+    saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+    assert calls == []
+    assert saved["status"] in ("stopped", "paused") and saved["provider_status"] == "not_requested"
+    assert saved["stage"] == "ready_to_summarize" and saved["last_provider_binding"] is None
+    assert "No provider request was made" in " ".join(output.split())
+    assert not any(t.name == "alva-notes-provider" and t.is_alive() for t in threading.enumerate())
+
+
+def test_notes_closed_dispatch_gate_fault_is_not_sent_and_resumable():
+    def start_server():
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(0.1)
+        accepted = threading.Event()
+        closed = threading.Event()
+        stop = threading.Event()
+        request_bytes = bytearray()
+        connections = []
+
+        def serve():
+            connection = None
+            try:
+                while not stop.is_set():
+                    try:
+                        connection, _ = listener.accept()
+                        break
+                    except socket.timeout:
+                        continue
+                if connection is None:
+                    return
+                connections.append(connection)
+                connection.settimeout(0.1)
+                accepted.set()
+                while not stop.is_set():
+                    try:
+                        chunk = connection.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        closed.set()
+                        return
+                    if not chunk:
+                        closed.set()
+                        return
+                    request_bytes.extend(chunk)
+            except OSError:
+                closed.set()
+            finally:
+                listener.close()
+
+        server_thread = threading.Thread(target=serve, name="notes-gate-test-server", daemon=True)
+        server_thread.start()
+        port = listener.getsockname()[1]
+
+        def cleanup():
+            stop.set()
+            try:
+                listener.close()
+            except OSError:
+                pass
+            for connection in connections:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+            server_thread.join(timeout=2.0)
+
+        return ("http://127.0.0.1:%d/v1" % port, accepted, closed,
+                request_bytes, server_thread, cleanup)
+
+    old_gate = notes_mod._open_dispatch_gate
+    old_save = notes_mod._save_state
+    old_poll = notes_mod._poll_inflight_control
+    old_stdin = notes_mod.sys.stdin
+    notes_mod._poll_inflight_control = lambda: None
+    notes_mod.sys.stdin = _NotesFakeTTY()
+    try:
+        cases = (
+            ("fresh", "not_requested", KeyboardInterrupt),
+            ("prior-uncertain", "sent_outcome_unknown", RuntimeError),
+        )
+        for case_name, prior_status, fault_type in cases:
+            root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+            rt = _notes_test_runtime()
+            provider_name = rt.cfg["active"]
+            cfg = rt.cfg["profiles"][provider_name]
+            endpoint, accepted, closed, request_bytes, server_thread, cleanup = start_server()
+            cfg["base_url"] = endpoint
+            prior_binding = (
+                notes_mod._provider_binding(provider_name, cfg)
+                if prior_status == "sent_outcome_unknown" else None)
+            attempt_history = []
+
+            def record_attempt_save(runtime, state):
+                result = old_save(runtime, state)
+                if state.get("stage") == "summarizing":
+                    attempt_history.append((state.get("provider_status"),
+                                            state.get("last_provider_binding")))
+                return result
+
+            notes_mod._save_state = record_attempt_save
+            if prior_status == "sent_outcome_unknown":
+                old_cwd = os.getcwd()
+                try:
+                    os.chdir(root)
+                    _, hashes = notes_mod._read_selected(root, ["one.md"])
+                finally:
+                    os.chdir(old_cwd)
+                state = notes_mod._new_state(root, ["one.md"], hashes)
+                state.update({
+                    "status": "stopped", "provider_status": prior_status,
+                    "provider_name": provider_name, "model": cfg["model"],
+                    "stage": "ready_to_summarize", "last_provider_binding": prior_binding,
+                })
+                notes_mod._save_state(rt, state)
+
+            def fail_before_gate_open(gate, selected_fault=fault_type):
+                assert not gate.is_set()
+                assert attempt_history and attempt_history[-1][0] == "sent_outcome_unknown"
+                if selected_fault is KeyboardInterrupt:
+                    raise KeyboardInterrupt()
+                raise RuntimeError("synthetic fault before dispatch gate open")
+
+            notes_mod._open_dispatch_gate = fail_before_gate_open
+            answers = ["1", "y", "", "s"] if prior_status == "not_requested" else ["r", "", "s"]
+            action = "" if prior_status == "not_requested" else "resume"
+            try:
+                output, _ = _notes_run(rt, root, answers, action)
+                assert accepted.wait(2.0), "%s never reached the closed gate" % case_name
+                assert closed.wait(2.0), "%s left the loopback connection open" % case_name
+            finally:
+                notes_mod._open_dispatch_gate = old_gate
+                cleanup()
+
+            saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+            assert request_bytes == b"", (case_name, request_bytes)
+            assert not server_thread.is_alive(), case_name
+            assert not any(t.name == "alva-notes-provider" and t.is_alive()
+                           for t in threading.enumerate()), case_name
+            assert saved["status"] == "paused" and saved["provider_status"] == prior_status, (case_name, saved)
+            assert saved["stage"] == "ready_to_summarize" and saved["files"] == ["one.md"]
+            assert saved["last_provider_binding"] == prior_binding
+            assert saved["consent_provider_binding"] is None and saved["consent_snapshot_sha256"] is None
+            assert attempt_history[-1] == (prior_status, prior_binding), (case_name, attempt_history)
+            assert "Request not sent" in output
+            if prior_status == "not_requested":
+                assert "No provider request was made" in " ".join(output.split())
+            else:
+                normalized = " ".join(output.split())
+                assert "This new request was not sent." in normalized
+                assert "The provider may already have received the selected notes. The result is unknown; no automatic retry will happen." in normalized
+                assert "the request ended without a usable result" not in output
+                assert "ALVA / Result uncertain" not in output
+    finally:
+        notes_mod._open_dispatch_gate = old_gate
+        notes_mod._save_state = old_save
+        notes_mod._poll_inflight_control = old_poll
+        notes_mod.sys.stdin = old_stdin
+
+
+def test_notes_config_drift_requires_fresh_consent_and_never_falls_back():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    provider_name = rt.cfg["active"]
+    old_cfg = notes_mod.active_cfg(rt)
+    old_binding = notes_mod._provider_binding(provider_name, old_cfg)
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        _, hashes = notes_mod._read_selected(root, ["one.md"])
+    finally:
+        os.chdir(old_cwd)
+    state = notes_mod._new_state(root, ["one.md"], hashes)
+    state.update({
+        "status": "stopped", "provider_status": "sent_outcome_unknown",
+        "provider_name": provider_name, "model": old_cfg["model"],
+        "stage": "ready_to_summarize", "last_provider_binding": old_binding,
+    })
+    notes_mod._save_state(rt, state)
+    new_cfg = rt.cfg["profiles"][provider_name]
+    new_cfg["base_url"] = "https://new-provider.invalid/v2"
+    new_cfg["model"] = "synthetic-model-v2"
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    notes_mod._single_provider_completion = _notes_fake_provider("Fresh synthetic summary.", calls)
+    try:
+        declined, _ = _notes_run(rt, root, ["r", "", "n"], "resume")
+        saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+        assert calls == []
+        assert saved["status"] == "stopped" and saved["provider_status"] == "sent_outcome_unknown"
+        assert saved["last_provider_binding"] == old_binding
+        assert "provider configuration changed" in declined
+        assert "synthetic-model-v2" in declined and "endpoint ID:" in declined
+        assert "No new provider request was sent" in " ".join(declined.split())
+
+        # A second explicit review and send authorizes only the newly displayed
+        # provider/model/endpoint and exact unchanged note snapshot.
+        sent, _ = _notes_run(rt, root, ["r", "", "s", "s"], "resume")
+    finally:
+        notes_mod._single_provider_completion = old_provider
+    saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+    assert len(calls) == 1
+    assert calls[0][1]["base_url"] == "https://new-provider.invalid/v2"
+    assert calls[0][1]["model"] == "synthetic-model-v2"
+    current_binding = notes_mod._provider_binding(provider_name, notes_mod.active_cfg(rt))
+    assert saved["last_provider_binding"] == current_binding
+    assert "provider configuration changed" in sent
+    assert not os.path.exists(os.path.join(root, "summary.md"))
+
+
+def test_notes_credential_drift_requires_fresh_consent_without_key_storage():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    provider_name = rt.cfg["active"]
+    cfg = notes_mod.active_cfg(rt)
+    original_key = cfg["api_key"]
+    old_binding = notes_mod._provider_binding(provider_name, cfg)
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        _, hashes = notes_mod._read_selected(root, ["one.md"])
+    finally:
+        os.chdir(old_cwd)
+    state = notes_mod._new_state(root, ["one.md"], hashes)
+    state.update({
+        "status": "stopped", "provider_status": "sent_outcome_unknown",
+        "provider_name": provider_name, "model": cfg["model"],
+        "stage": "ready_to_summarize", "last_provider_binding": old_binding,
+    })
+    notes_mod._save_state(rt, state)
+    replacement_key = "SYNTHETIC_ROTATED_CREDENTIAL_DO_NOT_LEAK"
+    cfg["api_key"] = replacement_key
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    notes_mod._single_provider_completion = _notes_fake_provider("must not be sent", calls)
+    try:
+        output, _ = _notes_run(rt, root, ["r", "", "n"], "resume")
+    finally:
+        notes_mod._single_provider_completion = old_provider
+    state_path = os.path.join(rt.data_dir, notes_mod._STATE_NAME)
+    saved_text = open(state_path, encoding="utf-8").read()
+    saved = json.loads(saved_text)
+    assert calls == []
+    assert saved["status"] == "stopped" and saved["provider_status"] == "sent_outcome_unknown"
+    assert saved["last_provider_binding"] == old_binding
+    assert notes_mod._provider_binding(provider_name, cfg) != old_binding
+    assert "provider configuration changed" in output
+    assert original_key not in saved_text and replacement_key not in saved_text
+    assert original_key not in output and replacement_key not in output
+
+
+def test_notes_endpoint_fingerprint_preserves_explicit_zero_port():
+    endpoint, host = notes_mod._canonical_provider_endpoint({
+        "base_url": "https://provider.invalid:0/v1",
+    })
+    assert endpoint == "https://provider.invalid:0/v1"
+    assert host == "provider.invalid:0"
+    default_cfg = {"base_url": "https://provider.invalid/v1", "model": "synthetic-model", "api_key": "KEY_A"}
+    explicit_cfg = {"base_url": endpoint, "model": "synthetic-model", "api_key": "KEY_A"}
+    assert notes_mod._provider_binding("default", default_cfg) != notes_mod._provider_binding("default", explicit_cfg)
+
+
+def test_notes_endpoint_display_is_canonical_redacted_and_40_columns():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    old_width = notes_mod.shutil.get_terminal_size
+    notes_mod._single_provider_completion = lambda *a, **k: calls.append((a, k))
+    notes_mod.shutil.get_terminal_size = lambda fallback: os.terminal_size((40, 24))
+    try:
+        rt = _notes_test_runtime()
+        provider_name = rt.cfg["active"]
+        rt.cfg["profiles"][provider_name]["base_url"] = (
+            "HTTPS://Provider.Example:8443/api/custom/base/")
+        valid_output, _ = _notes_run(rt, root, ["1", "y", "", "n"])
+
+        unsafe_rt = _notes_test_runtime()
+        unsafe_name = unsafe_rt.cfg["active"]
+        unsafe_rt.cfg["profiles"][unsafe_name]["base_url"] = (
+            "https://SYNTHETIC_USER:SYNTHETIC_CREDENTIAL@Provider.Example:8443/"
+            "api/custom/base?token=SYNTHETIC_QUERY#SYNTHETIC_FRAGMENT")
+        unsafe_output, _ = _notes_run(unsafe_rt, root, ["1", "y", "", "n"])
+    finally:
+        notes_mod._single_provider_completion = old_provider
+        notes_mod.shutil.get_terminal_size = old_width
+
+    expected_wrap = (
+        "  endpoint:\n"
+        "    https://provider.example:8443\n"
+        "    /api/custom/base")
+    for output in (valid_output, unsafe_output):
+        assert expected_wrap in output, output
+        assert max(map(len, output.splitlines())) <= 40, output
+        assert "SYNTHETIC_TEST_KEY" not in output
+    for secret in ("SYNTHETIC_USER", "SYNTHETIC_CREDENTIAL", "SYNTHETIC_QUERY",
+                   "SYNTHETIC_FRAGMENT"):
+        assert secret not in unsafe_output, unsafe_output
+    assert "provider is not configured for a request" in " ".join(unsafe_output.split())
+    assert calls == []
+
+
+def test_notes_post_dispatch_failure_stays_uncertain_and_is_not_retried():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    old_poll = notes_mod._poll_inflight_control
+    old_stdin = notes_mod.sys.stdin
+
+    def disconnect_after_dispatch(messages, cfg, before_dispatch=None, cancel_handle=None):
+        if before_dispatch:
+            before_dispatch()
+        calls.append((messages, cfg))
+        raise OSError("synthetic disconnect after send")
+
+    notes_mod._single_provider_completion = disconnect_after_dispatch
+    notes_mod._poll_inflight_control = lambda: None
+    notes_mod.sys.stdin = _NotesFakeTTY()
+    try:
+        output, _ = _notes_run(rt, root, ["1", "y", "", "s", "l"])
+        resumed, _ = _notes_run(rt, root, ["l"], "resume")
+    finally:
+        notes_mod._single_provider_completion = old_provider
+        notes_mod._poll_inflight_control = old_poll
+        notes_mod.sys.stdin = old_stdin
+    saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+    assert len(calls) == 1
+    assert saved["status"] == "stopped" and saved["provider_status"] == "sent_outcome_unknown"
+    assert "Result uncertain" in output and "no automatic retry" in output
+    assert "No provider request was made" not in resumed
+    assert not os.path.exists(os.path.join(root, "summary.md"))
+
+
+def test_notes_stop_cancels_worker_on_connect_headers_body_and_dns_stalls():
+    hint = "  p + Enter to pause · s + Enter to stop"
+    assert len(hint) == 40
+    for mode, control in (("tls", "s"), ("headers", "p"), ("body", "s")):
+        base, entered, peer_closed, request_count, server_thread, cleanup = _notes_start_stall_server(mode)
+        root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+        rt = _notes_test_runtime()
+        notes_mod.active_cfg(rt)["base_url"] = base
+        answers = ["1", "y", "", "s"] + (["l"] if mode == "body" else [])
+        try:
+            output, _, elapsed = _notes_run_with_pty_control(rt, root, answers, entered, control)
+            assert elapsed < 2.0, (mode, elapsed)
+            assert hint in output, (mode, output)
+            assert peer_closed.wait(1.5), "client socket remained open in %s stall" % mode
+            saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+            if mode == "tls":
+                assert saved["status"] == "stopped" and saved["provider_status"] == "not_requested"
+                assert request_count[0] == 0
+                assert "No provider request was made" in " ".join(output.split())
+            else:
+                assert saved["provider_status"] == "sent_outcome_unknown"
+                assert request_count[0] == 1
+                assert "Result uncertain" in output
+                if mode == "headers":
+                    assert saved["status"] == "paused" and "Pause was received" in output
+                else:
+                    assert saved["status"] == "stopped" and "Stop was received" in output
+            assert not any(t.name == "alva-notes-provider" and t.is_alive()
+                           for t in threading.enumerate()), "provider worker leaked after %s input" % control
+            assert not server_thread.is_alive(), "synthetic connection handler leaked after %s input" % control
+        finally:
+            cleanup()
+
+    # Feed actual s+Enter during a resolver subprocess stall as well.
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    notes_mod.active_cfg(rt)["base_url"] = "https://synthetic-dns-stall.invalid/v1"
+    old_dns_code = notes_mod._DNS_LOOKUP_CODE
+    old_popen = notes_mod.subprocess.Popen
+    children = []
+    resolver_started = threading.Event()
+    notes_mod._DNS_LOOKUP_CODE = "import time; time.sleep(30)"
+
+    def record_popen(*args, **kwargs):
+        proc = old_popen(*args, **kwargs)
+        children.append(proc)
+        resolver_started.set()
+        return proc
+
+    notes_mod.subprocess.Popen = record_popen
+    try:
+        output, _, elapsed = _notes_run_with_pty_control(
+            rt, root, ["1", "y", "", "s"], resolver_started, "s")
+    finally:
+        notes_mod._DNS_LOOKUP_CODE = old_dns_code
+        notes_mod.subprocess.Popen = old_popen
+    saved = json.loads(open(os.path.join(rt.data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+    assert elapsed < 2.0
+    assert hint in output
+    assert children and children[0].poll() is not None
+    assert saved["status"] == "stopped" and saved["provider_status"] == "not_requested"
+    assert "No provider request was made" in " ".join(output.split())
+    assert not any(t.name == "alva-notes-provider" and t.is_alive() for t in threading.enumerate())
+
+    # The same resolver child is also bounded without user Stop.
+    old_dns_timeout = notes_mod._DNS_TIMEOUT
+    old_dns_code = notes_mod._DNS_LOOKUP_CODE
+    old_popen = notes_mod.subprocess.Popen
+    children = []
+    notes_mod._DNS_TIMEOUT = 0.1
+    notes_mod._DNS_LOOKUP_CODE = "import time; time.sleep(30)"
+    notes_mod.subprocess.Popen = record_popen
+    try:
+        try:
+            notes_mod._resolve_addresses("synthetic-dns-timeout.invalid", 443,
+                                         notes_mod._TransportCancellation())
+            raise AssertionError("stalled DNS lookup was not bounded")
+        except notes_mod.NotesSummaryError as exc:
+            assert "DNS lookup timed out" in str(exc)
+    finally:
+        notes_mod._DNS_TIMEOUT = old_dns_timeout
+        notes_mod._DNS_LOOKUP_CODE = old_dns_code
+        notes_mod.subprocess.Popen = old_popen
+    assert children and children[0].poll() is not None
+
+
+def test_notes_symlinks_and_traversal_are_blocked():
+    parent = tempfile.mkdtemp(prefix="alva_notes_escape_")
+    _TMP_DIRS.append(parent)
+    outside = os.path.join(parent, "outside.txt")
+    with open(outside, "w", encoding="utf-8") as stream:
+        stream.write("OUTSIDE_SENTINEL")
+    root = _notes_test_root({"safe.md": "SYNTHETIC_SAFE_NOTE"})
+    os.symlink(outside, os.path.join(root, "notes", "escape.md"))
+    os.symlink(outside, os.path.join(root, "summary.md"))
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        assert notes_mod._list_note_names(root) == ["safe.md"]
+        try:
+            notes_mod._read_selected(root, ["../outside.txt"])
+            raise AssertionError("parent traversal was accepted")
+        except notes_mod.NotesSummaryError:
+            pass
+    finally:
+        os.chdir(old_cwd)
+    rt = _notes_test_runtime()
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    notes_mod._single_provider_completion = lambda *a, **k: calls.append(1)
+    try:
+        output, _ = _notes_run(rt, root, [])
+    finally:
+        notes_mod._single_provider_completion = old_provider
+    assert calls == []
+    assert "not a regular file" in output
+    assert open(outside, encoding="utf-8").read() == "OUTSIDE_SENTINEL"
+
+    root2 = _notes_test_root({})
+    os.rmdir(os.path.join(root2, "notes"))
+    os.symlink(parent, os.path.join(root2, "notes"))
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root2)
+        try:
+            notes_mod._list_note_names(root2)
+            raise AssertionError("notes directory symlink was accepted")
+        except notes_mod.NotesSummaryError:
+            pass
+    finally:
+        os.chdir(old_cwd)
+
+
+def test_notes_private_state_paths_modes_and_rejections():
+    import stat
+
+    parent = tempfile.mkdtemp(prefix="alva_notes_state_security_")
+    _TMP_DIRS.append(parent)
+    state_dir = os.path.join(parent, "permissive-state")
+    os.mkdir(state_dir, 0o755)
+    os.chmod(state_dir, 0o755)
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    rt.data_dir = state_dir
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        _, hashes = notes_mod._read_selected(root, ["one.md"])
+    finally:
+        os.chdir(old_cwd)
+    state = notes_mod._new_state(root, ["one.md"], hashes)
+    notes_mod._save_state(rt, state)
+    state_path = notes_mod._state_path(rt)
+    assert stat.S_IMODE(os.stat(state_dir).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(state_path).st_mode) == 0o600
+    state["draft_sha256"] = notes_mod._save_draft(rt, state, "SYNTHETIC_DRAFT")
+    notes_mod._save_state(rt, state)
+    draft_path = notes_mod._draft_path(rt, state["task_id"])
+    assert stat.S_IMODE(os.stat(draft_path).st_mode) == 0o600
+    assert notes_mod._load_draft(rt, state) == "SYNTHETIC_DRAFT\n"
+
+    # A checkpoint symlink must not replace or read through to its target.
+    external = os.path.join(parent, "external-state")
+    with open(external, "w", encoding="utf-8") as stream:
+        stream.write("OUTSIDE_STATE_SENTINEL")
+    os.unlink(state_path)
+    os.symlink(external, state_path)
+    try:
+        notes_mod._save_state(rt, state)
+        raise AssertionError("symlink checkpoint target was accepted")
+    except notes_mod.NotesSummaryError:
+        pass
+    assert open(external, encoding="utf-8").read() == "OUTSIDE_STATE_SENTINEL"
+
+    real_dir = os.path.join(parent, "real-state")
+    os.mkdir(real_dir, 0o700)
+    link_dir = os.path.join(parent, "state-link")
+    os.symlink(real_dir, link_dir)
+    link_rt = _notes_test_runtime()
+    link_rt.data_dir = link_dir
+    try:
+        notes_mod._state_path(link_rt)
+        raise AssertionError("symlink state directory was accepted")
+    except (notes_mod.NotesSummaryError, OSError):
+        pass
+
+    non_directory = os.path.join(parent, "not-a-directory")
+    with open(non_directory, "w", encoding="utf-8") as stream:
+        stream.write("SYNTHETIC_FILE")
+    non_directory_rt = _notes_test_runtime()
+    non_directory_rt.data_dir = non_directory
+    try:
+        notes_mod._state_path(non_directory_rt)
+        raise AssertionError("non-directory state path was accepted")
+    except (notes_mod.NotesSummaryError, OSError):
+        pass
+
+    wrong_owner_dir = os.path.join(parent, "wrong-owner")
+    os.mkdir(wrong_owner_dir, 0o700)
+    old_uid = notes_mod._current_uid
+    notes_mod._current_uid = lambda: os.getuid() + 1
+    try:
+        try:
+            notes_mod._ensure_private_dir(wrong_owner_dir)
+            raise AssertionError("wrong-owner state directory was accepted")
+        except notes_mod.NotesSummaryError as exc:
+            assert "not owned by the current user" in str(exc)
+    finally:
+        notes_mod._current_uid = old_uid
+
+
+def test_notes_storage_survives_alva_and_xdg_relaunch_and_root_move():
+    parent = tempfile.mkdtemp(prefix="alva_notes_relaunch_")
+    _TMP_DIRS.append(parent)
+    env_names = ("ALVA_DATA_DIR", "POCKET_DATA_DIR", "XDG_STATE_HOME")
+    saved_env = {name: os.environ.get(name) for name in env_names}
+    old_data_dir = notes_mod.DATA_DIR
+    try:
+        for mode in ("ALVA_DATA_DIR", "XDG_STATE_HOME"):
+            root_a = _notes_test_root({"one.md": "SYNTHETIC_SAME_NOTE"})
+            root_b = _notes_test_root({"one.md": "SYNTHETIC_SAME_NOTE"})
+            old_install = os.path.join(parent, mode, "install-a", ".alvaagent")
+            new_install = os.path.join(parent, mode, "install-b", ".alvaagent")
+            shared = os.path.join(parent, mode, "shared-data")
+            xdg_home = os.path.join(parent, mode, "xdg")
+            for name in env_names:
+                os.environ.pop(name, None)
+
+            if mode == "ALVA_DATA_DIR":
+                os.environ["ALVA_DATA_DIR"] = shared
+                first_data_dir = second_data_dir = shared
+                expected_state_dir = shared
+            else:
+                os.environ["XDG_STATE_HOME"] = xdg_home
+                first_data_dir, second_data_dir = old_install, new_install
+                expected_state_dir = os.path.join(xdg_home, "alvaagent")
+                notes_mod.DATA_DIR = first_data_dir
+
+            first = _notes_test_runtime()
+            first.data_dir = first_data_dir
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(root_a)
+                _, hashes = notes_mod._read_selected(root_a, ["one.md"])
+            finally:
+                os.chdir(old_cwd)
+            state = notes_mod._new_state(root_a, ["one.md"], hashes)
+            state.update({"status": "stopped", "provider_status": "not_requested"})
+            notes_mod._save_state(first, state)
+            task_id = state["task_id"]
+            assert notes_mod._notes_data_dir(first) == os.path.abspath(expected_state_dir)
+
+            if mode == "XDG_STATE_HOME":
+                notes_mod.DATA_DIR = second_data_dir
+            second = _notes_test_runtime()
+            second.data_dir = second_data_dir
+            output, _ = _notes_run(second, root_b, ["s"], "resume")
+            resumed = notes_mod._load_state(second)
+            assert resumed["task_id"] == task_id
+            assert resumed["root"] == os.path.realpath(root_b)
+            assert resumed["status"] == "stopped"
+            assert "resumed in a new checkout" in output
+            assert notes_mod._notes_data_dir(second) == os.path.abspath(expected_state_dir)
+    finally:
+        notes_mod.DATA_DIR = old_data_dir
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_notes_corrupt_unreadable_and_unwritable_checkpoints_fail_truthfully():
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    rt = _notes_test_runtime()
+    state_path = os.path.join(rt.data_dir, notes_mod._STATE_NAME)
+    os.makedirs(rt.data_dir, exist_ok=True)
+    with open(state_path, "wb") as stream:
+        stream.write(b"{broken-json")
+    os.chmod(state_path, 0o600)
+    original_bytes = open(state_path, "rb").read()
+    output, _ = _notes_run(rt, root, [], "resume")
+    assert "checkpoint is unreadable" in output
+    assert open(state_path, "rb").read() == original_bytes
+
+    old_read = notes_mod._read_private
+    notes_mod._read_private = lambda *a, **k: (_ for _ in ()).throw(PermissionError())
+    try:
+        output2, _ = _notes_run(rt, root, [], "resume")
+    finally:
+        notes_mod._read_private = old_read
+    assert "checkpoint could not be read" in output2
+    assert open(state_path, "rb").read() == original_bytes
+
+    rt2 = _notes_test_runtime()
+    calls = []
+    old_save = notes_mod._save_state
+    old_provider = notes_mod._single_provider_completion
+    notes_mod._save_state = lambda *a, **k: (_ for _ in ()).throw(PermissionError())
+    notes_mod._single_provider_completion = lambda *a, **k: calls.append(1)
+    try:
+        output3, _ = _notes_run(rt2, root, ["1", "y"])
+    finally:
+        notes_mod._save_state = old_save
+        notes_mod._single_provider_completion = old_provider
+    assert "could not save the task checkpoint" in output3
+    assert "checkpoint saved" not in output3
+    assert calls == []
+
+
+def test_notes_unreadable_input_and_disk_write_failure_do_not_claim_success():
+    unreadable_root = _notes_test_root({"bad.txt": b"\xff\xfe"})
+    rt = _notes_test_runtime()
+    calls = []
+    old_provider = notes_mod._single_provider_completion
+    notes_mod._single_provider_completion = lambda *a, **k: calls.append(1)
+    try:
+        output, _ = _notes_run(rt, unreadable_root, ["1", "y"])
+    finally:
+        notes_mod._single_provider_completion = old_provider
+    assert "not valid UTF-8" in output and calls == []
+    assert not os.path.exists(os.path.join(rt.data_dir, notes_mod._STATE_NAME))
+
+    root = _notes_test_root({"one.md": "SYNTHETIC_NOTE"})
+    with open(os.path.join(root, "summary.md"), "w", encoding="utf-8") as stream:
+        stream.write("PRESERVE_ON_DISK_ERROR")
+    rt2 = _notes_test_runtime()
+    old_provider = notes_mod._single_provider_completion
+    old_replace = notes_mod._atomic_replace
+    notes_mod._single_provider_completion = _notes_fake_provider("Synthetic output.")
+    notes_mod._atomic_replace = lambda *a, **k: (_ for _ in ()).throw(OSError("synthetic disk failure"))
+    try:
+        output2, _ = _notes_run(rt2, root, ["1", "y", "", "s", "", "y"])
+    finally:
+        notes_mod._single_provider_completion = old_provider
+        notes_mod._atomic_replace = old_replace
+    assert "file or storage operation failed (OSError)" in output2
+    assert "complete" not in output2
+    assert open(os.path.join(root, "summary.md"), encoding="utf-8").read() == "PRESERVE_ON_DISK_ERROR"
+
+
+def test_notes_repl_40_column_offline_entry():
+    root = _notes_test_root({"one.md": "SYNTHETIC_PTY_NOTE"})
+    data_dir = tempfile.mkdtemp(prefix="alva_notes_pty_data_")
+    _TMP_DIRS.append(data_dir)
+    script = (
+        "import os, sys\n"
+        "sys.path.insert(0, %r)\n" % ROOT +
+        "os.environ['ALVA_DATA_DIR'] = %r\n" % data_dir +
+        "os.environ['NO_COLOR'] = '1'\n"
+        "os.chdir(%r)\n" % root +
+        "from alvaagent.repl import main\n"
+        "main()\n"
+    )
+    pid, fd = _pty_run(script)
+    status = None
+    out = b""
+    try:
+        import fcntl
+        import struct
+        import termios
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
+        out += _pty_drain_until(fd, b"> ", 15.0)
+        assert b"> " in out, out[-1000:]
+        os.write(fd, b"/notes\n")
+        out += _pty_drain_until(fd, b"select numbers", 10.0)
+        assert b"select numbers" in out, out[-1000:]
+        os.write(fd, b"1\n")
+        out += _pty_drain_until(fd, b"proceed with this scope", 10.0)
+        assert b"proceed with this scope" in out, out[-1000:]
+        os.write(fd, b"y\n")
+        out += _pty_drain_until(fd, b"Enter=continue", 10.0)
+        assert b"Enter=continue" in out, out[-1000:]
+        os.write(fd, b"\n")
+        out += _pty_drain_until(fd, b"Type o + Enter to stay offline;", 10.0)
+        assert b"Type o + Enter to stay offline;" in out, out[-1000:]
+        assert b"n = cancel" in out, out[-1000:]
+        os.write(fd, b"o\n")
+        out += _pty_drain_until(fd, b"no local summarizer", 10.0)
+        assert b"no local summarizer" in out, out[-1000:]
+        assert b"provider: default" in out
+        assert b"SYNTHETIC_PTY_NOTE" not in out
+        if b"> " not in out.split(b"no local summarizer", 1)[-1]:
+            out += _pty_drain_until(fd, b"> ", 10.0)
+        os.write(fd, b"/exit\n")
+        out += _pty_drain_until(fd, b"bye", 10.0)
+        assert b"bye" in out, out[-1000:]
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    finally:
+        if status is None:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    saved = json.loads(open(os.path.join(data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
+    assert saved["status"] == "offline_unavailable"
+    assert not os.path.exists(os.path.join(root, "summary.md"))
 
 
 # ---------------- bundled runner (plan Task 15 step 1) ---------------------

@@ -4,7 +4,7 @@
 #
 #  Install once (symlink onto Termux PATH so `git pull` keeps it
 #  up to date):
-#    ln -sf "$PWD/alvaagent" /data/data/com.termux/files/usr/bin/alvaagent
+#    ln -sf "$PWD/alvaagent.sh" /data/data/com.termux/files/usr/bin/alvaagent
 #
 #  Then just type:  alvaagent
 # ============================================================
