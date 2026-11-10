@@ -3931,6 +3931,7 @@ def test_notes_status_summary_is_shared_read_only_home_content():
     summary = notes_mod.notes_status_summary(rt)
     assert summary == {
         "status": "paused", "stage": "ready_to_summarize",
+        "provider_outcome_unknown": False,
         "lines": ["saved notes task: paused",
                   "phase: ready_to_summarize | resume with /notes resume"],
     }
@@ -3946,6 +3947,24 @@ def test_notes_status_summary_is_shared_read_only_home_content():
     assert "private-note.md" not in home and "SYNTHETIC_PRIVATE_NOTE_CONTENT" not in home
     assert "./notes" not in home and "select numbers" not in home
     assert notes_mod.notes_status_summary(rt)["status"] == "paused"
+
+    state = notes_mod._load_state(rt)
+    state["provider_status"] = "sent_outcome_unknown"
+    notes_mod._save_state(rt, state)
+    summary = notes_mod.notes_status_summary(rt)
+    assert summary["status"] == "paused" and summary["provider_outcome_unknown"] is True
+    assert any("no automatic retry" in line for line in summary["lines"])
+    home = _capture_home_text(rt)
+    assert "Notes result unknown · /notes resume" in home
+    saved = notes_mod._load_state(rt)
+    assert saved["status"] == "paused" and saved["provider_status"] == "sent_outcome_unknown"
+    assert "private-note.md" not in home and "SYNTHETIC_PRIVATE_NOTE_CONTENT" not in home
+
+    state["status"] = "stopped"
+    notes_mod._save_state(rt, state)
+    stopped_summary = notes_mod.notes_status_summary(rt)
+    assert stopped_summary["status"] == "stopped" and stopped_summary["provider_outcome_unknown"] is True
+    assert "Notes result unknown · /notes resume" in _capture_home_text(rt)
 
 
 def test_chat_provider_setup_warning_is_contextual_and_truthful():
@@ -3999,6 +4018,8 @@ def test_task_home_chat_home_chat_cycle_40_column_pty():
     pa.save_state(rt)
     _seed_paused_notes_checkpoint(rt, root)
     call_log = os.path.join(data_dir, "chat-send-calls.txt")
+    multi_log = os.path.join(data_dir, "multi-command-calls.txt")
+    compress_log = os.path.join(data_dir, "compress-command-calls.txt")
     script = (
         "import os, sys\n"
         "sys.path.insert(0, %r)\n" % ROOT +
@@ -4009,12 +4030,23 @@ def test_task_home_chat_home_chat_cycle_40_column_pty():
         "repl_mod = importlib.import_module('alvaagent.repl')\n"
         "main = repl_mod.main\n"
         "call_log = %r\n" % call_log +
+        "multi_log = %r\n" % multi_log +
+        "compress_log = %r\n" % compress_log +
         "_original_send = repl_mod.send_message\n"
         "def _counted_send(rt, text):\n"
         "    with open(call_log, 'a', encoding='utf-8') as stream:\n"
         "        stream.write(text + '\\n')\n"
         "    return _original_send(rt, text)\n"
         "repl_mod.send_message = _counted_send\n"
+        "def _counted_multi():\n"
+        "    with open(multi_log, 'a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return '[plain] SYNTHETIC_MULTI_MESSAGE'\n"
+        "repl_mod.cmd_multi = _counted_multi\n"
+        "def _counted_compress(rt, history, session):\n"
+        "    with open(compress_log, 'a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "repl_mod.cmd_compress = _counted_compress\n"
         "main()\n"
     )
     pid, fd = _pty_run(script)
@@ -4044,6 +4076,20 @@ def test_task_home_chat_home_chat_cycle_40_column_pty():
         assert b"Conversation" not in home_input
         assert not os.path.exists(call_log)
 
+        os.write(fd, b"/multi\n")
+        home_multi = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_multi
+        assert b"Open /chat before /multi" in home_multi
+        assert b"Choose /notes or /chat" in home_multi
+        assert not os.path.exists(call_log) and not os.path.exists(multi_log)
+
+        os.write(fd, b"/compress\n")
+        home_compress = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_compress
+        assert b"Open /chat before /compress" in home_compress
+        assert b"Choose /notes or /chat" in home_compress
+        assert not os.path.exists(compress_log)
+
         os.write(fd, b"/chat\n")
         out += _pty_drain_until(fd, b"chat> ", 10.0)
         assert b"Conversation" in out and b"/home returns to tasks" in out
@@ -4054,14 +4100,52 @@ def test_task_home_chat_home_chat_cycle_40_column_pty():
             "[plain] SYNTHETIC_CHAT_MESSAGE"]
         out += _pty_drain_until(fd, b"chat> ", 10.0)
 
+        os.write(fd, b"/redo\n")
+        redo_chat = _pty_drain_until(fd, b"PLAIN_OK this is a direct answer", 15.0)
+        out += redo_chat
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert open(call_log, encoding="utf-8").read().splitlines() == [
+            "[plain] SYNTHETIC_CHAT_MESSAGE", "[plain] SYNTHETIC_CHAT_MESSAGE"]
+
+        os.write(fd, b"/multi\n")
+        multi_chat = _pty_drain_until(fd, b"PLAIN_OK this is a direct answer", 15.0)
+        out += multi_chat
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert open(call_log, encoding="utf-8").read().splitlines() == [
+            "[plain] SYNTHETIC_CHAT_MESSAGE", "[plain] SYNTHETIC_CHAT_MESSAGE",
+            "[plain] SYNTHETIC_MULTI_MESSAGE"]
+        assert open(multi_log, encoding="utf-8").read().splitlines() == ["called"]
+
+        os.write(fd, b"/compress\n")
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert open(compress_log, encoding="utf-8").read().splitlines() == ["called"]
+
         checkpoint = notes_mod._load_state(rt)
         assert checkpoint["status"] == "paused"
-        checkpoint["status"] = "blocked_uncertain"
         checkpoint["provider_status"] = "sent_outcome_unknown"
         notes_mod._save_state(rt, checkpoint)
         os.write(fd, b"/home\n")
         out += _pty_drain_until(fd, b"> ", 10.0)
         assert "Notes result unknown · /notes resume".encode("utf-8") in out
+        os.write(fd, b"/redo\n")
+        home_redo = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_redo
+        assert b"Open /chat before /redo" in home_redo
+        assert b"Choose /notes or /chat" in home_redo
+        assert len(open(call_log, encoding="utf-8").read().splitlines()) == 3
+        assert open(multi_log, encoding="utf-8").read().splitlines() == ["called"]
+        assert open(compress_log, encoding="utf-8").read().splitlines() == ["called"]
+        os.write(fd, b"/multi\n")
+        home_multi = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_multi
+        assert b"Open /chat before /multi" in home_multi
+        assert len(open(call_log, encoding="utf-8").read().splitlines()) == 3
+        assert open(multi_log, encoding="utf-8").read().splitlines() == ["called"]
+        os.write(fd, b"/compress\n")
+        home_compress = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_compress
+        assert b"Open /chat before /compress" in home_compress
+        assert open(compress_log, encoding="utf-8").read().splitlines() == ["called"]
         os.write(fd, b"/chat\n")
         out += _pty_drain_until(fd, b"chat> ", 10.0)
         assert b"/home returns to tasks" in out
@@ -4087,7 +4171,9 @@ def test_task_home_chat_home_chat_cycle_40_column_pty():
             os.close(fd)
         except OSError:
             pass
-    assert notes_mod.notes_status_summary(rt)["status"] == "blocked_uncertain"
+    final_summary = notes_mod.notes_status_summary(rt)
+    assert final_summary["status"] == "paused"
+    assert final_summary["provider_outcome_unknown"] is True
 
 
 # ---------------- bundled runner (plan Task 15 step 1) ---------------------

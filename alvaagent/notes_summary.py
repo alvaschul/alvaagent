@@ -1631,12 +1631,16 @@ def notes_status_summary(rt):
         return {"status": None, "stage": None, "lines": ["no saved notes task"]}
     status = state.get("status", "unknown")
     stage = state.get("stage", "unknown")
+    provider_outcome_unknown = state.get("provider_status") == "sent_outcome_unknown"
     lines = ["saved notes task: %s" % status]
+    if provider_outcome_unknown:
+        lines.append(_PROVIDER_OUTCOME_UNKNOWN)
     if status in ("active", "paused", "stopped", "blocked_uncertain"):
         lines.append("phase: %s | resume with /notes resume" % stage)
     elif status == "needs_new_task":
         lines.append("selected notes changed; start a new /notes task for fresh scope review")
-    return {"status": status, "stage": stage, "lines": lines}
+    return {"status": status, "stage": stage,
+            "provider_outcome_unknown": provider_outcome_unknown, "lines": lines}
 
 
 def cmd_notes(rt, action=""):

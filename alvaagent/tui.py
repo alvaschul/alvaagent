@@ -810,7 +810,7 @@ def _home_task_lines(rt):
     status = summary.get("status")
     if status is None:
         return ["Ready · no task running"]
-    if status == "blocked_uncertain":
+    if summary.get("provider_outcome_unknown") or status == "blocked_uncertain":
         return ["Notes result unknown · /notes resume",
                 "Phase · %s" % summary.get("stage", "unknown")]
     if status in ("active", "paused", "stopped"):

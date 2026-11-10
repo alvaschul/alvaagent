@@ -115,6 +115,15 @@ def _show_chat_view(session):
     print("Type a message · /home returns to tasks")
 
 
+def _require_chat_mode(rt, in_chat, command):
+    """Block command-driven provider dispatch unless /chat is explicitly open."""
+    if in_chat:
+        return True
+    p_info("Open /chat before %s; no provider request was sent" % command)
+    banner(rt)
+    return False
+
+
 def _slash_complete(text, state):
     if text.startswith("/"):
         opts = [c for c in _SLASH_COMMANDS if c.startswith(text.lower())]
@@ -332,6 +341,8 @@ def repl(rt):
             elif c == "/context":
                 cmd_context(rt, rest, history)
             elif c == "/compress":
+                if not _require_chat_mode(rt, in_chat, "/compress"):
+                    continue
                 cmd_compress(rt, history, session)
             elif c == "/new":
                 save_session(rt, session, history)
@@ -343,6 +354,8 @@ def repl(rt):
             elif c == "/clear":
                 cmd_clear(rt, history)
             elif c == "/multi":
+                if not _require_chat_mode(rt, in_chat, "/multi"):
+                    continue
                 text = cmd_multi()
                 if text and text.strip():
                     session = send_message(rt, text.strip())
@@ -383,6 +396,8 @@ def repl(rt):
                 cancel_agent(rt)
                 p_info("stopping...")
             elif c == "/redo":
+                if not _require_chat_mode(rt, in_chat, "/redo"):
+                    continue
                 if rt.last_turn.get("session") != session or rt.last_turn.get("text") is None:
                     p_err("nothing to redo - send a message first (in this session)")
                     continue
