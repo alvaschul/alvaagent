@@ -14,7 +14,7 @@ Built for Termux, runs offline-friendly, and survives flaky mobile connections.
 ## Features
 - **Python TUI** (`alvaagent_tui.py` shim → `alvaagent/` package) — stdlib only,
   no dependencies to install.
-- **36 tools** (curated for the model): calculator, sandboxed run_python,
+- **36 tools** (curated for the model): calculator, bounded run_python interpreter,
   web_fetch/web_head/web_json/web_markdown/web_search/web_download/web_post,
   get_time, memory save/recall/search/list, todos, shell, file
   read/write/edit/list/search, skill save/read/list/remove/install/sync,
@@ -74,16 +74,25 @@ That's it — no `pip install`, no virtualenv. The package is self-contained.
 On first launch you'll be at the `⚡` prompt. Configure your endpoint:
 
 ```
-/provider add        # create a new provider profile
+/provider add        # start the guided provider setup
 ```
-You'll be asked for:
-- **Name** — anything, e.g. `omniroute`
-- **Base URL** — your OpenAI-compatible endpoint, e.g. `https://omniroute.alvaschul.cloud/v1`
-- **API key** — paste it when prompted (it's masked and stored locally in
-  `.alvaagent/config.json`, gitignored). Type `none` to clear it.
-- **Model** — e.g. `auto/best-coding`
-- **Temperature** — `0.7` is a sane default
-
+Choose a built-in provider or a custom OpenAI-compatible endpoint. You'll name
+the profile; custom profiles also ask for a base URL. The API key is entered
+with terminal echo disabled and stored locally in `.alvaagent/config.json`
+(gitignored).
+At any setup prompt, type `cancel` or press `Ctrl+C` to stop; saved settings and
+the currently active provider remain unchanged.
+Alvaagent fetches available models when possible; if discovery fails, you can
+retry, enter a model ID manually, or cancel. Before saving, setup sends a
+minimal one-token chat completion to test the selected model, after asking you
+to confirm `yes` or `no`; the request may incur a usage charge with your
+provider. Answering `no` cancels without changing saved settings or the active
+provider. A failed test offers a retry or manual model choice and never saves
+or reports the connection as successful. When the test succeeds, the profile
+is saved and becomes the active provider.
+Provider endpoints must use HTTPS, except for loopback/private local addresses
+and `.local` / `.localhost` hostnames. `/config` also reads API keys without
+echoing them; pressing Enter keeps the current key, while `none` clears it.
 Or set it non-interactively with env vars before launching:
 ```bash
 export ALVA_BASE_URL="https://omniroute.alvaschul.cloud/v1"
@@ -122,7 +131,8 @@ stored in `.alvaagent/cmd_history.txt`.
 python3 test_tui.py      # headless validation against mock_llm_server.py
 ```
 All checks should print `ALL TESTS PASSED ✓` (includes security regression
-tests for the command classifier and atomic store writes).
+tests for command classification, the bounded Python interpreter, and atomic
+store writes).
 
 ## Security model
 - Headless runs default to **deny** for risky/mutating commands; the TUI prompts
@@ -131,11 +141,18 @@ tests for the command classifier and atomic store writes).
   session (exact-match, in-memory only — `y` or `a`) so the agent can repeat it
   without re-asking. Nothing is ever permanently approved; a restart resets the
   cache.
+- `run_python` interprets only a small AST allowlist for bounded calculations
+  and data transforms: literals, collections, arithmetic, simple assignments,
+  `if`/bounded `for`, one-loop comprehensions, and selected pure functions.
+  Imports, attributes, reflection, filesystem/network/process access, and other
+  unsupported syntax are always rejected; approval cannot turn them into
+  executable Python. This is an in-process interpreter policy, **not OS process
+  isolation or a general-purpose Python sandbox**.
 - The read-only allowlist covers everyday inspection (`ls/cat/ps/sort/diff/...`),
   the dev loop (`python3 -m pyflakes`, `python3 test_tui.py`,
   `python3 -m py_compile`), git read commands, and archive *listing*
-  (`unzip -l`, `tar -tf`) — while execution (`python3 -c`, `pip`, `sh -c`,
-  extraction, chaining, substitution) always stays gated.
+  (`unzip -l`, `tar -tf`) — while direct shell execution (`python3 -c`, `pip`,
+  `sh -c`, extraction, chaining, substitution) always stays approval-gated.
 - Blocked without approval: command substitution (`$()`, backticks), env-prefixed
   risky tokens (`env X=1 rm -rf /`), destructive `find` flags (`-delete`,
   `-exec`), and reading files outside the project folder.

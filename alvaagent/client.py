@@ -1,9 +1,11 @@
 import codecs
+import ipaddress
 import json
 import re
 import select
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ---------------- LLM client (OpenAI-compatible) ----------------
@@ -103,6 +105,68 @@ _STREAM_IDLE_LIMIT = 90.0         # seconds with no bytes before a stream is tre
 _STREAM_POLL = 0.25               # cancel-check interval while waiting on a stream socket
 
 
+def _local_http_host(host):
+    host = (host or "").rstrip(".").lower()
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        return True
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    return (address.is_loopback or
+            (address.is_private and not address.is_link_local and
+             not address.is_multicast and not address.is_reserved))
+
+
+def provider_url_error(url):
+    """Return a safe validation message, or None for an allowed provider URL."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url).strip())
+        host = parsed.hostname
+        # Accessing .port also validates malformed port values.
+        parsed.port
+    except (TypeError, ValueError):
+        return "endpoint URL is invalid"
+    if not host or parsed.username is not None or parsed.password is not None:
+        return "endpoint URL must include a host and must not contain credentials"
+    if parsed.scheme.lower() == "https":
+        return None
+    if parsed.scheme.lower() == "http" and _local_http_host(host):
+        return None
+    return "HTTPS is required except for loopback or local HTTP endpoints"
+
+
+def _url_origin(url):
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return scheme, host, port
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow provider redirects only while the request origin stays identical."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            if _url_origin(req.full_url) != _url_origin(newurl):
+                return None
+        except (TypeError, ValueError):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_provider_request(req, timeout):
+    """Open an authenticated provider request with HTTPS and redirect guards."""
+    problem = provider_url_error(req.full_url)
+    if problem:
+        raise RuntimeError(problem)
+    opener = urllib.request.build_opener(_SameOriginRedirectHandler())
+    return opener.open(req, timeout=timeout)
+
+
 def _retryable_status(code):
     """Status codes worth retrying (rate limits + transient server errors)."""
     return code in (408, 409, 429) or code >= 500
@@ -118,6 +182,9 @@ class _Cancelled(Exception):
 
 def chat_completion(rt, messages, config, tools=None):
     base = (config.get("base_url") or "").rstrip("/")
+    problem = provider_url_error(base)
+    if problem:
+        raise RuntimeError(problem)
     url = base + "/chat/completions"
     payload = {
         "model": config.get("model") or "gpt-4o-mini",
@@ -145,7 +212,7 @@ def chat_completion(rt, messages, config, tools=None):
         if rt.cancel.is_set():
             raise RuntimeError("LLM request cancelled by user")
         try:
-            with urllib.request.urlopen(req, timeout=180) as r:
+            with _open_provider_request(req, timeout=180) as r:
                 status = int(r.getcode())
                 text = r.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
@@ -181,6 +248,9 @@ def chat_completion(rt, messages, config, tools=None):
 def chat_completion_stream(rt, messages, config, tools=None):
     """Streaming version of chat_completion. Yields (content_chunk, tool_calls_json_or_None)."""
     base = (config.get("base_url") or "").rstrip("/")
+    problem = provider_url_error(base)
+    if problem:
+        raise RuntimeError(problem)
     url = base + "/chat/completions"
     payload = {
         "model": config.get("model") or "gpt-4o-mini",
@@ -208,7 +278,7 @@ def chat_completion_stream(rt, messages, config, tools=None):
         if rt.cancel.is_set():
             raise _Cancelled()
         try:
-            resp = urllib.request.urlopen(req, timeout=60)
+            resp = _open_provider_request(req, timeout=60)
             break
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
@@ -349,6 +419,9 @@ def fetch_models(rt, base_url, api_key, timeout=20):
     base = (base_url or "").rstrip("/")
     if not base:
         raise RuntimeError("no base url configured")
+    problem = provider_url_error(base)
+    if problem:
+        raise RuntimeError(problem)
     req = urllib.request.Request(
         base + "/models",
         headers={"Authorization": "Bearer " + (api_key or ""), "Accept-Encoding": "identity"})
@@ -357,7 +430,7 @@ def fetch_models(rt, base_url, api_key, timeout=20):
         if attempt:
             _sleep_retry(attempt)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _open_provider_request(req, timeout=timeout) as r:
                 data = json.loads(r.read().decode("utf-8", errors="replace"))
             return [str(m["id"]) for m in (data.get("data") or [])
                     if isinstance(m, dict) and m.get("id")]
@@ -380,4 +453,3 @@ def fetch_models(rt, base_url, api_key, timeout=20):
 
 def cancel_agent(rt):
     rt.cancel.set()
-

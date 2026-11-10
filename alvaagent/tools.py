@@ -5,18 +5,20 @@ import json
 import math
 import os
 import re
-import select
 import socket
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
-from alvaagent.client import _STREAM_POLL
 from alvaagent.config import TOOL_MODES, save_state
+from alvaagent.python_subset import (
+    PythonSubsetError,
+    interpret_python,
+    parse_python_subset,
+)
 from alvaagent.permissions import (
     PROJECT_DIR, classify_command, classify_file_action, request_permission,
 )
@@ -706,15 +708,15 @@ _CALC_ALLOWED = {
 }
 
 
-def _calc_eval(node):
+def _calc_interpret(node):
     if isinstance(node, ast.Expression):
-        return _calc_eval(node.body)
+        return _calc_interpret(node.body)
     if isinstance(node, ast.Constant):
         if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
             return node.value
         raise ValueError("only numeric constants allowed")
     if isinstance(node, ast.BinOp):
-        l, r = _calc_eval(node.left), _calc_eval(node.right)
+        l, r = _calc_interpret(node.left), _calc_interpret(node.right)
         op = type(node.op)
         if op is ast.Add: return l + r
         if op is ast.Sub: return l - r
@@ -734,7 +736,7 @@ def _calc_eval(node):
             return l ** r
         raise ValueError("operator not allowed: %s" % op.__name__)
     if isinstance(node, ast.UnaryOp):
-        v = _calc_eval(node.operand)
+        v = _calc_interpret(node.operand)
         if isinstance(node.op, ast.UAdd): return v
         if isinstance(node.op, ast.USub): return -v
         raise ValueError("unary operator not allowed")
@@ -744,8 +746,8 @@ def _calc_eval(node):
         fn = _CALC_ALLOWED.get(node.func.id)
         if fn is None:
             raise ValueError("function not allowed: %s" % node.func.id)
-        args = [_calc_eval(a) for a in node.args]
-        kwargs = {k.arg: _calc_eval(k.value) for k in node.keywords}
+        args = [_calc_interpret(a) for a in node.args]
+        kwargs = {k.arg: _calc_interpret(k.value) for k in node.keywords}
         try:
             return fn(*args, **kwargs)
         except Exception as e:
@@ -772,7 +774,7 @@ def tool_calculator(expression):
     if len(expression) > 500:
         raise ValueError("expression too long")
     tree = ast.parse(expression, mode="eval")
-    result = _fmt_num(_calc_eval(tree))
+    result = _fmt_num(_calc_interpret(tree))
     # complex results (e.g. (-8)**0.5) aren't JSON-serializable and would
     # crash the request when the tool result is placed in the chat history.
     if isinstance(result, complex):
@@ -790,97 +792,31 @@ def tool_calculator(expression):
     return {"ok": True, "expression": expression, "result": result}
 
 
-_PY_RUN_TIMEOUT = 120     # wall-clock seconds for the python child (like run_command)
-_PY_MAX_BYTES = 200_000   # hard cap on bytes read from the child before we kill it
-_PY_MAX_CHARS = 5000      # chars of output returned to the agent
-
-
 def classify_python(code):
-    """allow / ask for Python code (best-effort risk scan).
-
-    Code that only computes (math, strings, pure data) runs freely; code that
-    can touch the device - imports of os/subprocess/shutil/sys, filesystem
-    access, exec/eval/__import__, path strings outside /tmp - asks the user
-    first, mirroring classify_command's deny-by-default stance.
-    """
-    import re as _re
-    low = _re.sub(r"#[^\n]*", "", str(code))
-    patterns = (
-        r"\b(import|from)\s+(os|sys|subprocess|shutil|pathlib|builtins)\b",
-        r"\b__import__\s*\(|\beval\s*\(|\bexec\s*\(|\bglobals\s*\(|\blocals\s*\(|\bvars\s*\(",
-        r"\bopen\s*\(",
-        r"\bos\.\s*(system|popen|remove|unlink|rmdir|removedirs|rename|replace|chmod|chown|"
-        r"listdir|scandir|walk|makedirs|mkdir|symlink|kill)\b",
-        r"\bshutil\.\s*(rmtree|move|copy|copy2|copyfile|copytree|chown)\b",
-        r"\bsubprocess\.\s*[A-Za-z_]+|\bPopen\b|\bcheck_output\b|\bcheck_call\b|\bgetoutput\b",
-        r"[\"']/(?:sdcard|data|etc|root|bin|system)|[\"']\.\./|[\"']/tmp/",
-    )
-    for p in patterns:
-        if _re.search(p, low):
-            return "ask"
-    return "allow"
+    """Return ``allow`` only for syntax accepted by the bounded interpreter."""
+    try:
+        parse_python_subset(code)
+        return "allow"
+    except PythonSubsetError:
+        return "deny"
 
 
 def tool_run_python(rt, code):
-    """Execute Python code in a child process and return the output.
-
-    The code runs under `python -c` in a separate process with a wall-clock
-    timeout and a hard output cap, so runaway loops or huge prints can't hang
-    the agent. Code that touches the device asks the user first (same as
-    run_command). Pure computation runs freely.
-    """
-    code = str(code).strip()
+    """Interpret a bounded allowlisted subset; arbitrary Python is never run."""
+    if not isinstance(code, str):
+        return {"ok": False, "error": "code must be text"}
+    code = code.strip()
     if not code:
         return {"ok": False, "error": "empty code"}
-    if len(code) > 10000:
-        return {"ok": False, "error": "code too long (>10000 chars)"}
-    if classify_python(code) == "ask" and not request_permission(rt, "run python: %s" % code[:160]):
-        return {"ok": False, "error": "permission denied by user"}
     try:
-        proc = subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        output = interpret_python(code, cancel=rt.cancel)
+    except PythonSubsetError as e:
+        return {"ok": False, "exit": 1, "error": str(e)}
     except Exception as e:
-        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
-    out = []
-    total = 0
-    deadline = time.monotonic() + _PY_RUN_TIMEOUT
-    reason = None
-    try:
-        while proc.poll() is None:
-            if rt.cancel.is_set():
-                proc.kill()
-                reason = "cancelled by user"
-                break
-            if time.monotonic() > deadline:
-                proc.kill()
-                reason = "timed out after %ds" % _PY_RUN_TIMEOUT
-                break
-            rlist, _, _ = select.select([proc.stdout], [], [], _STREAM_POLL)
-            if rlist:
-                chunk = proc.stdout.read1(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                out.append(chunk.decode("utf-8", errors="replace"))
-                if total > _PY_MAX_BYTES:
-                    proc.kill()
-                    reason = "output exceeded the %d-byte cap" % _PY_MAX_BYTES
-                    break
-        proc.wait(timeout=5)
-        tail = proc.stdout.read()
-        if tail:
-            total += len(tail)
-            out.append(tail.decode("utf-8", errors="replace"))
-    except Exception as e:
-        reason = "%s: %s" % (type(e).__name__, e)
-    rc = proc.returncode
-    output = "".join(out)
-    if len(output) > _PY_MAX_CHARS:
-        output = output[:_PY_MAX_CHARS] + "\n... (truncated)"
-    if reason:
-        return {"ok": False, "error": reason, "exit": rc, "output": output[:5000]}
-    return {"ok": rc == 0, "exit": rc, "output": (output or "(no output)"), "chars": len(output)}
+        return {"ok": False, "exit": 1,
+                "error": "calculation failed: %s: %s" % (type(e).__name__, e)}
+    return {"ok": True, "exit": 0, "output": output or "(no output)",
+            "chars": len(output)}
 
 
 
@@ -893,9 +829,9 @@ TOOLS = [
             "required": ["expression"]}}},
     {"type": "function", "function": {
         "name": "run_python",
-        "description": "Execute Python code in a sandboxed child process and return stdout/stderr. Use for calculations, data processing, or any pure-Python task. Runs with a 120s timeout and output cap. Code that imports os/subprocess/shutil/sys, touches the filesystem, or uses exec/eval asks the user for permission first (like run_command).",
+        "description": "Interpret a small, bounded allowlist of Python syntax for calculations and data transforms (literals, collections, arithmetic, simple assignments, if/for, one-loop comprehensions, and allowlisted pure functions). This is not arbitrary Python execution or OS process isolation: imports, attributes, filesystem/network/process access, and unsupported syntax are always rejected and never sent to a process launcher.",
         "parameters": {"type": "object", "properties": {
-            "code": {"type": "string", "description": "Python code to execute"}},
+            "code": {"type": "string", "description": "A short calculation or data transform in the supported Python subset"}},
             "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "web_fetch",
@@ -1341,12 +1277,12 @@ def self_test(rt):
     checks.append(("memory", tool_memory_recall(rt, "__no_such_key__")["found"] is False))
     checks.append(("clock", isinstance(tool_get_time(), dict) and "iso" in tool_get_time()))
 
-    # run_python: dispatched, sandboxed, permission-gated
+    # run_python: bounded AST interpretation; arbitrary syntax is denied.
     try:
         checks.append(("run_python_dispatch", tool_run_python(rt, "print(2+2)").get("output") == "4\n"))
     except Exception:
         checks.append(("run_python_dispatch", False))
-    checks.append(("run_python_gate", classify_python("import os") == "ask"))
+    checks.append(("run_python_policy", classify_python("import os") == "deny"))
 
     # tiered tool selection: core mode advertises a subset, full mode all
     _saved_mode = rt.tool_mode
@@ -1505,4 +1441,3 @@ def tool_self_test(rt):
         result["all_passed"] = False
 
     return result
-

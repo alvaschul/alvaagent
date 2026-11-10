@@ -1,10 +1,13 @@
 import datetime
+import getpass
 import json
 import os
 import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.request
+import warnings
 
 from alvaagent.config import (
     PROVIDERS, DEFAULT_CFG, FIRST_RUN_CFG, DEFAULT_SKIN,
@@ -25,7 +28,10 @@ from alvaagent.tools import (
     tool_memory_recall, tool_feedback, tool_improvement_set,
     tool_improvement_done, tool_reflect, tool_calculator,
 )
-from alvaagent.client import SYSTEM_PROMPT, _readable_error, fetch_models
+from alvaagent.client import (
+    SYSTEM_PROMPT, _readable_error, fetch_models, provider_url_error,
+    _open_provider_request,
+)
 from alvaagent.sessions import (
     estimate_tokens, context_usage, sessions_map, save_session,
 )
@@ -57,14 +63,8 @@ def parse_key(v, current):
 
 
 def ask_key(current):
-    """Ask for an API key; 'none' / 'clear' / '-' empties it, Enter keeps."""
-    print("    api key [%s]   ('none' clears it)" % mask_key(current))
-    try:
-        v = input("    > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return current
-    return parse_key(v, current)
+    """Compatibility wrapper for hidden API-key input; Enter keeps the key."""
+    return _ask_hidden_api_key(current, keep_current=True)
 
 
 def ask_permission(rt, desc):
@@ -392,7 +392,8 @@ def cmd_help():
     print("    /export                save the conversation as a text file")
     print("    /scroll                browse the conversation with a pager (q to exit)")
     print("    /redo                  re-run the last request (regenerates the answer)")
-    print("    /provider [name]       list / add / switch provider profiles")
+    print("    /provider add          guided setup for a provider profile")
+    print("    /provider [name]       list profiles or switch to one")
     print("    /provider rm <name>    delete a provider")
     print("    /config                edit the ACTIVE provider (base url, key, model, temp)")
     print("    /models                fetch + pick a model for the active provider")
@@ -433,7 +434,14 @@ def cmd_config(rt):
     print("    auto-compress: " + ("on" if cfg.get("auto_compress", True) else "off"))
     print("  (Enter keeps the current value; at the api key prompt type 'none' to clear it)")
     base = ask("base url", cfg.get("base_url", ""))
-    key = ask_key(cfg.get("api_key", ""))
+    problem = provider_url_error(base)
+    if problem:
+        p_err(problem + "; settings were not changed")
+        return
+    key = _ask_hidden_api_key(cfg.get("api_key", ""), keep_current=True)
+    if key is None:
+        p_info("  configuration edit cancelled; settings were not changed")
+        return
     unchanged = (base == (cfg.get("base_url") or "") and key == (cfg.get("api_key") or "") and bool(cfg.get("model")))
     cfg["base_url"], cfg["api_key"] = base, key
     cfg["model"] = pick_model(rt, base, key, cfg.get("model", ""), fetch=not unchanged)
@@ -463,8 +471,256 @@ def _list_providers(rt):
         print("    %-12s %s | model %s | key %s%s"
               % (name, p.get("base_url") or "(no base)",
                  p.get("model") or "-", mask_key(p.get("api_key", "")), mark))
-    print("  usage: /provider <name> (add or switch) | /provider rm <name>")
-    print("  presets: openai | groq | openrouter | gemini | custom   (any other name = custom endpoint)")
+    print("  usage: /provider add | /provider <name> (switch) | /provider rm <name>")
+    print("  presets: openai | groq | openrouter | gemini | custom")
+
+
+def _prompt_value(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+def _choose_provider_kind():
+    choices = list(PROVIDERS)
+    print("  choose a built-in provider or custom endpoint:")
+    print("  at any setup prompt, type 'cancel' or press Ctrl+C to leave settings unchanged")
+    for i, name in enumerate(choices, 1):
+        label = PROVIDERS[name]["label"]
+        print("    %d) %s (%s)" % (i, label, name))
+    while True:
+        value = _prompt_value("    provider [1-%d, name, or cancel]: " % len(choices))
+        if value is None or value.lower() == "cancel":
+            return None
+        key = value.lower()
+        if key in choices:
+            return key
+        if key.isdigit() and 1 <= int(key) <= len(choices):
+            return choices[int(key) - 1]
+        p_info("  choose one of the listed providers, or type its name")
+
+
+def _provider_profile_name(rt, default):
+    while True:
+        value = _prompt_value("    profile name [%s, or cancel]: " % default)
+        if value is None or value.lower() == "cancel":
+            return None
+        name = (value or default).strip().lower()
+        if not name or any(ch.isspace() for ch in name):
+            p_info("  use a non-empty name without spaces")
+            continue
+        if name in rt.cfg["profiles"]:
+            p_info("  a profile named '%s' already exists; choose another name" % name)
+            continue
+        return name
+
+
+def _ask_hidden_api_key(current="", keep_current=False, allow_cancel=False):
+    # getpass falls back to echoed input when no controlling terminal exists;
+    # refuse that fallback rather than risk printing a credential.
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        p_err("hidden API-key input requires an interactive terminal; no key was read")
+        return None
+    prompt = "    API key (input hidden; blank if not required): "
+    if keep_current:
+        prompt = "    API key (input hidden; Enter keeps, 'none' clears): "
+    if allow_cancel:
+        prompt = "    API key (input hidden; blank if not required, 'cancel' stops setup): "
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            value = getpass.getpass(prompt).strip()
+        if allow_cancel and value.lower() == "cancel":
+            return None
+        return parse_key(value, current) if keep_current else value
+    except getpass.GetPassWarning:
+        p_err("terminal cannot disable input echo; no key was read")
+        return None
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+def _ask_manual_model():
+    while True:
+        model = _prompt_value("    model id (or 'cancel'): ")
+        if model is None or model.lower() == "cancel":
+            return None
+        if model:
+            return model
+        p_info("  enter a model id or type 'cancel'")
+
+
+def _choose_new_provider_model(rt, base_url, api_key, default_model):
+    while True:
+        try:
+            models = fetch_models(rt, base_url, api_key)
+            discovery_failed = not models
+        except Exception:
+            models = []
+            discovery_failed = True
+
+        if discovery_failed:
+            p_warn("model discovery failed or returned no models; the connection is not verified")
+            choice = _prompt_value("    [r]etry discovery, [m]anual model id, [c]ancel: ")
+            if choice is None or choice.lower() in ("c", "cancel", "q"):
+                return None
+            if choice.lower() in ("m", "manual"):
+                return _ask_manual_model()
+            if choice.lower() in ("r", "retry", ""):
+                continue
+            p_info("  choose retry, manual model id, or cancel")
+            continue
+
+        print("  available models:")
+        for i, model in enumerate(models):
+            display = str(model)
+            if api_key:
+                display = display.replace(api_key, "[redacted]")
+            mark = "   <- suggested" if model == default_model else ""
+            print("    %2d) %s%s" % (i, display, mark))
+        choice = _prompt_value("    select a model [number/id, m=manual, r=retry, c=cancel]: ")
+        if choice is None or choice.lower() in ("c", "cancel", "q"):
+            return None
+        if choice.lower() in ("m", "manual"):
+            return _ask_manual_model()
+        if choice.lower() in ("r", "retry"):
+            continue
+        if choice == "" and default_model in models:
+            return default_model
+        if choice in models:
+            return choice
+        try:
+            index = int(choice)
+            if 0 <= index < len(models):
+                return models[index]
+        except ValueError:
+            pass
+        p_info("  invalid model choice; select a listed model, manual entry, retry, or cancel")
+
+
+def _test_provider_model(base_url, api_key, model, timeout=20):
+    """Make a minimal chat completion; return a safe status, never response text."""
+    base = (base_url or "").rstrip("/")
+    if not base:
+        return False, "no endpoint URL is configured"
+    problem = provider_url_error(base)
+    if problem:
+        return False, problem
+    if not model:
+        return False, "no model is selected"
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "max_tokens": 1,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        base + "/chat/completions", data=body,
+        headers={"Authorization": "Bearer " + (api_key or ""),
+                 "Content-Type": "application/json", "Accept-Encoding": "identity"},
+        method="POST")
+    try:
+        with _open_provider_request(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or not data["choices"]:
+            return False, "endpoint returned an unexpected response"
+        return True, "ok"
+    except urllib.error.HTTPError as exc:
+        return False, "HTTP %d" % exc.code
+    except Exception as exc:
+        return False, "network/response error (%s)" % type(exc).__name__
+
+
+def _confirm_provider_test():
+    p_warn("The one-token completion test will contact the provider and may incur a usage charge.")
+    while True:
+        choice = _prompt_value("    send the test request? [yes/no]: ")
+        if choice is None or choice.lower() in ("no", "cancel"):
+            return False
+        if choice.lower() == "yes":
+            return True
+        p_info("  answer yes to send the request or no to leave settings unchanged")
+
+
+def _guided_provider_add(rt):
+    kind = _choose_provider_kind()
+    if kind is None:
+        p_info("  provider setup cancelled; settings and active provider were not changed")
+        return
+    preset = PROVIDERS[kind]
+    name = _provider_profile_name(rt, kind)
+    if name is None:
+        p_info("  provider setup cancelled; settings and active provider were not changed")
+        return
+
+    base_url = preset["base"]
+    if kind == "custom":
+        base_url = _prompt_value("    OpenAI-compatible base URL (or 'cancel'): ")
+        if base_url is None or base_url.lower() == "cancel":
+            p_info("  provider setup cancelled; settings and active provider were not changed")
+            return
+        base_url = base_url.rstrip("/")
+        if not base_url:
+            p_err("base URL is required; nothing was saved")
+            return
+
+    problem = provider_url_error(base_url)
+    if problem:
+        p_err(problem + "; nothing was saved")
+        return
+
+    api_key = _ask_hidden_api_key(allow_cancel=True)
+    if api_key is None:
+        p_info("  provider setup cancelled; settings and active provider were not changed")
+        return
+
+    model = _choose_new_provider_model(rt, base_url, api_key, preset.get("model", ""))
+    if model is None:
+        p_info("  provider setup cancelled; settings and active provider were not changed")
+        return
+
+    while True:
+        if not _confirm_provider_test():
+            p_info("  provider setup cancelled; settings and active provider were not changed")
+            return
+        passed, reason = _test_provider_model(base_url, api_key, model)
+        if passed:
+            profile = dict(FIRST_RUN_CFG)
+            profile.update(base_url=base_url, api_key=api_key, model=model)
+            previous_active = rt.cfg["active"]
+            rt.cfg["profiles"][name] = profile
+            rt.cfg["active"] = name
+            save_state(rt)
+            try:
+                with open(os.path.join(rt.data_dir, "config.json"), encoding="utf-8") as saved_file:
+                    saved = json.load(saved_file)
+                if saved.get("active") != name or saved.get("profiles", {}).get(name) != profile:
+                    raise ValueError("saved provider profile did not match")
+            except Exception:
+                rt.cfg["profiles"].pop(name, None)
+                rt.cfg["active"] = previous_active
+                p_err("connection test passed, but the profile could not be saved; nothing changed")
+                return
+            p_ok("provider profile '%s' saved and now active [OK]" % name)
+            return
+
+        p_err("connection test failed (%s); profile was not saved" % reason)
+        choice = _prompt_value("    [r]etry test, [m]anual model id, [c]ancel: ")
+        if choice is None or choice.lower() in ("c", "cancel", "q"):
+            p_info("  provider setup cancelled; settings and active provider were not changed")
+            return
+        if choice.lower() in ("m", "manual"):
+            model = _ask_manual_model()
+            if model is None:
+                p_info("  provider setup cancelled; settings and active provider were not changed")
+                return
+            continue
+        if choice.lower() in ("r", "retry", ""):
+            continue
+        p_info("  choose retry test, manual model id, or cancel")
 
 
 def cmd_provider(rt, rest):
@@ -475,6 +731,9 @@ def cmd_provider(rt, rest):
 
     if arg in ("ls", "list"):
         _list_providers(rt)
+        return
+    if arg == "add":
+        _guided_provider_add(rt)
         return
     if arg in ("rm", "remove", "del", "delete"):
         sub = sub.lower()
@@ -503,22 +762,7 @@ def cmd_provider(rt, rest):
         p_ok("switched to '%s' [OK]" % arg)
         return
 
-    # add a new provider - a fresh profile, never inherits another provider's key
-    p = PROVIDERS.get(arg)
-    prof = dict(FIRST_RUN_CFG)
-    if p:
-        print("  " + p["label"])
-        prof["base_url"] = p["base"]
-        if p["model"]:
-            prof["model"] = p["model"]
-    if arg == "custom" or p is None:
-        prof["base_url"] = ask("base url", prof.get("base_url", ""))
-    prof["api_key"] = ask_key("")
-    prof["model"] = pick_model(rt, prof.get("base_url", ""), prof.get("api_key", ""), prof.get("model", ""))
-    profiles[arg] = prof
-    rt.cfg["active"] = arg
-    save_state(rt)
-    p_ok("added '%s' [OK]" % arg)
+    p_err("no provider named '%s' - run /provider add to create one" % arg)
 
 
 def cmd_test(rt):
@@ -532,7 +776,7 @@ def cmd_test(rt):
         headers={"Authorization": "Bearer " + (cfg.get("api_key") or ""),
                  "Accept-Encoding": "identity"})
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with _open_provider_request(req, timeout=20) as r:
             data = json.loads(r.read().decode("utf-8", errors="replace"))
         n = len(data.get("data") or [])
         p_ok("Connected [OK] | %d model%s available" % (n, "" if n == 1 else "s"))

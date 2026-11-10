@@ -53,8 +53,10 @@ from alvaagent.skills import (  # noqa: F401
     skill_list, skill_read, skill_remove, skill_save, skill_install,
     skill_sync_repo,
 )
+from alvaagent.python_subset import MAX_OUTPUT_CHARS
+_PY_MAX_CHARS = MAX_OUTPUT_CHARS
 from alvaagent.tools import (  # noqa: F401
-    _PY_RUN_TIMEOUT, _PY_MAX_BYTES, _PY_MAX_CHARS, _CALC_ALLOWED,
+    _CALC_ALLOWED,
     _CORE_TOOL_NAMES, _ADVANCED_TOOL_NAMES, _TOOL_ERROR_HINTS,
     Tools, visible, set_mode, sync_tool_mode, maybe_enable_full,
     tool_self_test, tool_count, classify_python,
@@ -68,7 +70,7 @@ from alvaagent.tools import (  # noqa: F401
     tool_memory_save, tool_memory_recall,
     tool_memory_list, tool_memory_search,
     dispatch_tool, self_test,
-    TOOLS, _safe_factorial, _calc_eval, _fmt_num,
+    TOOLS, _safe_factorial, _calc_interpret, _fmt_num,
 )
 from alvaagent.client import (  # noqa: F401
     SYSTEM_PROMPT,
