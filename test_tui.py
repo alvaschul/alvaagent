@@ -3244,7 +3244,8 @@ def test_notes_closed_dispatch_gate_fault_is_not_sent_and_resumable():
                 assert "No provider request was made" in " ".join(output.split())
             else:
                 normalized = " ".join(output.split())
-                assert "This new request was not sent. The earlier result is still unknown." in normalized
+                assert "This new request was not sent." in normalized
+                assert "The provider may already have received the selected notes. The result is unknown; no automatic retry will happen." in normalized
                 assert "the request ended without a usable result" not in output
                 assert "ALVA / Result uncertain" not in output
     finally:
