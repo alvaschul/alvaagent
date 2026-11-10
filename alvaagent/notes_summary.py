@@ -795,7 +795,7 @@ def _mark_provider_uncertain(rt, state, message, task_status="stopped"):
     _emit("ALVA / Result uncertain")
     if state.get("provider_name"):
         _emit("previous provider: %s" % state["provider_name"])
-    _emit("The provider may still receive the selected notes; no automatic retry will happen.")
+    _emit("The provider may already have received the selected notes. The result is unknown; no automatic retry will happen.")
     if message:
         _emit(message)
 
@@ -814,9 +814,9 @@ def _leave_uncertain(rt, state, message):
 
 
 def _offer_uncertain_recovery():
-    _emit("[Review and send again]")
-    _emit("[Leave unresolved]")
-    choice = _ask("  [r] review / [l] leave: ")
+    _emit("Type r + Enter to review")
+    _emit("Type l + Enter to leave unresolved")
+    choice = _ask("  choice: ")
     return choice is not None and choice.lower() in ("r", "review", "send")
 
 
