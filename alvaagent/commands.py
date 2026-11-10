@@ -150,7 +150,7 @@ _SLASH_COMMANDS = [
     "/sessions", "/session", "/new", "/clear", "/context", "/compress",
     "/tools", "/trace", "/todos", "/todo", "/memory", "/skills", "/skill",
     "/install_skill", "/feedback", "/reflect", "/self-test", "/improve",
-    "/multi", "/export", "/scroll", "/redo", "/stop", "/exit", "/quit",
+    "/multi", "/export", "/scroll", "/redo", "/notes", "/stop", "/exit", "/quit",
 ]
 
 
@@ -391,6 +391,9 @@ def cmd_help():
     print("    /multi                 multi-line input ('.' on its own line submits)")
     print("    /export                save the conversation as a text file")
     print("    /scroll                browse the conversation with a pager (q to exit)")
+    print("    /notes                 summarize selected files from ./notes to ./summary.md")
+    print("    /notes resume          resume a checkpointed notes task")
+    print("    /notes stop|status     stop or inspect a saved notes task")
     print("    /redo                  re-run the last request (regenerates the answer)")
     print("    /provider add          guided setup for a provider profile")
     print("    /provider [name]       list profiles or switch to one")

@@ -29,6 +29,7 @@ from alvaagent.commands import (
     cmd_provider, cmd_self_test, cmd_sessions, cmd_skill_category, cmd_skills,
     cmd_skin, cmd_test, cmd_tools, cmd_trace,
 )
+from alvaagent.notes_summary import cmd_notes
 from alvaagent.util import _fmt_k
 import alvaagent.tui as _tui
 from alvaagent.scrollback import (StreamTee, LineReader, ScrollView,
@@ -234,6 +235,8 @@ def repl(rt):
                     cmd_tools(rt)
             elif c == "/trace":
                 cmd_trace(rt, rest)
+            elif c == "/notes":
+                cmd_notes(rt, rest)
             elif c == "/models":
                 cmd_models(rt)
             elif c == "/skin":
