@@ -3581,8 +3581,9 @@ def test_notes_repl_40_column_offline_entry():
         out += _pty_drain_until(fd, b"Enter=continue", 10.0)
         assert b"Enter=continue" in out, out[-1000:]
         os.write(fd, b"\n")
-        out += _pty_drain_until(fd, b"offline /", 10.0)
-        assert b"offline /" in out, out[-1000:]
+        out += _pty_drain_until(fd, b"Type o + Enter to stay offline;", 10.0)
+        assert b"Type o + Enter to stay offline;" in out, out[-1000:]
+        assert b"n = cancel" in out, out[-1000:]
         os.write(fd, b"o\n")
         out += _pty_drain_until(fd, b"no local summarizer", 10.0)
         assert b"no local summarizer" in out, out[-1000:]
