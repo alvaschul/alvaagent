@@ -146,7 +146,7 @@ def cmd_models(rt):
 
 
 _SLASH_COMMANDS = [
-    "/help", "/config", "/provider", "/models", "/test", "/skin",
+    "/help", "/chat", "/home", "/config", "/provider", "/models", "/test", "/skin",
     "/sessions", "/session", "/new", "/clear", "/context", "/compress",
     "/tools", "/trace", "/todos", "/todo", "/memory", "/skills", "/skill",
     "/install_skill", "/feedback", "/reflect", "/self-test", "/improve",
@@ -381,6 +381,8 @@ def _feedback_check(rt):
 def cmd_help():
     print("  commands:")
     print("    /help /?               this help")
+    print("    /chat                  open the current conversation")
+    print("    /home                  return to task home")
     print("    /sessions              list saved sessions (name | messages | updated)")
     print("    /session <name>        switch to (or create) a session")
     print("    /session rm <name>     delete a session      /session rename <old> <new>")

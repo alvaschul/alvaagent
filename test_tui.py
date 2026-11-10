@@ -20,6 +20,7 @@ owned by this process, reused for the suite, and stopped during cleanup.
 import atexit
 import builtins
 import contextlib
+import hashlib
 import inspect
 import io
 import json
@@ -2418,8 +2419,9 @@ def test_scroll_from_lines():
 def test_scroll_e2e():
     # Boot the real app against the offline mock server with a seeded PAST
     # session, send one real message so the screen holds this run's content,
-    # then feed a wheel-up (swipe up) event: the scroll view must page through
-    # exactly what was printed THIS run - never the seeded past session.
+    # then enter the conversation explicitly, send one message, and feed a
+    # wheel-up (swipe up) event: the scroll view must page through exactly
+    # what was printed THIS run - never the seeded past session.
     # Enter returns to live, then /exit.
     _mock_server()
     data_dir = tempfile.mkdtemp(prefix="alva_scrolle2e_")
@@ -2453,18 +2455,21 @@ def test_scroll_e2e():
         out += _pty_drain_until(fd, b"> ", 15.0)
         assert b"> " in out, out[-400:]  # prompt live
         assert b"PAST_SESSION_CONTENT_XXX" not in out, out[-400:]
+        os.write(fd, b"/chat\n")
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert b"Conversation" in out
         os.write(fd, b"hello [plain]\n")  # a real turn against the mock server
         out += _pty_drain_until(fd, b"PLAIN_OK", 20.0)
         assert b"PLAIN_OK" in out, out[-800:]  # answer streamed onto the screen
-        out += _pty_drain_until(fd, b"> ", 10.0)  # live prompt after the turn
+        out += _pty_drain_until(fd, b"chat> ", 10.0)  # live chat prompt after the turn
         os.write(fd, b"\x1b[<64;1;1M")  # wheel up == swipe up on Termux
         out += _pty_drain(fd, 3.0)
         assert b"hello [plain]" in out, out[-800:]  # user turn printed this run
         assert b"PLAIN_OK" in out, out[-800:]       # streamed answer printed this run
         assert b"PAST_SESSION_CONTENT_XXX" not in out, out[-800:]  # not past history
         os.write(fd, b"\r")             # Enter: return to live
-        out += _pty_drain_until(fd, b"> ", 4.0)
-        assert b"> " in out[-400:], out[-400:]  # live prompt restored
+        out += _pty_drain_until(fd, b"chat> ", 4.0)
+        assert b"chat> " in out[-400:], out[-400:]  # live prompt restored
         os.write(fd, b"/exit\n")
         out += _pty_drain_until(fd, b"bye", 5.0)
         assert b"bye" in out, out[-400:]
@@ -3020,6 +3025,8 @@ def test_notes_uncertain_provider_request_is_never_repeated_on_resume():
         assert saved["stage"] == "ready_to_summarize" and saved["files"] == ["one.md"]
         assert saved["content_snapshot_sha256"] == state["content_snapshot_sha256"]
         assert calls == []
+        assert "The provider may already have received the selected notes. The result is unknown; no automatic retry will happen." in " ".join(output.split())
+        assert "Type r + Enter to review" in output
 
         # Reload from the same private data directory, then explicitly review,
         # recheck, and consent to one fresh request for the same exact snapshot.
@@ -3834,6 +3841,339 @@ def test_notes_repl_40_column_offline_entry():
     saved = json.loads(open(os.path.join(data_dir, notes_mod._STATE_NAME), encoding="utf-8").read())
     assert saved["status"] == "offline_unavailable"
     assert not os.path.exists(os.path.join(root, "summary.md"))
+
+
+def _capture_home_text(rt, console_mode="runtime"):
+    """Capture the home renderer through Rich, its fallback, or a test probe."""
+    output = io.StringIO()
+    previous = tui_mod._CON
+    if console_mode == "runtime":
+        if hasattr(tui_mod, "_ShimConsole"):
+            tui_mod._CON = tui_mod._ShimConsole()
+            try:
+                with contextlib.redirect_stdout(output):
+                    tui_mod.banner(rt)
+            finally:
+                tui_mod._CON = previous
+            return output.getvalue()
+        console_mode = "rich"
+    try:
+        if console_mode == "fallback":
+            class FallbackProbe:
+                def print(self, *values, **_kwargs):
+                    for value in values:
+                        output.write(str(value) + "\n")
+            tui_mod._CON = FallbackProbe()
+        else:
+            try:
+                from rich.console import Console as RichConsole
+            except ImportError:
+                class RichProbe:
+                    def print(self, *values, **kwargs):
+                        assert kwargs.get("markup") is False
+                        for value in values:
+                            output.write(str(value) + "\n")
+                tui_mod._CON = RichProbe()
+            else:
+                tui_mod._CON = RichConsole(file=output, width=40, force_terminal=False)
+        tui_mod.banner(rt)
+    finally:
+        tui_mod._CON = previous
+    return output.getvalue()
+
+
+def _seed_paused_notes_checkpoint(rt, root):
+    names = sorted(os.listdir(os.path.join(root, "notes")))
+    hashes = {}
+    for name in names:
+        with open(os.path.join(root, "notes", name), "rb") as stream:
+            hashes[name] = hashlib.sha256(stream.read()).hexdigest()
+    state = notes_mod._new_state(root, names, hashes)
+    state["status"] = "paused"
+    state["stage"] = "ready_to_summarize"
+    notes_mod._save_state(rt, state)
+
+
+def test_task_first_home_copy_and_rich_fallback_rendering():
+    rt = mkrt()
+    home = _capture_home_text(rt)
+    expected = [
+        "ALVAAGENT", "Ready · no task running", "Choose /notes or /chat",
+        "/notes  Summarize selected notes", "/chat   Open a conversation",
+        "/help   More commands",
+    ]
+    positions = [home.index(line) for line in expected]
+    assert positions == sorted(positions)
+    assert "Available Tools" not in home and "Available Skills" not in home
+    assert "run_command" not in home and "skill_list" not in home
+    assert "no API key" not in home and "provider endpoint" not in home
+
+    original_lines = tui_mod._home_task_lines
+    tui_mod._home_task_lines = lambda _rt: [
+        "Notes [paused] · /notes resume", "Phase · ready_to_summarize"]
+    try:
+        for mode in ("fallback", "rich"):
+            rendered = _capture_home_text(rt, mode)
+            assert "Notes [paused] · /notes resume" in rendered
+            assert "Phase · ready_to_summarize" in rendered
+            assert "[dim" not in rendered and "[bold" not in rendered
+            assert "[paused]" in rendered
+            assert "Available Tools" not in rendered
+    finally:
+        tui_mod._home_task_lines = original_lines
+
+
+def test_notes_status_summary_is_shared_read_only_home_content():
+    rt = mkrt()
+    root = _notes_test_root({"private-note.md": "SYNTHETIC_PRIVATE_NOTE_CONTENT"})
+    _seed_paused_notes_checkpoint(rt, root)
+
+    summary = notes_mod.notes_status_summary(rt)
+    assert summary == {
+        "status": "paused", "stage": "ready_to_summarize",
+        "provider_outcome_unknown": False,
+        "lines": ["saved notes task: paused",
+                  "phase: ready_to_summarize | resume with /notes resume"],
+    }
+    notes_status = io.StringIO()
+    with contextlib.redirect_stdout(notes_status):
+        notes_mod.cmd_notes(rt, "status")
+    assert "saved notes task: paused" in notes_status.getvalue()
+    assert "phase: ready_to_summarize | resume with /notes resume" in notes_status.getvalue()
+
+    home = _capture_home_text(rt)
+    assert "Notes paused · /notes resume" in home
+    assert "Phase · ready_to_summarize" in home
+    assert "private-note.md" not in home and "SYNTHETIC_PRIVATE_NOTE_CONTENT" not in home
+    assert "./notes" not in home and "select numbers" not in home
+    assert notes_mod.notes_status_summary(rt)["status"] == "paused"
+
+    state = notes_mod._load_state(rt)
+    state["provider_status"] = "sent_outcome_unknown"
+    notes_mod._save_state(rt, state)
+    summary = notes_mod.notes_status_summary(rt)
+    assert summary["status"] == "paused" and summary["provider_outcome_unknown"] is True
+    assert any("no automatic retry" in line for line in summary["lines"])
+    home = _capture_home_text(rt)
+    assert "Notes result unknown · /notes resume" in home
+    saved = notes_mod._load_state(rt)
+    assert saved["status"] == "paused" and saved["provider_status"] == "sent_outcome_unknown"
+    assert "private-note.md" not in home and "SYNTHETIC_PRIVATE_NOTE_CONTENT" not in home
+
+    state["status"] = "stopped"
+    notes_mod._save_state(rt, state)
+    stopped_summary = notes_mod.notes_status_summary(rt)
+    assert stopped_summary["status"] == "stopped" and stopped_summary["provider_outcome_unknown"] is True
+    assert "Notes result unknown · /notes resume" in _capture_home_text(rt)
+
+
+def test_chat_provider_setup_warning_is_contextual_and_truthful():
+    rt = mkrt()
+    rt.history = []
+    rt.session = "default"
+    home = _capture_home_text(rt)
+    assert "provider" not in home.lower() and "api key" not in home.lower()
+    assert repl_mod._chat_setup_warning(rt) == (
+        "Chat needs a provider endpoint. Run /provider add or /config.")
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        repl_mod.send_message(rt, "SYNTHETIC_CHAT_WITHOUT_PROVIDER")
+    assert "Chat needs a provider endpoint" in output.getvalue()
+    assert rt.history == []
+
+    rt.cfg = config_mod._normalize_state({
+        "provider": "openai", "base_url": "https://api.openai.com/v1",
+        "api_key": "", "model": "gpt-4o-mini"})
+    warning = repl_mod._chat_setup_warning(rt)
+    assert warning == "No API key is saved for OpenAI. Run /provider openai or /config."
+
+    rt.cfg = config_mod._normalize_state({
+        "provider": "default", "base_url": "https://api.openai.com/v1",
+        "api_key": "", "model": "gpt-4o-mini"})
+    assert repl_mod._chat_setup_warning(rt) == (
+        "No API key is saved for OpenAI. Run /config.")
+
+    rt.cfg = config_mod._normalize_state({
+        "provider": "custom", "base_url": "https://custom.invalid/v1",
+        "api_key": "", "model": "custom-model"})
+    assert repl_mod._chat_setup_warning(rt) is None
+
+
+def test_chat_home_commands_help_and_completion():
+    assert repl_mod._slash_complete("/ch", 0) == "/chat"
+    assert repl_mod._slash_complete("/ho", 0) == "/home"
+    help_output = io.StringIO()
+    with contextlib.redirect_stdout(help_output):
+        commands_mod.cmd_help()
+    assert "/chat" in help_output.getvalue()
+    assert "/home" in help_output.getvalue()
+
+
+def test_task_home_chat_home_chat_cycle_40_column_pty():
+    _mock_server()
+    root = _notes_test_root({"private-note.md": "SYNTHETIC_PRIVATE_NOTE_CONTENT"})
+    data_dir = tempfile.mkdtemp(prefix="alva_task_home_pty_data_")
+    _TMP_DIRS.append(data_dir)
+    rt = mock_rt(data_dir)
+    pa.save_state(rt)
+    _seed_paused_notes_checkpoint(rt, root)
+    call_log = os.path.join(data_dir, "chat-send-calls.txt")
+    multi_log = os.path.join(data_dir, "multi-command-calls.txt")
+    compress_log = os.path.join(data_dir, "compress-command-calls.txt")
+    script = (
+        "import os, sys\n"
+        "sys.path.insert(0, %r)\n" % ROOT +
+        "os.environ['ALVA_DATA_DIR'] = %r\n" % data_dir +
+        "os.environ['NO_COLOR'] = '1'\n"
+        "os.chdir(%r)\n" % root +
+        "import importlib\n"
+        "repl_mod = importlib.import_module('alvaagent.repl')\n"
+        "main = repl_mod.main\n"
+        "call_log = %r\n" % call_log +
+        "multi_log = %r\n" % multi_log +
+        "compress_log = %r\n" % compress_log +
+        "_original_send = repl_mod.send_message\n"
+        "def _counted_send(rt, text):\n"
+        "    with open(call_log, 'a', encoding='utf-8') as stream:\n"
+        "        stream.write(text + '\\n')\n"
+        "    return _original_send(rt, text)\n"
+        "repl_mod.send_message = _counted_send\n"
+        "def _counted_multi():\n"
+        "    with open(multi_log, 'a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return '[plain] SYNTHETIC_MULTI_MESSAGE'\n"
+        "repl_mod.cmd_multi = _counted_multi\n"
+        "def _counted_compress(rt, history, session):\n"
+        "    with open(compress_log, 'a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "repl_mod.cmd_compress = _counted_compress\n"
+        "main()\n"
+    )
+    pid, fd = _pty_run(script)
+    status = None
+    out = b""
+    try:
+        import fcntl
+        import struct
+        import termios
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
+        out += _pty_drain_until(fd, b"> ", 15.0)
+        for marker in (b"ALVAAGENT", "Notes paused · /notes resume".encode("utf-8"),
+                       "Phase · ready_to_summarize".encode("utf-8"),
+                       b"Choose /notes or /chat", b"/notes  Summarize selected notes",
+                       b"/chat   Open a conversation", b"/help   More commands"):
+            assert marker in out, (marker, out[-1200:])
+        assert b"provider endpoint" not in out and b"no API key" not in out
+        assert b"Available Tools" not in out and b"Available Skills" not in out
+        assert b"[dim" not in out and b"[bold" not in out
+        assert b"private-note.md" not in out and b"SYNTHETIC_PRIVATE_NOTE_CONTENT" not in out
+
+        os.write(fd, b"SYNTHETIC_HOME_TEXT_SHOULD_NOT_SEND\n")
+        home_input = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_input
+        assert b"Text is not sent from home" in home_input
+        assert b"Choose /notes or /chat" in home_input
+        assert b"Conversation" not in home_input
+        assert not os.path.exists(call_log)
+
+        os.write(fd, b"/multi\n")
+        home_multi = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_multi
+        assert b"Open /chat before /multi" in home_multi
+        assert b"Choose /notes or /chat" in home_multi
+        assert not os.path.exists(call_log) and not os.path.exists(multi_log)
+
+        os.write(fd, b"/compress\n")
+        home_compress = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_compress
+        assert b"Open /chat before /compress" in home_compress
+        assert b"Choose /notes or /chat" in home_compress
+        assert not os.path.exists(compress_log)
+
+        os.write(fd, b"/chat\n")
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert b"Conversation" in out and b"/home returns to tasks" in out
+        os.write(fd, b"[plain] SYNTHETIC_CHAT_MESSAGE\n")
+        out += _pty_drain_until(fd, b"PLAIN_OK this is a direct answer", 15.0)
+        assert b"PLAIN_OK this is a direct answer" in out
+        assert open(call_log, encoding="utf-8").read().splitlines() == [
+            "[plain] SYNTHETIC_CHAT_MESSAGE"]
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+
+        os.write(fd, b"/redo\n")
+        redo_chat = _pty_drain_until(fd, b"PLAIN_OK this is a direct answer", 15.0)
+        out += redo_chat
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert open(call_log, encoding="utf-8").read().splitlines() == [
+            "[plain] SYNTHETIC_CHAT_MESSAGE", "[plain] SYNTHETIC_CHAT_MESSAGE"]
+
+        os.write(fd, b"/multi\n")
+        multi_chat = _pty_drain_until(fd, b"PLAIN_OK this is a direct answer", 15.0)
+        out += multi_chat
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert open(call_log, encoding="utf-8").read().splitlines() == [
+            "[plain] SYNTHETIC_CHAT_MESSAGE", "[plain] SYNTHETIC_CHAT_MESSAGE",
+            "[plain] SYNTHETIC_MULTI_MESSAGE"]
+        assert open(multi_log, encoding="utf-8").read().splitlines() == ["called"]
+
+        os.write(fd, b"/compress\n")
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert open(compress_log, encoding="utf-8").read().splitlines() == ["called"]
+
+        checkpoint = notes_mod._load_state(rt)
+        assert checkpoint["status"] == "paused"
+        checkpoint["provider_status"] = "sent_outcome_unknown"
+        notes_mod._save_state(rt, checkpoint)
+        os.write(fd, b"/home\n")
+        out += _pty_drain_until(fd, b"> ", 10.0)
+        assert "Notes result unknown · /notes resume".encode("utf-8") in out
+        os.write(fd, b"/redo\n")
+        home_redo = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_redo
+        assert b"Open /chat before /redo" in home_redo
+        assert b"Choose /notes or /chat" in home_redo
+        assert len(open(call_log, encoding="utf-8").read().splitlines()) == 3
+        assert open(multi_log, encoding="utf-8").read().splitlines() == ["called"]
+        assert open(compress_log, encoding="utf-8").read().splitlines() == ["called"]
+        os.write(fd, b"/multi\n")
+        home_multi = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_multi
+        assert b"Open /chat before /multi" in home_multi
+        assert len(open(call_log, encoding="utf-8").read().splitlines()) == 3
+        assert open(multi_log, encoding="utf-8").read().splitlines() == ["called"]
+        os.write(fd, b"/compress\n")
+        home_compress = _pty_drain_until(fd, b"> ", 10.0)
+        out += home_compress
+        assert b"Open /chat before /compress" in home_compress
+        assert open(compress_log, encoding="utf-8").read().splitlines() == ["called"]
+        os.write(fd, b"/chat\n")
+        out += _pty_drain_until(fd, b"chat> ", 10.0)
+        assert b"/home returns to tasks" in out
+        os.write(fd, b"/home\n")
+        out += _pty_drain_until(fd, b"> ", 10.0)
+        assert b"Choose /notes or /chat" in out
+        os.write(fd, b"/exit\n")
+        out += _pty_drain_until(fd, b"bye", 10.0)
+        assert b"bye" in out
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    finally:
+        if status is None:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    final_summary = notes_mod.notes_status_summary(rt)
+    assert final_summary["status"] == "paused"
+    assert final_summary["provider_outcome_unknown"] is True
 
 
 # ---------------- bundled runner (plan Task 15 step 1) ---------------------

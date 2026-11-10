@@ -821,6 +821,7 @@ def _leave_uncertain(rt, state, message):
 
 
 def _offer_uncertain_recovery():
+    _emit(_PROVIDER_OUTCOME_UNKNOWN)
     _emit("Type r + Enter to review")
     _emit("Type l + Enter to leave unresolved")
     choice = _ask("  choice: ")
@@ -1623,26 +1624,44 @@ def _start(rt):
     _run_state(rt, state)
 
 
+def notes_status_summary(rt):
+    """Read only a notes checkpoint's status and phase, never its note data."""
+    state = _load_state(rt)
+    if not state:
+        return {"status": None, "stage": None, "lines": ["no saved notes task"]}
+    status = state.get("status", "unknown")
+    stage = state.get("stage", "unknown")
+    provider_outcome_unknown = state.get("provider_status") == "sent_outcome_unknown"
+    lines = ["saved notes task: %s" % status]
+    if provider_outcome_unknown:
+        lines.append(_PROVIDER_OUTCOME_UNKNOWN)
+    if status in ("active", "paused", "stopped", "blocked_uncertain"):
+        lines.append("phase: %s | resume with /notes resume" % stage)
+    elif status == "needs_new_task":
+        lines.append("selected notes changed; start a new /notes task for fresh scope review")
+    return {"status": status, "stage": stage,
+            "provider_outcome_unknown": provider_outcome_unknown, "lines": lines}
+
+
 def cmd_notes(rt, action=""):
     """Start or resume the dedicated notes-only summary flow."""
     action = (action or "").strip().lower()
     if action not in ("", "resume", "stop", "status"):
         p_info("  usage: /notes [resume|stop|status]")
         return
+    if action == "status":
+        try:
+            summary = notes_status_summary(rt)
+        except (NotesSummaryError, OSError) as exc:
+            p_err(str(exc) if isinstance(exc, NotesSummaryError) else "checkpoint could not be read")
+            return
+        for line in summary["lines"]:
+            p_info("  " + line)
+        return
     try:
         state = _load_state(rt)
     except (NotesSummaryError, OSError) as exc:
         p_err(str(exc) if isinstance(exc, NotesSummaryError) else "checkpoint could not be read")
-        return
-    if action == "status":
-        if not state:
-            p_info("  no saved notes task")
-        else:
-            p_info("  saved notes task: %s" % state.get("status", "unknown"))
-            if state.get("status") in ("active", "paused", "stopped", "blocked_uncertain"):
-                p_info("  phase: %s | resume with /notes resume" % state.get("stage", "unknown"))
-            elif state.get("status") == "needs_new_task":
-                p_info("  selected notes changed; start a new /notes task for fresh scope review")
         return
     if action == "stop":
         if not state or state.get("status") not in ("active", "paused", "stopped", "blocked_uncertain"):

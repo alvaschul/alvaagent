@@ -4,7 +4,7 @@ import signal
 import sys
 import threading
 
-from alvaagent.config import HISTORY_PATH, TOOL_MODES, active_cfg
+from alvaagent.config import HISTORY_PATH, PROVIDERS, TOOL_MODES, active_cfg
 from alvaagent.context import build_runtime
 from alvaagent.store import get as store_get, ACTIVE_SESSION_KEY
 from alvaagent.client import cancel_agent
@@ -84,8 +84,44 @@ def _history_file_lines():
     return lines
 
 
-def _prompt(rt):
-    return col(_tui.CUR_SKIN["accent"], "> ") if COLOR else "> "
+def _prompt(rt, in_chat=False):
+    prompt = "chat> " if in_chat else "> "
+    return col(_tui.CUR_SKIN["accent"], prompt) if COLOR else prompt
+
+
+def _chat_setup_warning(rt):
+    """Return setup guidance only when a chat request needs provider setup."""
+    cfg = active_cfg(rt)
+    provider = str(rt.cfg.get("active") or "default")
+    if not (cfg.get("base_url") or "").strip():
+        return "Chat needs a provider endpoint. Run /provider add or /config."
+    base = str(cfg.get("base_url") or "").rstrip("/")
+    required_provider = provider if provider in PROVIDERS and provider != "custom" else None
+    if required_provider is None:
+        required_provider = next((name for name, details in PROVIDERS.items()
+                                  if name != "custom" and
+                                  base == details.get("base", "").rstrip("/")), None)
+    if required_provider and not cfg.get("api_key"):
+        command = ("/provider " + provider + " or /config"
+                   if provider in PROVIDERS and provider != "custom" else "/config")
+        return "No API key is saved for %s. Run %s." % (
+            PROVIDERS[required_provider]["label"], command)
+    return None
+
+
+def _show_chat_view(session):
+    """Announce the current conversation and its explicit task-home route."""
+    print("Conversation · %s" % session)
+    print("Type a message · /home returns to tasks")
+
+
+def _require_chat_mode(rt, in_chat, command):
+    """Block command-driven provider dispatch unless /chat is explicitly open."""
+    if in_chat:
+        return True
+    p_info("Open /chat before %s; no provider request was sent" % command)
+    banner(rt)
+    return False
 
 
 def _slash_complete(text, state):
@@ -103,6 +139,10 @@ def send_message(rt, text):
     history = rt.history
     session = rt.session
     cfg = active_cfg(rt)
+    setup_warning = _chat_setup_warning(rt)
+    if setup_warning:
+        p_warn(setup_warning)
+        return session
     # auto-title a fresh placeholder session from the first user message
     if session.startswith("sess-"):
         new_name = unique_session_name(rt, text)
@@ -190,6 +230,7 @@ def repl(rt):
     # last completed turn, for /redo (session-scoped so it can't leak across
     # a /session switch)
     rt.last_turn = {"session": None, "text": None, "pre": None}
+    in_chat = False
     # one tee for the whole run: the screen shown when swiping is what has
     # actually been printed THIS run (never the resumed past session)
     global _TEE
@@ -198,7 +239,7 @@ def repl(rt):
     _reader = None
     while True:
         try:
-            prompt = _prompt(rt)
+            prompt = _prompt(rt, in_chat)
             _reader = LineReader(_TEE, _history_file_lines(), prompt=prompt)
             _reader.on_scroll(lambda d: _handle_scroll(d, rt, _reader))
             line = _reader.read_line()
@@ -217,7 +258,16 @@ def repl(rt):
         if line.startswith("/"):
             cmd, _, rest = line.partition(" ")
             c = cmd.lower()
-            if c in ("/help", "/h", "/?"):
+            if c == "/chat":
+                if not in_chat:
+                    in_chat = True
+                    _show_chat_view(session)
+                else:
+                    p_info("Already in chat · /home returns to tasks")
+            elif c == "/home":
+                in_chat = False
+                banner(rt)
+            elif c in ("/help", "/h", "/?"):
                 cmd_help()
             elif c == "/config":
                 cmd_config(rt)
@@ -237,6 +287,8 @@ def repl(rt):
                 cmd_trace(rt, rest)
             elif c == "/notes":
                 cmd_notes(rt, rest)
+                if not in_chat:
+                    banner(rt)
             elif c == "/models":
                 cmd_models(rt)
             elif c == "/skin":
@@ -289,6 +341,8 @@ def repl(rt):
             elif c == "/context":
                 cmd_context(rt, rest, history)
             elif c == "/compress":
+                if not _require_chat_mode(rt, in_chat, "/compress"):
+                    continue
                 cmd_compress(rt, history, session)
             elif c == "/new":
                 save_session(rt, session, history)
@@ -300,6 +354,8 @@ def repl(rt):
             elif c == "/clear":
                 cmd_clear(rt, history)
             elif c == "/multi":
+                if not _require_chat_mode(rt, in_chat, "/multi"):
+                    continue
                 text = cmd_multi()
                 if text and text.strip():
                     session = send_message(rt, text.strip())
@@ -340,6 +396,8 @@ def repl(rt):
                 cancel_agent(rt)
                 p_info("stopping...")
             elif c == "/redo":
+                if not _require_chat_mode(rt, in_chat, "/redo"):
+                    continue
                 if rt.last_turn.get("session") != session or rt.last_turn.get("text") is None:
                     p_err("nothing to redo - send a message first (in this session)")
                     continue
@@ -353,6 +411,10 @@ def repl(rt):
                 p_err("unknown command: " + c + "   (/help for the list)")
             continue
 
+        if not in_chat:
+            p_info("Text is not sent from home; choose /notes or /chat")
+            banner(rt)
+            continue
         rt.last_turn["session"] = session
         rt.last_turn["text"] = line
         rt.last_turn["pre"] = list(history)

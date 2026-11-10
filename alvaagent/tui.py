@@ -760,40 +760,33 @@ TOOLSETS = {
 
 
 def _markup_safe(s):
-    """Strip Rich markup tag characters from user-controlled strings before
-    they're interpolated into banner cells (a `[` in a provider/model/skill
-    name would otherwise crash Rich's markup parser)."""
-    return str(s).replace("[", "").replace("]", "")
+    """Return plain text unchanged; callers no longer interpolate Rich markup."""
+    return str(s)
 
 
 def _banner_tools_lines(rt):
-    """Hermes-style 'Available Tools' grid: active tools grouped by toolset,
-    with a footer noting how many advanced tools are hidden in core mode.
-
-    Returns Rich-markup strings (Hermes' own convention inside Panels).
-    """
+    """Return plain-text tool inventory lines for explicit inventory views."""
     active = set(t["function"]["name"] for t in visible(rt))
-    lines = ["[bold %s]Available Tools[/]" % HERMES_ACCENT]
+    lines = ["Available Tools"]
     for ts, names in TOOLSETS.items():
         shown = [n for n in names if n in active]
         if shown:
-            lines.append("[dim %s]%s:[/] [bold %s]%s[/]"
-                         % (HERMES_DIM, ts, HERMES_TEXT, ", ".join(shown)))
+            lines.append("%s: %s" % (ts, ", ".join(shown)))
     hidden = len(TOOLS) - len(active)
     if hidden:
-        lines.append("[dim %s]%d advanced tools hidden - /tools full shows them[/]" % (HERMES_DIM, hidden))
+        lines.append("%d advanced tools hidden - /tools full shows them" % hidden)
     return lines
 
 
 def _banner_skills_lines(rt):
-    """Hermes-style 'Available Skills' grid: skills grouped by category."""
-    lines = ["", "[bold %s]Available Skills[/]" % HERMES_ACCENT]
+    """Return plain-text skill inventory lines for explicit inventory views."""
+    lines = ["", "Available Skills"]
     try:
         skills = skill_list(rt).get("skills") or []
     except Exception:
         skills = []
     if not skills:
-        lines.append("[dim %s]saved: (none yet - ask the agent to save one)[/]" % HERMES_DIM)
+        lines.append("saved: (none yet - ask the agent to save one)")
         return lines
     # group by category
     by_cat = {}
@@ -802,85 +795,49 @@ def _banner_skills_lines(rt):
         by_cat.setdefault(cat, []).append(s)
     disp_name = lambda c: "flat" if c == "(flat)" else c
     for cat in sorted(by_cat):
-        names = [_markup_safe(s["name"]) for s in by_cat[cat]]
-        lines.append("[dim %s]%s:[/] [bold %s]%s[/]"
-                     % (HERMES_DIM, disp_name(cat), HERMES_TEXT, ", ".join(names)))
+        names = [str(s["name"]) for s in by_cat[cat]]
+        lines.append("%s: %s" % (disp_name(cat), ", ".join(names)))
     return lines
 
 
-def banner(rt):
-    """Hermes-banner style: block wordmark + bronze panel with tools/skills grid.
-
-    Mirrors hermes_cli/banner.build_welcome_banner: a large block wordmark on
-    top, then a bordered panel whose LEFT is model/provider/skin meta and RIGHT
-    is an 'Available Tools' / 'Available Skills' grid, laid out with a real Rich
-    two-column grid (exactly how Hermes aligns its banner). Colors use the fixed
-    Hermes palette (gold accent, bronze border) regardless of /skin. The wordmark
-    is pyfiglet output; grid cells use Rich markup tags (Hermes' own convention).
-    NOTE: Table is imported lazily (inside try/except) so the banner still
-    renders when rich is absent — the module-level fallback shim covers
-    Console/Panel only.
-    """
-    cfg = active_cfg(rt)
-    _CON.print()  # top spacer like Hermes
-    # Hermes only prints its big wordmark when the terminal is wide enough; on
-    # narrow terminals (phones) it would wrap ugly, so we mirror that gate.
-    # NOTE: use plain print() + raw ANSI here (not _CON.print) — the rest of the
-    # TUI renders color via print()+_fgh(), and Rich's Console leaks bare escapes.
-    term_w = _term_width()
-    if COLOR and term_w >= 72:
-        for ln in ALVA_WORDMARK.split("\n"):
-            if ln.strip():
-                print(_fgh(HERMES_ACCENT) + ln + _rsth())
-    elif COLOR:
-        print(_fgh(HERMES_ACCENT) + C.BOLD + "ALVAAGENT" + _rsth())
-    else:
-        print("ALVAAGENT")
-    print()
-
-    model_short = _markup_safe(cfg.get("model") or "?")
-    if "/" in model_short:
-        model_short = model_short.split("/")[-1]
-    ctx = _fmt_k(context_window_for(cfg))
-    # Left meta column (Hermes banner left side): model · context · provider.
-    left_lines = [
-        "",
-        "[bold %s]%s[/]  [dim %s]·[/] [dim %s]%s context[/]"
-        % (HERMES_ACCENT, model_short, HERMES_DIM, HERMES_DIM, ctx),
-        "[dim %s]skin[/] %s" % (HERMES_DIM, rt.skin or DEFAULT_SKIN),
-        "[dim %s]provider[/] %s" % (HERMES_DIM, _markup_safe(rt.cfg.get("active", "local"))),
-        "[dim %s]config/store:[/] %s" % (HERMES_DIM, _markup_safe(rt.data_dir)),
-    ]
-    right_lines = _banner_tools_lines(rt) + _banner_skills_lines(rt)
-    right_lines.append("")
-    right_lines.append("[dim %s]%d/%d tools (%s) · v%s · you are here · /help for commands[/]"
-                       % (HERMES_DIM, len(visible(rt)), len(TOOLS), rt.tool_mode, ALVA_VERSION))
-
+def _home_task_lines(rt):
+    """Show only the read-only notes status, phase, and next action."""
     try:
-        from rich.table import Table
-        grid = Table.grid(padding=(0, 2))
-        grid.add_column("left", justify="left")
-        grid.add_column("right", justify="left")
-        for i in range(max(len(left_lines), len(right_lines))):
-            l = left_lines[i] if i < len(left_lines) else ""
-            r = right_lines[i] if i < len(right_lines) else ""
-            grid.add_row(l, r)
-        panel_body = grid
+        from alvaagent.notes_summary import notes_status_summary
+        summary = notes_status_summary(rt)
     except Exception:
-        # Rich Table unavailable — fall back to a single stacked block.
-        panel_body = "\n".join(left_lines + [""] + right_lines)
+        return ["Notes status unavailable · /notes status"]
+    status = summary.get("status")
+    if status is None:
+        return ["Ready · no task running"]
+    if summary.get("provider_outcome_unknown") or status == "blocked_uncertain":
+        return ["Notes result unknown · /notes resume",
+                "Phase · %s" % summary.get("stage", "unknown")]
+    if status in ("active", "paused", "stopped"):
+        return ["Notes %s · /notes resume" % status.replace("_", " "),
+                "Phase · %s" % summary.get("stage", "unknown")]
+    if status == "needs_new_task":
+        return ["Notes need a new task · /notes",
+                "Phase · %s" % summary.get("stage", "unknown")]
+    if status in ("complete", "declined", "offline_unavailable", "failed",
+                  "overwrite_declined"):
+        return ["Ready · no task running"]
+    return ["Notes status unavailable · /notes status"]
 
-    _CON.print(Panel(
-        panel_body,
-        title="[bold %s]%s v%s[/]" % (HERMES_ACCENT, "⚕ alvaagent", ALVA_VERSION),
-        border_style=HERMES_BORDER,
-        padding=(0, 2),
-    ))
-    print("  " + col(C.DIM, "type a message | /help lists commands | Tab completes /commands"))
-    print()
-    if not cfg.get("api_key"):
-        p_info("no API key set for '%s' - run /provider %s or /config"
-               % (rt.cfg.get("active", "local"), rt.cfg.get("active", "local")))
+
+def banner(rt):
+    """Render a compact task-first home that fits a 40-column phone terminal."""
+    lines = [
+        "ALVAAGENT",
+    ] + _home_task_lines(rt) + [
+        "Choose /notes or /chat",
+        "/notes  Summarize selected notes",
+        "/chat   Open a conversation",
+        "/help   More commands",
+    ]
+    # Explicitly disable Rich markup: legitimate text such as [paused] must
+    # remain literal, and the no-Rich shim prints the same plain text.
+    _CON.print("\n".join(lines), markup=False, highlight=False, soft_wrap=True)
 
 
 def render_status_bar(rt, session, elapsed, tools, history):
@@ -943,4 +900,3 @@ def compress_now(rt, history, threshold=0.75, force=False):
     if stats.get("mode") == "fallback":
         p_info("  (offline summary - the model call failed, kept a basic note)")
     return True
-
