@@ -56,7 +56,7 @@ from alvaagent.skills import (  # noqa: F401
 from alvaagent.python_subset import MAX_OUTPUT_CHARS
 _PY_MAX_CHARS = MAX_OUTPUT_CHARS
 from alvaagent.tools import (  # noqa: F401
-    _CALC_ALLOWED,
+    _CALC_ALLOWED, _FILE_READ_MAX,
     _CORE_TOOL_NAMES, _ADVANCED_TOOL_NAMES, _TOOL_ERROR_HINTS,
     Tools, visible, set_mode, sync_tool_mode, maybe_enable_full,
     tool_self_test, tool_count, classify_python,

@@ -393,6 +393,30 @@ def test_file_tools():
     rt.on_permission = None
 
 
+def test_file_read_truncation():
+    # file_read must cap while reading, not after slurping a huge file into
+    # memory (that can OOM-kill the app on a phone).
+    rt = mock_rt()
+    big = os.path.join(rt.data_dir, "big-demo.txt")
+    small = os.path.join(rt.data_dir, "small-demo.txt")
+    try:
+        pa.tool_file_write(rt, big, "x" * (pa._FILE_READ_MAX + 500))
+        r = pa.tool_file_read(rt, big)
+        assert r.get("ok") is True and r.get("truncated") is True
+        assert r.get("content", "").endswith("... [truncated]")
+        assert len(r.get("content", "")) < pa._FILE_READ_MAX + 40
+        pa.tool_file_write(rt, small, "hello")
+        s = pa.tool_file_read(rt, small)
+        assert s.get("ok") is True and s.get("truncated") is False
+        assert s.get("content") == "hello"
+    finally:
+        for p in (big, small):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 # ---------------- autonomy: skills -----------------------------------------
 
 def test_skill_save_read_list():

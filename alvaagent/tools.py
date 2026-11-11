@@ -34,6 +34,9 @@ from alvaagent.trace import trace as _trace
 from alvaagent.util import _atomic_write
 
 # ---------------- autonomy: shell + files + skills ----------------
+_FILE_READ_MAX = 20000  # chars file_read returns before truncating
+
+
 def tool_run_command(rt, command):
     """Run a shell command on the device (Termux). Risky commands ask the user."""
     command = str(command).strip()
@@ -61,10 +64,13 @@ def tool_file_read(rt, path):
         return {"ok": False, "error": "permission denied by user"}
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        truncated = len(content) > 20000
+            # Read one char past the cap instead of the whole file: pulling a
+            # huge log into memory on a phone just to truncate it can get the
+            # app OOM-killed.
+            content = f.read(_FILE_READ_MAX + 1)
+        truncated = len(content) > _FILE_READ_MAX
         if truncated:
-            content = content[:20000] + "\n... [truncated]"
+            content = content[:_FILE_READ_MAX] + "\n... [truncated]"
         return {"ok": True, "path": path, "chars": len(content),
                 "truncated": truncated, "content": content}
     except Exception as e:

@@ -166,8 +166,11 @@ store writes).
   - `config.py` / `store.py` / `permissions.py` / `sessions.py` / `trace.py`
     — persistence, provider profiles, and the security classifier
   - `client.py` / `agent.py` — OpenAI-compatible client + agent loop
-  - `skills.py` / `tools.py` — skill management and the 30 tool implementations
+  - `skills.py` / `tools.py` — skill management and the 36 tool implementations
+  - `python_subset.py` — the bounded AST interpreter behind `run_python`
+  - `notes_summary.py` — consent-gated `./notes` → `./summary.md` workflow
   - `tui.py` / `commands.py` / `repl.py` — rendering, slash commands, REPL
+  - `scrollback.py` — alt-screen scroll view + input reader
   - `util.py` — shared helpers
 - `alvaagent_tui.py` — one-line launcher shim (historical entry point)
 - `mock_llm_server.py` — offline OpenAI-compatible mock for the test suite

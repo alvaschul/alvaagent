@@ -30,8 +30,18 @@ globals are banned except `tui.py`'s current-skin (`CUR_SKIN`).
 ## Architecture
 - **Module map** (all in `alvaagent/`, downward dependencies only):
   `context.py` (Runtime + `build_runtime`) ← config, store, permissions,
-  sessions, trace ← client, skills, tools ← agent ← tui, commands ← repl ←
-  `__init__.py` (plain re-export facade). `util.py` shared helpers.
+  sessions, trace ← client, skills, tools ← agent ← tui ← notes_summary,
+  commands ← repl ← `__init__.py` (plain re-export facade). `util.py` shared
+  helpers. Two leaves hang off that chain: `python_subset.py` (bounded
+  run_python interpreter, imported by tools) and `scrollback.py` (alt-screen
+  scroll view + input reader, imported by repl). `notes_summary.py` is the
+  consent-gated `./notes` → `./summary.md` workflow (checkpointed, provider
+  calls only — no tools or conversation history); it imports client, config,
+  tui and util, and is used by repl (`cmd_notes`) and tui (lazy
+  `notes_status_summary` import).
+- **`file_read` cap**: `_FILE_READ_MAX` (20000 chars) is enforced while
+  reading (`f.read(cap + 1)`), never after slurping the whole file — a huge
+  log on a phone must not get the app OOM-killed just to be truncated.
 - **Runtime context object**: every leaf function takes `rt` first —
   `run_agent(rt, history_json)`, `dispatch_tool(rt, name, args)`,
   `send_message(rt, text)`, `trace(rt, entry)`, `store_get(rt, key)`,
