@@ -1,7 +1,9 @@
+import builtins
 import datetime
 import getpass
 import json
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -18,7 +20,9 @@ from alvaagent.store import (
     get as store_get, set as store_set, TODO_KEY, MEM_PREFIX, FEEDBACK_KEY,
     IMPROVEMENT_KEY, HISTORY_KEY, ACTIVE_SESSION_KEY,
 )
-from alvaagent.permissions import classify_command, PROJECT_DIR
+from alvaagent.permissions import (
+    classify_command, PROJECT_DIR, permission_key,
+)
 from alvaagent.skills import (
     skill_list, skill_read, skill_install, skill_sync_repo,
 )
@@ -68,31 +72,266 @@ def ask_key(current):
     return _ask_hidden_api_key(current, keep_current=True)
 
 
-def ask_permission(rt, desc):
-    """Interactive y/N/a prompt used as rt.on_permission in the REPL.
+_REAL_INPUT = builtins.input
 
-    y or a approve (and are remembered for this session, so the same action
-    won't prompt again); anything else denies.
+
+def _panel_row(segments, inner, border):
+    """One row of a bordered panel. `segments` are (text, color) pairs
+    (color None = plain text); the row is padded to `inner` visible cells
+    and closed with the right border."""
+    vis = sum(len(t) for t, _ in segments)
+    body = "".join(col(c, t) if c else t for t, c in segments)
+    return (col(border, "│") + " " + body
+            + " " * max(0, inner - vis) + " " + col(border, "│"))
+
+
+def _fill_row(segments, width, bg):
+    """One row of the filled permission panel (OpenCode style): segment
+    texts laid out on a solid background, padded to the full panel width.
+    Colors are emitted without resets between segments (a reset would
+    clear the background fill); a single reset closes the row."""
+    vis = sum(len(t) for t, _ in segments)
+    if not _tui.COLOR:
+        return "".join(t for t, _ in segments) + " " * max(0, width - vis)
+    out = [bg]
+    for t, fg in segments:
+        if fg:
+            out.append(fg)
+        out.append(t)
+    out.append(" " * max(0, width - vis))
+    out.append(_tui.C.RESET)
+    return "".join(out)
+
+
+def _perm_read_key():
+    """Read one keypress from the raw terminal: 'up', 'down', 'enter',
+    'esc', a single (lowercased) character, or '' for EOF/unknown keys."""
+    b = os.read(0, 1)
+    if not b:
+        return ""
+    if b in (b"\r", b"\n"):
+        return "enter"
+    if b in (b"\x03", b"\x04"):  # Ctrl+C / Ctrl+D deny, like Esc
+        return "esc"
+    if b != b"\x1b":
+        return b.decode("utf-8", "ignore").lower()
+    # An arrow key's tail is already buffered; a bare Esc is not.
+    if not select.select([0], [], [], 0.05)[0]:
+        return "esc"
+    b2 = os.read(0, 1)
+    if b2 == b"O":  # SS3 (application cursor keys)
+        b3 = os.read(0, 1)
+        return {b"A": "up", b"B": "down"}.get(b3, "")
+    if b2 != b"[":
+        return ""
+    b3 = os.read(0, 1)
+    if b3 == b"A":
+        return "up"
+    if b3 == b"B":
+        return "down"
+    while b3 and not (0x40 <= b3[0] <= 0x7E):  # swallow rest of the CSI
+        b3 = os.read(0, 1)
+    return ""
+
+
+def _perm_select(options, read_key, redraw):
+    """Selection loop for the permission panel (pure logic; the terminal
+    wiring lives in _ask_permission_panel). Starts on the last row (the
+    safe default), clamps at both ends, returns the chosen option value,
+    or None for Esc/EOF."""
+    sel = len(options) - 1
+    redraw(sel)
+    while True:
+        k = read_key()
+        if k == "" or k == "esc":
+            return None
+        if k in ("up", "k"):
+            sel = max(0, sel - 1)
+        elif k in ("down", "j"):
+            sel = min(len(options) - 1, sel + 1)
+        elif k == "enter":
+            return options[sel]
+        elif k in options:
+            return k
+        else:
+            continue
+        redraw(sel)
+
+
+def _ask_permission_panel(desc, key):
+    """OpenCode-style filled modal: a solid panel with the action and a
+    selectable option list (arrows/j/k + Enter, or the y/a/n keys
+    directly; Esc denies). Returns 'y', 'a' or 'n'."""
+    import termios
+    import tty
+    skin = _tui.CUR_SKIN
+    term = _tui._term_width()
+    width = max(30, min(term - 2, 72))
+    margin = " " * max(0, (term - width) // 2)
+    bg = _tui.C.BG % 238
+    accent_bg = skin["accent"].replace("38;5;", "48;5;", 1)
+    fg_dim = _tui.C.FG % 244
+    black = _tui.C.BOLD + (_tui.C.FG % 16)
+    a_label = ("Always - '%s', this session" % key) if key != desc \
+        else "Always - this exact action, this session"
+    options = [("y", "Yes - this once"), ("a", a_label), ("n", "No")]
+
+    def row(segments, row_bg=None):
+        return margin + _fill_row(segments, width, row_bg or bg)
+
+    def option_rows(sel):
+        rows = []
+        for i, (k, label) in enumerate(options):
+            chunks = textwrap.wrap(label, width - 7,
+                                   break_long_words=False,
+                                   break_on_hyphens=False) or [""]
+            for j, chunk in enumerate(chunks):
+                if i == sel:
+                    body = ("  ● " if j == 0 else "    ") \
+                        + ((k + "  ") if j == 0 else "   ") + chunk
+                    rows.append(row([(body, black)], accent_bg))
+                elif j == 0:
+                    rows.append(row(
+                        [("    ", None), (k + "  ", skin["accent"]),
+                         (chunk, skin["code"])]))
+                else:
+                    rows.append(row([("       " + chunk, skin["code"])]))
+        return rows
+
+    out = sys.stdout
+    opt_lines = len(option_rows(0))
+    print()
+    print()
+    title = "Permission required"
+    blank = row([])
+    out.write(blank + "\n")
+    out.write(row(
+        [("  " + title, _tui.C.BOLD + (_tui.C.FG % 255)),
+         (" " * (width - len(title) - 7), None), ("esc", fg_dim)]) + "\n")
+    out.write(blank + "\n")
+    for chunk in textwrap.wrap(desc, width - 4, break_long_words=True,
+                               break_on_hyphens=False) or [""]:
+        out.write(row([("  " + chunk, skin["code"])]) + "\n")
+    out.write(blank + "\n")
+    for r in option_rows(len(options) - 1):
+        out.write(r + "\n")
+    out.write(blank + "\n")
+    footer = "  ↑/↓ select · Enter confirm · Esc no" if width >= 44 \
+        else "  ↑/↓ select · Enter ok"
+    out.write(row([(footer, fg_dim)]) + "\n")
+    out.write(blank + "\n")
+    out.flush()
+
+    def redraw(sel):
+        buf = ["\x1b[%dA" % (opt_lines + 3)]
+        for r in option_rows(sel):
+            buf.append("\r" + r + "\n")
+        buf.append("\x1b[%dB" % 3)
+        out.write("".join(buf))
+        out.flush()
+
+    fd = sys.stdin.fileno()
+    attrs = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    try:
+        out.write("\x1b[?25l")  # hide the cursor while selecting
+        out.flush()
+        choice = _perm_select([k for k, _ in options],
+                              _perm_read_key, redraw)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+        out.write("\x1b[?25h")
+        out.flush()
+    return choice or "n"
+
+
+def _perm_interactive():
+    """True when the selectable modal can run: a real terminal on both
+    ends and the genuine input() still in place. Tests and embedders
+    replace builtins.input, and they get the text prompt instead."""
+    try:
+        return (bool(sys.stdin.isatty()) and bool(sys.stdout.isatty())
+                and builtins.input is _REAL_INPUT)
+    except Exception:
+        return False
+
+
+def _ask_permission_text(desc, key):
+    """Bordered text prompt (the fallback for pipes, tests and
+    embedders): prints the panel, reads one line, returns the raw
+    answer ('' on EOF/interrupt)."""
+    skin = _tui.CUR_SKIN
+    border = skin["border"]
+    width = _tui._term_width()
+    inner = width - 4
+    print()
+    print(col(border, "╭" + "─" * (width - 2) + "╮"))
+    print(_panel_row([("Permission required", skin["err"])], inner, border))
+    for chunk in textwrap.wrap(desc, inner, break_long_words=True,
+                               break_on_hyphens=False) or [""]:
+        print(_panel_row([(chunk, None)], inner, border))
+    print(_panel_row([], inner, border))
+    a_label = ("Always - '%s', this session" % key) if key != desc \
+        else "Always - this exact action, this session"
+    for k, label in (("y", "Yes - this once"), ("a", a_label), ("n", "No")):
+        chunks = textwrap.wrap(label, inner - 3, break_long_words=False,
+                               break_on_hyphens=False) or [""]
+        print(_panel_row([(k + "  ", skin["accent"]), (chunks[0], None)],
+                         inner, border))
+        for chunk in chunks[1:]:
+            print(_panel_row([("   ", None), (chunk, None)], inner, border))
+    print(col(border, "╰" + "─" * (width - 2) + "╯"))
+    try:
+        return input("    allow? [y/N/a]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def ask_permission(rt, desc):
+    """Interactive permission prompt used as rt.on_permission in the REPL.
+
+    On a real terminal this is a selectable filled modal (OpenCode
+    style); anywhere else it is the bordered text panel above. Either
+    way: y approves this exact action (remembered exactly for this
+    session); a approves this *kind* of action for the rest of the
+    session (see permissions.permission_key — e.g. every `git commit`,
+    or writes inside one folder); anything else denies.
     """
     sp = rt.spinner
     was_running = sp is not None
     if sp:
         sp.stop()
-    print()
-    print(col(_tui.CUR_SKIN["err"], "  [!] permission needed") + "  " + desc)
-    try:
-        v = input("    allow? [y/N/a]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        if was_running and sp:
-            sp.start()
-        return False
+    key = permission_key(desc)
+    v = None
+    from_panel = False
+    if _perm_interactive():
+        try:
+            v = _ask_permission_panel(desc, key)
+            from_panel = True
+        except Exception:
+            v = None
+    if v is None:
+        v = _ask_permission_text(desc, key)
     if was_running and sp:
         sp.start()
-    if v in ("y", "yes", "a", "allow", "always"):
-        print("    (remembered for this session - restart to reset)")
+    if v in ("a", "allow", "always", "2"):
+        rt.approved_keys.add(key)
+        rt.approved.add(desc)
+        print(textwrap.fill(
+            "(always for '%s' this session - restart to reset)" % key,
+            width=_tui._term_width(), initial_indent="    ",
+            subsequent_indent="    "))
+        return True
+    if v in ("y", "yes", "1"):
+        print(textwrap.fill(
+            "(remembered for this session - restart to reset)",
+            width=_tui._term_width(), initial_indent="    ",
+            subsequent_indent="    "))
         rt.approved.add(desc)
         return True
+    if from_panel:
+        print("    (denied)")
     return False
 
 

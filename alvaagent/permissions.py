@@ -1,10 +1,14 @@
 import os
+from urllib.parse import urlparse
 
 # ---------------- autonomy: permissions ----------------
 # The agent can run shell commands, edit files and manage skills. Everything
 # outside the project folder (or risky) goes through rt.on_permission, which
-# the REPL wires to an interactive y/N prompt. Headless (no hook) defaults to
-# DENY, unless ALVA_AUTO_APPROVE=1 is set (attended/automated runs).
+# the REPL wires to an interactive y/N/a prompt. Headless (no hook) defaults
+# to DENY, unless ALVA_AUTO_APPROVE=1 is set (attended/automated runs).
+# At the prompt, 'y' remembers the exact action for this session and 'a'
+# remembers the whole kind of action (see permission_key) — so a long task
+# asks once per kind, not once per near-identical action.
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -123,20 +127,77 @@ def classify_file_action(rt, path):
     return "ask"
 
 
-def request_permission(rt, desc):
-    """Resolve a permission request: session cache -> env override -> hook.
+# CLIs whose second word is a subcommand that changes what the command does
+# (git commit vs git push, npm install vs npm publish): a session grant keys
+# on program + subcommand, never on the program alone.
+_MULTIWORD_CLIS = frozenset({
+    "git", "npm", "pip", "pip3", "pkg", "apt", "apt-get",
+    "systemctl", "service", "docker",
+})
 
-    The approved-set and the hook live on the Runtime (`rt.approved` /
-    `rt.on_permission`) instead of module globals. Descriptions approved this
-    session run again WITHOUT prompting (exact-match, in-memory only - nothing
-    survives a restart). Reset any time with rt.approved.clear()."""
+_FILE_ACTIONS = ("read file: ", "write file: ", "edit file: ",
+                 "download to file: ")
+
+
+def permission_key(desc):
+    """Session-grant key for a permission description.
+
+    Pressing 'a' (always) at the prompt remembers this key, not the exact
+    description, so one approval covers the *kind* of action for the rest
+    of the session:
+
+    - shell commands: program + subcommand (`git commit` never covers
+      `git push`; `python3 -m pyflakes` never covers `python3 -m pip`)
+    - file actions: the action + the file's folder (one folder only, and
+      never the filesystem root)
+    - web POSTs: the action + the host
+    - anything else (e.g. cloning a skills repo): the exact description
+    """
+    if desc.startswith("run command: "):
+        words = [t for t in _tokenize_shell(desc[len("run command: "):])
+                 if t != "QUOTED"]
+        if not words:
+            return desc
+        key = "run command: " + words[0]
+        if words[0] in ("python", "python3") and len(words) > 2 \
+                and words[1] == "-m":
+            key += " -m " + words[2]
+        elif words[0] in _MULTIWORD_CLIS and len(words) > 1 \
+                and not words[1].startswith("-"):
+            key += " " + words[1]
+        return key
+    for action in _FILE_ACTIONS:
+        if desc.startswith(action):
+            folder = os.path.dirname(
+                os.path.realpath(os.path.expanduser(desc[len(action):])))
+            if folder and folder != os.sep:
+                return action + folder
+            return desc
+    if desc.startswith("POST to "):
+        host = urlparse(desc[len("POST to "):]).netloc
+        if host:
+            return "POST to " + host
+        return desc
+    return desc
+
+
+def request_permission(rt, desc):
+    """Resolve a permission request: session memory -> env override -> hook.
+
+    Two session memories live on the Runtime (both in-memory only - nothing
+    survives a restart): `rt.approved` holds exact descriptions approved
+    once, and `rt.approved_keys` holds permission_key() grants made with
+    'a' (always) at the prompt, which cover the whole kind of action.
+    Reset any time with rt.approved.clear() / rt.approved_keys.clear()."""
     if os.environ.get("ALVA_AUTO_APPROVE") == "1":
         return True
     if desc in rt.approved:
         return True
+    if permission_key(desc) in rt.approved_keys:
+        return True
     if rt.on_permission is not None:
         ok = rt.on_permission(desc)
         if ok:
-            rt.approved.add(desc)  # remember for the rest of this session
+            rt.approved.add(desc)  # remember the exact action this session
         return ok
     return False  # headless default: deny

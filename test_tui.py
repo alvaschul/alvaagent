@@ -358,6 +358,7 @@ def test_ask_permission_keys():
     finally:
         builtins.input = _orig_input
     rt.approved.clear()
+    rt.approved_keys.clear()
     # request_permission feeds the session cache from the hook result
     rt.on_permission = lambda d: True
     assert pa.request_permission(rt, "run command: python3 -m pyflakes demo3.py") is True
@@ -366,6 +367,89 @@ def test_ask_permission_keys():
     assert pa.request_permission(rt, "run command: python3 -m pyflakes demo3.py") is True
     rt.on_permission = None
     rt.approved.clear()
+    rt.approved_keys.clear()
+
+
+def test_permission_session_grants():
+    # 'a' remembers the KIND of action for the session (permission_key), so
+    # a long task stops re-prompting for every near-identical action, while
+    # 'y' still remembers only the exact action.
+    rt = mock_rt()
+    _orig_input = builtins.input
+    try:
+        # key derivation: program + subcommand / module / folder / host
+        assert pa.permission_key("run command: git commit -m x") == \
+            "run command: git commit"
+        assert pa.permission_key("run command: git push") == \
+            "run command: git push"
+        assert pa.permission_key("run command: python3 -m pyflakes a.py") == \
+            "run command: python3 -m pyflakes"
+        assert pa.permission_key("run command: touch /a/b") == \
+            "run command: touch"
+        assert pa.permission_key("POST to https://api.example.com/v1/x") == \
+            "POST to api.example.com"
+        assert pa.permission_key("clone skills repo: https://x/y") == \
+            "clone skills repo: https://x/y"
+        # command kind: one 'a' covers later commits, never a push
+        builtins.input = lambda *a, **k: "a"
+        assert pa.ask_permission(rt, "run command: git commit -m one") is True
+        assert "run command: git commit" in rt.approved_keys
+        rt.on_permission = lambda d: False  # the hook would deny...
+        assert pa.request_permission(rt, "run command: git commit -m two") is True
+        assert pa.request_permission(rt, "run command: git push") is False
+        # python -m: the module is part of the kind
+        builtins.input = lambda *a, **k: "a"
+        assert pa.ask_permission(rt, "run command: python3 -m pyflakes a.py") is True
+        assert pa.request_permission(rt, "run command: python3 -m pyflakes b.py") is True
+        assert pa.request_permission(rt, "run command: python3 -m pip install x") is False
+        # file kind: the action + the folder
+        scratch = tempfile.mkdtemp(prefix="alva_grant_")
+        try:
+            builtins.input = lambda *a, **k: "a"
+            assert pa.ask_permission(
+                rt, "write file: %s" % os.path.join(scratch, "a.txt")) is True
+            assert pa.request_permission(
+                rt, "write file: %s" % os.path.join(scratch, "b.txt")) is True
+            assert pa.request_permission(rt, "write file: /other-dir/c.txt") is False
+            # a different action in the same folder is a different kind
+            assert pa.request_permission(
+                rt, "read file: %s" % os.path.join(scratch, "a.txt")) is False
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        # 'y' remembers only the exact action, never the kind
+        rt.approved.clear()
+        rt.approved_keys.clear()
+        builtins.input = lambda *a, **k: "y"
+        assert pa.ask_permission(rt, "run command: touch /somewhere/x") is True
+        assert pa.request_permission(rt, "run command: touch /somewhere/x") is True
+        assert pa.request_permission(rt, "run command: touch /somewhere/y") is False
+    finally:
+        builtins.input = _orig_input
+        rt.on_permission = None
+        rt.approved.clear()
+        rt.approved_keys.clear()
+
+
+def test_permission_selector_logic():
+    # the modal's selection loop is pure logic: it starts on No (the safe
+    # default), clamps at both ends, and honors enter / direct keys / esc.
+    seen = []
+
+    def run(keys):
+        it = iter(keys)
+        return commands_mod._perm_select(["y", "a", "n"],
+                                         lambda: next(it), seen.append)
+
+    assert run(["enter"]) == "n"                    # default row is No
+    assert run(["up", "enter"]) == "a"
+    assert run(["up", "up", "enter"]) == "y"
+    assert run(["up", "up", "up", "enter"]) == "y"  # clamped at the top
+    assert run(["down", "enter"]) == "n"            # clamped at the bottom
+    assert run(["y"]) == "y"                        # direct keys answer at once
+    assert run(["a"]) == "a"
+    assert run(["esc"]) is None
+    assert run([""]) is None
+    assert seen[0] == 2                             # first paint selects row 2
 
 
 # ---------------- autonomy: files ------------------------------------------

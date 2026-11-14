@@ -13,6 +13,7 @@ class Runtime:
     store: dict = field(default_factory=dict)
     tool_mode: str = "core"
     approved: set = field(default_factory=set)
+    approved_keys: set = field(default_factory=set)
     cancel: threading.Event = field(default_factory=threading.Event)
     on_permission: Optional[Callable] = None
     on_tool: Optional[Callable] = None
