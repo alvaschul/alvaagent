@@ -150,7 +150,7 @@ def permission_key(desc):
       `git push`; `python3 -m pyflakes` never covers `python3 -m pip`)
     - file actions: the action + the file's folder (one folder only, and
       never the filesystem root)
-    - web POSTs: the action + the host
+    - web POSTs and browser renders: the action + the host
     - anything else (e.g. cloning a skills repo): the exact description
     """
     if desc.startswith("run command: "):
@@ -177,6 +177,11 @@ def permission_key(desc):
         host = urlparse(desc[len("POST to "):]).netloc
         if host:
             return "POST to " + host
+        return desc
+    if desc.startswith("web render: "):
+        host = urlparse(desc[len("web render: "):]).netloc
+        if host:
+            return "web render: " + host
         return desc
     return desc
 

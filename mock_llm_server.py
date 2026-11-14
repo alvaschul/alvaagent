@@ -16,6 +16,7 @@ Behavior:
 
 Usage:  python3 mock_llm_server.py [port]     (default: 8001; 0 = OS-assigned)
 """
+import gzip
 import json
 import signal
 import sys
@@ -168,6 +169,27 @@ class Handler(BaseHTTPRequestHandler):
                            b"<div class=\"result\"><a rel=\"nofollow\" href=\"http://example.com/two\">Mock Result Two</a>"
                            b"<span class=\"result-snippet\">Second snippet here.</span></div>"
                            b"</body></html>")
+        elif self._norm(self.path).endswith("/mock-search-bing"):
+            self._send_raw(200, "text/html",
+                           b"<html><body><ol>"
+                           b"<li class=\"b_algo\"><h2><a href=\"http://example.com/one\">Mock Result One</a></h2>"
+                           b"<div class=\"b_caption\"><p>This is the first snippet.</p></div></li>"
+                           b"<li class=\"b_algo\"><h2><a href=\"http://example.com/two\">Mock Result Two</a></h2>"
+                           b"<div class=\"b_caption\"><p>Second snippet here.</p></div></li>"
+                           b"</ol></body></html>")
+        elif self._norm(self.path).endswith("/mock-search-empty"):
+            self._send_raw(200, "text/html",
+                           b"<html><body><p>No results found.</p></body></html>")
+        elif self._norm(self.path).endswith("/mock-gzip"):
+            body = gzip.compress(
+                b"<html><body><p>gzipped mock content</p></body></html>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
         elif self._norm(self.path).endswith("/mock-download"):
             self._send_raw(200, "application/octet-stream", b"\x00\x01MOCKBYTES\xff")
         else:

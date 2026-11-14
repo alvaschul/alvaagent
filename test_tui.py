@@ -189,7 +189,7 @@ def _cfg():
 # ---------------- tools -----------------------------------------------------
 
 def test_tools_registered():
-    assert len(pa.TOOLS) == 36
+    assert len(pa.TOOLS) == 37
 
 
 def test_calculator():
@@ -388,6 +388,8 @@ def test_permission_session_grants():
             "run command: touch"
         assert pa.permission_key("POST to https://api.example.com/v1/x") == \
             "POST to api.example.com"
+        assert pa.permission_key("web render: https://shop.example.com/cart") == \
+            "web render: shop.example.com"
         assert pa.permission_key("clone skills repo: https://x/y") == \
             "clone skills repo: https://x/y"
         # command kind: one 'a' covers later commits, never a push
@@ -643,6 +645,16 @@ def test_web_fetch():
     assert "Mock Page" in wf.get("snippet", "")
 
 
+def test_web_fetch_gzip():
+    # a server that gzips despite the identity request must still yield
+    # readable text (urllib never decompresses on its own)
+    _mock_server()
+    rt = mock_rt()
+    wf = pa.tool_web_fetch(rt, BASE + "/mock-gzip")
+    assert wf.get("ok") is True
+    assert "gzipped mock content" in wf.get("snippet", "")
+
+
 def test_web_head():
     _mock_server()
     rt = mock_rt()
@@ -686,6 +698,8 @@ def test_web_search():
     _orig_req = tools_mod._web_req
 
     def _local_req(url, **kw):
+        url = url.replace("https://www.bing.com/search?q=",
+                          BASE + "/mock-search-bing?q=")
         url = url.replace("https://lite.duckduckgo.com/lite/?q=",
                           BASE + "/mock-search?q=")
         return _orig_req(url, **kw)
@@ -694,6 +708,7 @@ def test_web_search():
     try:
         _s = pa.tool_web_search(rt, "mock query")
         assert _s.get("ok") is True and _s.get("count") == 2
+        assert _s.get("source") == "bing"
         first = _s.get("results", [])[0]
         assert first.get("title") == "Mock Result One"
         assert first.get("url") == "http://example.com/one"
@@ -701,8 +716,56 @@ def test_web_search():
         # num_results caps the returned list
         _one = pa.tool_web_search(rt, "mock query", 1)
         assert len(_one.get("results", [])) == 1
+
+        # Bing starved -> the DuckDuckGo fallback answers instead
+        def _ddg_req(url, **kw):
+            url = url.replace("https://www.bing.com/search?q=",
+                              BASE + "/mock-search-empty?q=")
+            url = url.replace("https://lite.duckduckgo.com/lite/?q=",
+                              BASE + "/mock-search?q=")
+            return _orig_req(url, **kw)
+
+        tools_mod._web_req = _ddg_req
+        _f = pa.tool_web_search(rt, "mock query")
+        assert _f.get("ok") is True and _f.get("source") == "duckduckgo"
+        assert _f.get("count") == 2
+
+        # both backends starved -> an honest error, not a silent zero
+        def _empty_req(url, **kw):
+            url = url.replace("https://www.bing.com/search?q=",
+                              BASE + "/mock-search-empty?q=")
+            url = url.replace("https://lite.duckduckgo.com/lite/?q=",
+                              BASE + "/mock-search-empty?q=")
+            return _orig_req(url, **kw)
+
+        tools_mod._web_req = _empty_req
+        _e = pa.tool_web_search(rt, "mock query")
+        assert _e.get("ok") is False and _e.get("count") == 0
     finally:
         tools_mod._web_req = _orig_req
+
+
+def test_web_render_unavailable():
+    # without the agent-browser CLI the tool explains how to install it
+    # instead of failing obscurely
+    rt = mock_rt()
+    _orig_which = tools_mod.shutil.which
+    _orig_env = os.environ.get("ALVA_AGENT_BROWSER")
+    tools_mod.shutil.which = lambda name: None
+    os.environ["ALVA_AGENT_BROWSER"] = ""
+    try:
+        _r = pa.tool_web_render(rt, "https://example.com")
+        assert _r.get("ok") is False
+        assert "not installed" in _r.get("error", "")
+        # a non-http URL is rejected before the binary is even consulted
+        _bad = pa.tool_web_render(rt, "ftp://example.com")
+        assert _bad.get("ok") is False
+    finally:
+        tools_mod.shutil.which = _orig_which
+        if _orig_env is None:
+            os.environ.pop("ALVA_AGENT_BROWSER", None)
+        else:
+            os.environ["ALVA_AGENT_BROWSER"] = _orig_env
 
 
 def test_web_download():
@@ -3032,7 +3095,7 @@ def test_notes_task_scoped_payload_and_40_column_flow():
     assert b"UNRELATED_CHAT_HISTORY_SENTINEL" not in checkpoint
     assert not any(name.startswith(".notes-summary-") and name.endswith(".draft")
                    for name in os.listdir(rt.data_dir))
-    assert len(tools_mod.TOOLS) == 36  # no broad tool catalog changes
+    assert len(tools_mod.TOOLS) == 37  # no broad tool catalog changes
 
 
 def test_notes_decline_and_offline_send_zero_requests():

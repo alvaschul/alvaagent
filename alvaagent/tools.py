@@ -1,16 +1,20 @@
 import ast
+import base64
 import datetime
 import fnmatch
+import gzip
 import json
 import math
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from html.parser import HTMLParser
 
 from alvaagent.config import TOOL_MODES, save_state
@@ -349,6 +353,21 @@ def tool_reflect(rt):
     }
 
 
+def _decode_body(resp, raw):
+    """Undo a response's Content-Encoding. urllib never decompresses, and
+    some servers gzip even when 'identity' was requested - without this
+    the text tools return binary garbage."""
+    enc = (resp.headers.get("Content-Encoding") or "").lower()
+    try:
+        if "gzip" in enc:
+            return gzip.decompress(raw)
+        if "deflate" in enc:
+            return zlib.decompress(raw)
+    except Exception:
+        pass
+    return raw
+
+
 def tool_web_fetch(rt, url):
     url = str(url).strip()
     if not (url.startswith("http://") or url.startswith("https://")):
@@ -358,12 +377,17 @@ def tool_web_fetch(rt, url):
             url, headers={"User-Agent": "alvaagent-tui/1.0", "Accept-Encoding": "identity"})
         with urllib.request.urlopen(req, timeout=20) as r:
             status = int(r.getcode())
-            raw = r.read(300000).decode("utf-8", errors="replace")
+            raw = _decode_body(r, r.read(300000)).decode("utf-8", errors="replace")
         # crude HTML -> text
         text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
         text = re.sub(r"(?is)<[^>]+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
-        return {"ok": status < 400, "status": status, "chars": len(text), "snippet": text[:2500]}
+        out = {"ok": status < 400, "status": status, "chars": len(text),
+               "snippet": text[:2500]}
+        if len(text) < 200:
+            out["hint"] = ("page returned very little text - it may need "
+                           "JavaScript to render; try web_render")
+        return out
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -428,7 +452,7 @@ def tool_web_json(rt, url, path=None):
         req = _web_req(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=20) as r:
             status = int(r.getcode())
-            raw = r.read(1000000).decode("utf-8", errors="replace")
+            raw = _decode_body(r, r.read(1000000)).decode("utf-8", errors="replace")
         data = json.loads(raw)
         if path:
             data = _json_get(data, path)
@@ -540,7 +564,7 @@ def tool_web_markdown(rt, url):
         req = _web_req(url)
         with urllib.request.urlopen(req, timeout=20) as r:
             status = int(r.getcode())
-            raw = r.read(500000).decode("utf-8", errors="replace")
+            raw = _decode_body(r, r.read(500000)).decode("utf-8", errors="replace")
         md = _MarkdownParser()
         md.feed(raw)
         text = md.render()
@@ -606,25 +630,142 @@ class _SearchParser(HTMLParser):
         super().close()
 
 
+def _bing_target(href):
+    """Unwrap a Bing click-through URL (bing.com/ck/a?...&u=a1<base64>)."""
+    if "bing.com/ck/a" not in href:
+        return href
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+        u = (qs.get("u") or [""])[0]
+        if u.startswith("a1"):
+            pad = "=" * (-len(u[2:]) % 4)
+            out = base64.urlsafe_b64decode(u[2:] + pad).decode("utf-8", "replace")
+            if out.startswith("http"):
+                return out
+    except Exception:
+        pass
+    return href
+
+
+class _BingParser(HTMLParser):
+    """Extract title/url/snippet triples from Bing result HTML.
+
+    Organic results live in <li class="b_algo">: the first <h2><a> gives
+    the title and target, and a caption <p> carries the snippet.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._cur = None
+        self._li_depth = 0
+        self._in_h2 = False
+        self._in_a = False
+        self._in_p = False
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        a = dict(attrs)
+        if tag == "li":
+            if self._cur is None:
+                if "b_algo" in a.get("class", "").split():
+                    self._cur = {"title": "", "url": "", "snippet": ""}
+                    self._li_depth = 1
+                return
+            self._li_depth += 1
+            return
+        if self._cur is None:
+            return
+        if tag == "h2":
+            self._in_h2 = True
+        elif tag == "a" and self._in_h2 and not self._cur["url"]:
+            self._cur["url"] = _bing_target(a.get("href", ""))
+            self._in_a = True
+            self._buf = []
+        elif tag == "p" and not self._cur["snippet"]:
+            self._in_p = True
+            self._buf = []
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self._cur is None:
+            return
+        if tag == "a" and self._in_a:
+            self._cur["title"] = re.sub(r"\s+", " ", "".join(self._buf)).strip()
+            self._in_a = False
+            self._buf = []
+        elif tag == "h2":
+            self._in_h2 = False
+        elif tag == "p" and self._in_p:
+            self._cur["snippet"] = re.sub(r"\s+", " ", "".join(self._buf)).strip()
+            self._in_p = False
+            self._buf = []
+        elif tag == "li":
+            self._li_depth -= 1
+            if self._li_depth <= 0:
+                if self._cur["url"]:
+                    self.results.append(self._cur)
+                self._cur = None
+
+    def handle_data(self, data):
+        if self._in_a or self._in_p:
+            self._buf.append(data)
+
+
+_SEARCH_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def _search_bing(query, n):
+    q = urllib.parse.quote_plus(query)
+    req = _web_req("https://www.bing.com/search?q=" + q,
+                   headers={"User-Agent": _SEARCH_UA, "Accept": "text/html"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = _decode_body(r, r.read(500000)).decode("utf-8", errors="replace")
+    parser = _BingParser()
+    parser.feed(raw)
+    parser.close()
+    return parser.results[:n]
+
+
+def _search_ddg(query, n):
+    q = urllib.parse.quote_plus(query)
+    req = _web_req("https://lite.duckduckgo.com/lite/?q=" + q,
+                   headers={"User-Agent": _SEARCH_UA, "Accept": "text/html"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = _decode_body(r, r.read(500000)).decode("utf-8", errors="replace")
+    parser = _SearchParser()
+    parser.feed(raw)
+    parser.close()
+    return parser.results[:n]
+
+
 def tool_web_search(rt, query, num_results=5):
-    """Search the web via DuckDuckGo lite (no API key). Returns result triples."""
+    """Search the web (Bing primary, DuckDuckGo lite fallback; no API key).
+
+    Both backends are plain-HTML scrapes and either can be blocked by the
+    network (DuckDuckGo serves an anomaly page to many datacenter IPs),
+    so each is tried in turn. If both come back empty that is reported as
+    an error, not a silent zero-result success."""
     query = str(query or "").strip()
     if not query:
         return {"ok": False, "error": "empty query"}
     try:
-        q = urllib.parse.quote_plus(query)
-        req = _web_req("https://lite.duckduckgo.com/lite/?q=" + q, headers={"Accept": "text/html"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read(500000).decode("utf-8", errors="replace")
-        parser = _SearchParser()
-        parser.feed(raw)
-        parser.close()
-        results = parser.results[:max(0, int(num_results))]
-        return {"ok": True, "query": query, "count": len(results), "results": results}
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
-    except Exception as e:
-        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        n = max(0, int(num_results))
+    except (TypeError, ValueError):
+        n = 5
+    for name, backend in (("bing", _search_bing), ("duckduckgo", _search_ddg)):
+        try:
+            results = backend(query, n)
+        except Exception:
+            results = []
+        if results:
+            return {"ok": True, "query": query, "count": len(results),
+                    "results": results, "source": name}
+    return {"ok": False, "query": query, "count": 0, "results": [],
+            "error": "no results - Bing and DuckDuckGo both returned "
+                     "nothing (this network may be blocking them)"}
 
 
 def tool_web_download(rt, url, path, max_bytes=20 * 1024 * 1024):
@@ -690,6 +831,73 @@ def tool_web_post(rt, url, data=None):
                 "response": parsed if parsed is not None else raw[:2000]}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def _agent_browser_bin():
+    """Locate the agent-browser CLI: $ALVA_AGENT_BROWSER, then PATH."""
+    p = os.environ.get("ALVA_AGENT_BROWSER")
+    if p:
+        return p
+    return shutil.which("agent-browser")
+
+
+def tool_web_render(rt, url):
+    """Render a page in a real browser (via agent-browser) and return its
+    readable text with JavaScript executed - the fallback for SPAs and
+    other JS-heavy pages the plain fetchers only see as empty shells.
+
+    Optional integration: without the agent-browser CLI installed this
+    reports how to install it instead of failing obscurely."""
+    try:
+        _web_req(url)  # scheme validation only
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    binary = _agent_browser_bin()
+    if not binary:
+        return {"ok": False, "error": "agent-browser is not installed or "
+                "not on PATH - install it with: npm i -g agent-browser && "
+                "agent-browser install (or set ALVA_AGENT_BROWSER to its path)"}
+    if not request_permission(rt, "web render: %s" % url):
+        return {"ok": False, "error": "permission denied by user"}
+
+    def _ab(args, timeout):
+        return subprocess.run([binary, "--session", "alvaagent"] + args,
+                              capture_output=True, text=True, timeout=timeout)
+
+    try:
+        try:
+            proc = _ab(["open", str(url).strip()], 60)
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip()
+                return {"ok": False,
+                        "error": "agent-browser failed to open the page: %s" % err[:300]}
+            # let XHR-driven content settle; some pages never go idle, so
+            # a wait failure is not fatal
+            try:
+                _ab(["wait", "--load", "networkidle"], 20)
+            except Exception:
+                pass
+            # read with no URL returns the active tab's *rendered* DOM;
+            # 'read <url>' fetches on its own and misses JS-hydrated text
+            proc = _ab(["read"], 30)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "agent-browser timed out"}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            return {"ok": False, "error": "agent-browser failed: %s" % err[:300]}
+        text = (proc.stdout or "").strip()
+        if len(text) > 8000:
+            text = text[:8000] + "\n... [truncated]"
+        return {"ok": True, "url": str(url).strip(), "chars": len(text),
+                "content": text}
+    finally:
+        try:
+            subprocess.run([binary, "--session", "alvaagent", "close"],
+                           capture_output=True, timeout=15)
+        except Exception:
+            pass
 
 
 def _safe_factorial(n):
@@ -865,8 +1073,14 @@ TOOLS = [
             "url": {"type": "string", "description": "The URL to fetch"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
+        "name": "web_render",
+        "description": "Render a page in a real browser (agent-browser) and return its readable text after JavaScript runs. Use when web_fetch or web_markdown return an empty shell - SPAs and JS-heavy sites. Asks the user first; requires the agent-browser CLI (npm i -g agent-browser).",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "The URL to render"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
         "name": "web_search",
-        "description": "Search the web via DuckDuckGo (no API key required). Returns the top result titles, URLs and snippets. Use when an answer needs current or external information you don't already have.",
+        "description": "Search the web via Bing with a DuckDuckGo fallback (no API key required). Returns the top result titles, URLs and snippets. Use when an answer needs current or external information you don't already have.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "The search query"},
             "num_results": {"type": "integer", "description": "How many results to return (default 5)"}},
@@ -1055,7 +1269,7 @@ TOOLS = [
 # persisted via config.json under "tool_mode".
 _CORE_TOOL_NAMES = {
     "calculator", "run_python", "web_fetch", "web_head", "web_json",
-    "web_markdown", "web_search", "get_time",
+    "web_markdown", "web_render", "web_search", "get_time",
     "memory_save", "memory_recall", "memory_search",
     "todo_add", "todo_list", "todo_toggle",
     "run_command", "file_read", "file_write", "file_list", "file_edit",
@@ -1136,6 +1350,9 @@ class Tools:
 
     def web_markdown(self, args):
         return tool_web_markdown(self.rt, args.get("url"))
+
+    def web_render(self, args):
+        return tool_web_render(self.rt, args.get("url"))
 
     def web_search(self, args):
         return tool_web_search(self.rt, args.get("query"), args.get("num_results"))
@@ -1232,11 +1449,12 @@ class Tools:
 
 
 _TOOL_ERROR_HINTS = {
-    "web_fetch": "hint: the URL is unreachable or the site blocks bots; try a different/mobile URL, or run_command('curl -sL <url>') as a fallback",
+    "web_fetch": "hint: the URL is unreachable or the site blocks bots; try a different/mobile URL, web_render for JS-heavy pages, or run_command('curl -sL <url>') as a fallback",
     "web_head": "hint: the URL is unreachable or rejects HEAD; try web_fetch to inspect the body",
     "web_json": "hint: the endpoint returned non-JSON or an error status; check the URL and try web_head first",
     "web_markdown": "hint: the URL is unreachable; fall back to web_fetch for a plain text version",
-    "web_search": "hint: the search backend is unreachable or blocked; retry, or fall back to web_fetch of a known URL",
+    "web_render": "hint: agent-browser may be missing or the page failed to load; check that agent-browser is installed (or ALVA_AGENT_BROWSER), or fall back to web_fetch/web_markdown",
+    "web_search": "hint: the search backends are unreachable or blocked on this network; retry, or fall back to web_fetch of a known URL",
     "web_download": "hint: the URL is unreachable, exceeds the size cap, or the path needs permission; try a smaller URL or a path inside the project folder",
     "web_post": "hint: the endpoint failed or rejected the request; check the URL and payload, then try again",
     "run_command": "hint: the command was blocked or failed; retry a read-only variant, or ask the user to approve/run it themselves",
