@@ -326,15 +326,24 @@ def test_permission_cache():
     # an approved action never prompts again (exact-match, session-scoped)
     rt = mock_rt()
     rt.approved.clear()
-    rt.on_permission = lambda d: True
-    assert pa.tool_run_command(rt, "touch /tmp/alva-cache-demo").get("ok") is True
-    rt.on_permission = lambda d: False
-    _cached = pa.tool_run_command(rt, "touch /tmp/alva-cache-demo")
-    assert _cached.get("ok") is True
-    _notcached = pa.tool_run_command(rt, "touch /tmp/alva-cache-demo-2")
-    assert _notcached.get("ok") is False and "permission" in str(_notcached.get("error", ""))
-    rt.on_permission = None
-    rt.approved.clear()
+    # use a real scratch dir: some proot environments have no /tmp (they use
+    # $TMPDIR), so a hardcoded /tmp path would make `touch` fail before the
+    # permission logic is even exercised.
+    scratch = tempfile.mkdtemp(prefix="alva_perm_")
+    try:
+        cmd1 = "touch %s/a" % scratch
+        cmd2 = "touch %s/b" % scratch
+        rt.on_permission = lambda d: True
+        assert pa.tool_run_command(rt, cmd1).get("ok") is True
+        rt.on_permission = lambda d: False
+        _cached = pa.tool_run_command(rt, cmd1)
+        assert _cached.get("ok") is True
+        _notcached = pa.tool_run_command(rt, cmd2)
+        assert _notcached.get("ok") is False and "permission" in str(_notcached.get("error", ""))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+        rt.on_permission = None
+        rt.approved.clear()
 
 
 def test_ask_permission_keys():
