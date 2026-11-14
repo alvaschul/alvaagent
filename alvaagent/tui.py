@@ -171,9 +171,42 @@ def _rsth():
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
+def _vis_len(text):
+    """Visible width of a possibly-ANSI-colored string (escapes are 0 cells)."""
+    return len(_ANSI_RE.sub("", text))
+
+
+def _fit_line(label, budget):
+    """Fit a tool line into `budget` visible cells.
+
+    Long quoted values (URLs, paths, prompts) are middle-elided first, so a
+    narrow terminal never gets an over-long line to hard-wrap mid-token.
+    Anything still too long is end-truncated with an ellipsis.
+    """
+    if len(label) <= budget:
+        return label
+    spans = [(m.start(1), m.end(1))
+             for m in re.finditer(r"'([^']*)'", label)]
+    for start, end in sorted(spans, key=lambda s: s[1] - s[0], reverse=True):
+        overflow = len(label) - budget
+        if overflow <= 0:
+            break
+        seg = label[start:end]
+        keep = len(seg) - overflow - 1  # one cell for the ellipsis
+        if keep < 8:
+            continue
+        head = (keep + 1) // 2
+        tail = keep - head
+        label = (label[:start] + seg[:head] + "…"
+                 + (seg[len(seg) - tail:] if tail else "") + label[end:])
+    if len(label) > budget:
+        label = label[:budget - 1] + "…"
+    return label
+
+
 def _tool_line(label, color):
     """Compact indented tool line: '  ▸ name (args)' or '  ✓ name → summary'."""
-    print(_fgh(color) + "  " + label + _rsth())
+    print(_fgh(color) + "  " + _fit_line(label, _term_width() - 2) + _rsth())
 
 
 def print_user_turn(text, show_ts=False):
@@ -851,13 +884,32 @@ def render_status_bar(rt, session, elapsed, tools, history):
     tokens, window = context_usage(rt, history)
     pct = tokens * 100 // window if window else 0
     ctx_col = skin["ok"] if pct < 60 else (C.YELLOW if pct < 85 else skin["err"])
-    parts = [
-        col(skin["dim"], session[:16]),
-        col(skin["dim"], rt.cfg.get("active", "local") + "/" + (cfg.get("model") or "?")),
-        col(ctx_col, "ctx %d%%" % pct),
-        col(skin["dim"], "%.1fs" % elapsed),
-        col(skin["dim"], "%d tool calls" % (tools or 0)),
+    raw = [
+        session[:16],
+        rt.cfg.get("active", "local") + "/" + (cfg.get("model") or "?"),
+        "ctx %d%%" % pct,
+        "%.1fs" % elapsed,
+        "%d tool calls" % (tools or 0),
     ]
+    colors = [skin["dim"], skin["dim"], ctx_col, skin["dim"], skin["dim"]]
+    # On narrow screens the full chip row is longer than the terminal, which
+    # then hard-wraps it mid-word. Drop the least important chips first
+    # (elapsed, tool count, session) so the bar always fits on one line;
+    # provider/model and the context meter are never dropped.
+    width = _term_width()
+
+    def _bar_len(idxs):
+        return 2 + len(idxs) + sum(len(raw[i]) for i in idxs)
+
+    keep = [0, 1, 2, 3, 4]
+    for drop in (3, 4, 0):
+        if _bar_len(keep) <= width:
+            break
+        keep.remove(drop)
+    if _bar_len(keep) > width:
+        # Last resort: shrink the provider/model chip itself.
+        raw[1] = "…" + raw[1][_bar_len(keep) - width + 1:]
+    parts = [col(colors[i], raw[i]) for i in keep]
     # Hermes-style footer: dim '│' prefix + space-separated chips.
     print(col(C.DIM, "  " + "│".join([""] + parts)))
 

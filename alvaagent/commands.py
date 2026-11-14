@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 import urllib.error
 import urllib.request
 import warnings
@@ -378,54 +379,83 @@ def _feedback_check(rt):
     return True
 
 
+def _help_print(line=""):
+    """Print one help line, word-wrapped to the terminal width.
+
+    Help lines are laid out on a 27-column command field. On a narrow
+    (Termux) screen the raw line is longer than the terminal, which then
+    hard-wraps it mid-word with the overflow dumped at column 0. Wrap the
+    description on word boundaries instead, with a hanging indent aligned
+    to the description column (or the line's own indent for prose lines).
+    """
+    width = max(40, shutil.get_terminal_size((80, 24)).columns)
+    if len(line) <= width:
+        print(line)
+        return
+    if line[26:27] == " " and line[27:28] not in ("", " "):
+        chunks = textwrap.wrap(line[27:], width - 27,
+                               break_long_words=False,
+                               break_on_hyphens=False) or [""]
+        print(line[:27] + chunks[0])
+        for chunk in chunks[1:]:
+            print(" " * 27 + chunk)
+        return
+    indent = line[:len(line) - len(line.lstrip())]
+    chunks = textwrap.wrap(line.strip(), width - len(indent),
+                           break_long_words=False,
+                           break_on_hyphens=False) or [""]
+    for chunk in chunks:
+        print(indent + chunk)
+
+
 def cmd_help():
-    print("  commands:")
-    print("    /help /?               this help")
-    print("    /chat                  open the current conversation")
-    print("    /home                  return to task home")
-    print("    /sessions              list saved sessions (name | messages | updated)")
-    print("    /session <name>        switch to (or create) a session")
-    print("    /session rm <name>     delete a session      /session rename <old> <new>")
-    print("    /new                   start a fresh session (the current one is saved)")
-    print("    /clear                 wipe the current conversation")
-    print("    /context               context meter + settings (window, auto-compress)")
-    print("    /compress              summarize older messages to free context now")
-    print("    /multi                 multi-line input ('.' on its own line submits)")
-    print("    /export                save the conversation as a text file")
-    print("    /scroll                browse the conversation with a pager (q to exit)")
-    print("    /notes                 summarize selected files from ./notes to ./summary.md")
-    print("    /notes resume          resume a checkpointed notes task")
-    print("    /notes stop|status     stop or inspect a saved notes task")
-    print("    /redo                  re-run the last request (regenerates the answer)")
-    print("    /provider add          guided setup for a provider profile")
-    print("    /provider [name]       list profiles or switch to one")
-    print("    /provider rm <name>    delete a provider")
-    print("    /config                edit the ACTIVE provider (base url, key, model, temp)")
-    print("    /models                fetch + pick a model for the active provider")
-    print("    /test                  test the active provider's connection")
-    print("    /skin [name]           list / switch the UI skin (midnight, ember, ocean, daylight)")
-    print("    (at the api key prompt, type 'none' to clear the key)")
-    print("    /tools                 list the agent's tools (and switch mode: /tools full|core)")
-    print("    /trace [n]             show the last n agent-trace lines (default 15)")
-    print("    /todos                 show the to-do list")
-    print("    /todo <text>           add a task")
-    print("    /todo done <i>         toggle task i      /todo rm <i>   remove task i")
-    print("    /todo clear            empty the list")
-    print("    /memory                show saved memory facts")
-    print("    /skills                list saved skills (grouped by category)")
-    print("    /skills install <u>    install a skill from a URL or local .md [category]")
-    print("    /skills sync <repo>    bulk-import a whole skills git repo [subdir]")
-    print("    /skill rm <name>       delete a skill (name or category/name)")
-    print("    /skill category [n]    list categories / show skills in category n")
-    print("    /install_skill <u>     install a skill from a URL or local .md file")
-    print("    /feedback <good|bad>   record feedback on the last response")
-    print("    /reflect               review feedback + improvements, propose actions")
-    print("    /improve               manage self-improvement areas (list/add/done)")
-    print("    /self-test             run harness self-test suite (validate after edits)")
-    print("    /stop                  cancel the running request")
-    print("    /exit  /quit           leave the agent")
-    print("    Tab                    completes slash commands")
-    print("    Ctrl+C                 while a request runs: cancel it (same as /stop)")
+    _help_print("  commands:")
+    _help_print("    /help /?               this help")
+    _help_print("    /chat                  open the current conversation")
+    _help_print("    /home                  return to task home")
+    _help_print("    /sessions              list saved sessions (name | messages | updated)")
+    _help_print("    /session <name>        switch to (or create) a session")
+    _help_print("    /session rm <name>     delete a session      /session rename <old> <new>")
+    _help_print("    /new                   start a fresh session (the current one is saved)")
+    _help_print("    /clear                 wipe the current conversation")
+    _help_print("    /context               context meter + settings (window, auto-compress)")
+    _help_print("    /compress              summarize older messages to free context now")
+    _help_print("    /multi                 multi-line input ('.' on its own line submits)")
+    _help_print("    /export                save the conversation as a text file")
+    _help_print("    /scroll                browse the conversation with a pager (q to exit)")
+    _help_print("    /notes                 summarize selected files from ./notes to ./summary.md")
+    _help_print("    /notes resume          resume a checkpointed notes task")
+    _help_print("    /notes stop|status     stop or inspect a saved notes task")
+    _help_print("    /redo                  re-run the last request (regenerates the answer)")
+    _help_print("    /provider add          guided setup for a provider profile")
+    _help_print("    /provider [name]       list profiles or switch to one")
+    _help_print("    /provider rm <name>    delete a provider")
+    _help_print("    /config                edit the ACTIVE provider (base url, key, model, temp)")
+    _help_print("    /models                fetch + pick a model for the active provider")
+    _help_print("    /test                  test the active provider's connection")
+    _help_print("    /skin [name]           list / switch the UI skin (midnight, ember, ocean, daylight)")
+    _help_print("    (at the api key prompt, type 'none' to clear the key)")
+    _help_print("    /tools                 list the agent's tools (and switch mode: /tools full|core)")
+    _help_print("    /trace [n]             show the last n agent-trace lines (default 15)")
+    _help_print("    /todos                 show the to-do list")
+    _help_print("    /todo <text>           add a task")
+    _help_print("    /todo done <i>         toggle task i      /todo rm <i>   remove task i")
+    _help_print("    /todo clear            empty the list")
+    _help_print("    /memory                show saved memory facts")
+    _help_print("    /skills                list saved skills (grouped by category)")
+    _help_print("    /skills install <u>    install a skill from a URL or local .md [category]")
+    _help_print("    /skills sync <repo>    bulk-import a whole skills git repo [subdir]")
+    _help_print("    /skill rm <name>       delete a skill (name or category/name)")
+    _help_print("    /skill category [n]    list categories / show skills in category n")
+    _help_print("    /install_skill <u>     install a skill from a URL or local .md file")
+    _help_print("    /feedback <good|bad>   record feedback on the last response")
+    _help_print("    /reflect               review feedback + improvements, propose actions")
+    _help_print("    /improve               manage self-improvement areas (list/add/done)")
+    _help_print("    /self-test             run harness self-test suite (validate after edits)")
+    _help_print("    /stop                  cancel the running request")
+    _help_print("    /exit  /quit           leave the agent")
+    _help_print("    Tab                    completes slash commands")
+    _help_print("    Ctrl+C                 while a request runs: cancel it (same as /stop)")
 
 
 def cmd_config(rt):
