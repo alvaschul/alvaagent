@@ -2178,7 +2178,11 @@ def test_stream_tee_restore_replays():
     tee.restore()
     out = sink.getvalue()
     assert "\x1b[2J\x1b[H" in out
-    assert out.count("line one\nline two\n") == 2
+    # the replay uses \r\n line endings: restore() runs under the
+    # LineReader's raw mode, where a bare \n leaves each replayed line
+    # starting wherever the previous one ended (scattered text)
+    assert "line one\r\nline two\r\n" in out
+    assert out.count("line one") == 2 and out.count("line two") == 2
 
 
 def test_stream_tee_bounded():

@@ -63,10 +63,18 @@ class StreamTee:
         return self._partial
 
     def restore(self):
-        """Clear and replay the captured content (byte-faithful)."""
+        """Clear and replay the captured content (byte-faithful).
+
+        Lines are replayed with \r\n, not \n: restore() runs from the
+        scroll handler while the LineReader holds the terminal in raw
+        mode, where \n moves down WITHOUT returning to column 0 — each
+        replayed line would start where the previous one ended and the
+        screen stair-steps into scattered text. (\r\n is equally correct
+        in cooked mode.)
+        """
         self._orig.write("\x1b[2J\x1b[H")
         for line in self._lines:
-            self._orig.write(line + "\n")
+            self._orig.write(line + "\r\n")
         self._orig.flush()
 
 
@@ -369,7 +377,10 @@ class LineReader:
         last = scroll_view.page_count() - 1
         try:
             while True:
-                self._tee.write_direct("\x1b[H\x1b[2J" + scroll_view.page_text(page))
+                # \r\n, not \n: this loop runs in raw mode, where \n does
+                # not carriage-return (see StreamTee.restore).
+                self._tee.write_direct(
+                    "\x1b[H\x1b[2J" + scroll_view.page_text(page).replace("\n", "\r\n"))
                 b = self._read_byte()
                 if not b:
                     continue
